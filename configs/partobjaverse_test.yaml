@@ -1,0 +1,88 @@
+# PartCraft3D Pipeline Configuration — PartObjaverse Test (3 objects)
+# Phase 0 is pre-populated, run phases 1-4:
+#   python scripts/run_all.py --config configs/partobjaverse_test.yaml --phases 1 2 3 4
+
+data:
+  image_npz_dir: "data/partobjaverse_test/images"
+  mesh_npz_dir: "data/partobjaverse_test/mesh"
+  shards: ["00"]
+  output_dir: "outputs/partobjaverse_test"
+
+phase0:
+  vlm_backend: "api"
+  vlm_model: "gemini-2.5-flash"
+  vlm_base_url: "https://llm-api.mmchat.xyz/v1"
+  vlm_api_key: ""
+  views_for_labeling: [0, 10, 20, 30]
+  max_workers: 8
+  batch_size: 50
+  # Absolute path: pre-populated cache in data/ (not under output_dir)
+  cache_dir: "/Node11_nvme/wjw/3D_Editing/PartCraft3D/data/partobjaverse_test/cache/phase0"
+
+phase1:
+  min_parts_per_object: 2
+  max_parts_per_object: 50
+  core_categories: ["body", "torso", "base", "frame", "main", "head", "wall", "floor"]
+  max_swap_candidates: 5
+  min_cluster_size: 50
+  cache_dir: "cache/phase1"
+
+phase2:
+  alignment_strategy: "contact"
+  max_scale_ratio: 3.0
+  max_penetration: 0.3
+  max_gap_distance: 0.15
+  require_same_object_type: true
+  max_part_size_ratio: 5.0
+  cache_dir: "cache/phase2"
+
+phase2_5:
+  enabled: false
+  vinedresser_path: "/Node11_nvme/wjw/3D_Editing/Vinedresser3D-main"
+  trellis_text_ckpt: "checkpoints/TRELLIS-text-xlarge"
+  trellis_image_ckpt: "checkpoints/TRELLIS-image-large"
+  num_combinations: 2
+  seed: 42
+  cache_dir: "cache/phase2_5"
+  max_refine: 1000
+  output_format: "glb"
+  image_edit_model: "gemini-2.5-flash-image"
+  image_edit_enabled: true
+
+phase3:
+  cache_dir: "cache/phase3"
+  min_volume_ratio: 0.15
+  max_volume_ratio: 5.0
+  min_area_ratio: 0.1
+  max_area_ratio: 8.0
+  min_edit_ratio: 0.02
+  max_edit_ratio: 0.70
+  edit_ratio_precision: 4
+  min_part_proportion: 0.005
+  max_part_proportion: 0.80
+  max_components: 5
+  min_vertices: 50
+  min_extent: 0.0001
+  max_center_drift: 0.3
+  min_bbox_iou: 0.1
+  check_vertex_color: true
+  max_penetration: 0.3
+  max_gap_ratio: 0.15
+  max_scale_ratio: 3.0
+  instructions_per_edit: 3
+  num_views: 12
+  resolution: 518
+  blender_path: "blender"
+
+phase4:
+  min_volume_ratio: 0.15
+  max_volume_ratio: 5.0
+  max_components: 5
+  min_edit_ratio: 0.02
+  max_edit_ratio: 0.70
+  instructions_per_edit: 3
+  cache_dir: "cache/phase4"
+
+logging:
+  level: "INFO"
+  log_dir: "logs"

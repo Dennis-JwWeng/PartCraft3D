@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+outputs/
+cache/
+logs/
+*.tar.gz
+.env
+checkpoints/
+data/
+archive_v1/
+
+# Config files contain API keys — use .example versions
+configs/default.yaml
+configs/partobjaverse.yaml
