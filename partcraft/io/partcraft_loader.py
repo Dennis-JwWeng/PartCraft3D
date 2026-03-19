@@ -1,0 +1,682 @@
+"""PartCraft3D dataset loader.
+
+Data format produced by `PartCraftDataset.prepare_from_prerender()`:
+
+    render_dir/
+    └── {shard}/
+        └── {obj_id}.npz
+            ├── 000.png .. 149.png      # Blender Cycles RGBA renders
+            ├── transforms.json         # Camera c2w + FOV per frame
+            └── split_mesh.json         # Part cluster metadata
+
+    mesh_dir/
+    └── {shard}/
+        └── {obj_id}.npz
+            ├── full.ply                # Complete mesh (camera space)
+            └── part_0..N.ply           # Per-part watertight meshes
+
+Masks are rendered on-demand from part meshes + camera transforms
+via pyrender (no pre-generation needed).
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import math
+import os
+import zipfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterator
+
+import numpy as np
+
+try:
+    import trimesh
+except ImportError:
+    trimesh = None
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+
+@dataclass
+class PartInfo:
+    """Metadata for a single part cluster."""
+    part_id: int
+    cluster_name: str
+    mesh_node_names: list[str]
+    cluster_size: int
+
+
+@dataclass
+class ObjectRecord:
+    """Lazy-loaded record for one object."""
+    obj_id: str
+    shard: str
+    render_npz_path: str
+    mesh_npz_path: str
+    num_views: int = 0
+    parts: list[PartInfo] = field(default_factory=list)
+    part_id_to_name: list[str] = field(default_factory=list)
+
+    # Lazily loaded
+    _render_npz: np.lib.npyio.NpzFile | None = field(default=None, repr=False)
+    _mesh_npz: np.lib.npyio.NpzFile | None = field(default=None, repr=False)
+    _mask_cache: dict[int, np.ndarray] = field(default_factory=dict, repr=False)
+    _mask_renderer: object | None = field(default=None, repr=False)
+    _mask_scene: object | None = field(default=None, repr=False)
+    _mask_cam_node: object | None = field(default=None, repr=False)
+    _mask_resolution: int = field(default=512, repr=False)
+
+    def _ensure_render_npz(self):
+        if self._render_npz is None:
+            self._render_npz = np.load(self.render_npz_path, allow_pickle=True)
+
+    def _ensure_mesh_npz(self):
+        if self._mesh_npz is None:
+            self._mesh_npz = np.load(self.mesh_npz_path, allow_pickle=True)
+
+    def close(self):
+        if self._render_npz is not None:
+            self._render_npz.close()
+            self._render_npz = None
+        if self._mesh_npz is not None:
+            self._mesh_npz.close()
+            self._mesh_npz = None
+        if self._mask_renderer is not None:
+            try:
+                self._mask_renderer.delete()
+            except Exception:
+                pass
+            self._mask_renderer = None
+        self._mask_scene = None
+        self._mask_cam_node = None
+        self._mask_cache.clear()
+
+    # ---- Image access ----
+
+    def get_image_bytes(self, view_idx: int) -> bytes:
+        """Return raw image bytes (PNG or WebP) for a given view."""
+        self._ensure_render_npz()
+        for ext in (".png", ".webp"):
+            key = f"{view_idx:03d}{ext}"
+            if key in self._render_npz:
+                return self._render_npz[key].tobytes()
+        raise KeyError(f"No image for view {view_idx} in {self.render_npz_path}")
+
+    def get_image_pil(self, view_idx: int) -> "Image.Image":
+        """Return PIL Image for a given view."""
+        assert Image is not None, "Pillow is required"
+        return Image.open(io.BytesIO(self.get_image_bytes(view_idx)))
+
+    # ---- Mask access (on-demand rendering) ----
+
+    def get_mask(self, view_idx: int) -> np.ndarray:
+        """Return segmentation mask (H, W) int16 array. -1 = background.
+
+        Renders on-demand from part meshes + camera transforms.
+        Pre-generated masks in the NPZ are used if available.
+        """
+        if view_idx in self._mask_cache:
+            return self._mask_cache[view_idx]
+
+        # Try pre-generated mask
+        self._ensure_render_npz()
+        key = f"{view_idx:03d}_mask.npy"
+        if key in self._render_npz:
+            mask = self._render_npz[key]
+            self._mask_cache[view_idx] = mask
+            return mask
+
+        # Render on-demand
+        mask = self._render_mask(view_idx)
+        self._mask_cache[view_idx] = mask
+        return mask
+
+    def _ensure_mask_renderer(self):
+        """Build pyrender scene with instance-colored part meshes (lazy)."""
+        if self._mask_scene is not None:
+            return
+
+        os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+        import pyrender
+
+        assert trimesh is not None, "trimesh required for mask rendering"
+        self._ensure_mesh_npz()
+
+        # Detect resolution from first image
+        self._ensure_render_npz()
+        for ext in (".png", ".webp"):
+            k = f"000{ext}"
+            if k in self._render_npz:
+                img = Image.open(io.BytesIO(self._render_npz[k].tobytes()))
+                self._mask_resolution = img.size[0]
+                break
+
+        # Combine all part meshes with instance-colored faces
+        all_verts, all_faces, all_colors = [], [], []
+        offset = 0
+        part_ids = sorted(p.part_id for p in self.parts)
+
+        for pid in part_ids:
+            key = f"part_{pid}.ply"
+            if key not in self._mesh_npz:
+                continue
+            part_mesh = trimesh.load(
+                io.BytesIO(self._mesh_npz[key].tobytes()), file_type="ply")
+            n_faces = len(part_mesh.faces)
+
+            fc = np.zeros((n_faces, 4), dtype=np.uint8)
+            fc[:, 0] = pid % 256
+            fc[:, 1] = pid // 256
+            fc[:, 3] = 255
+
+            all_verts.append(np.array(part_mesh.vertices))
+            all_faces.append(part_mesh.faces + offset)
+            all_colors.append(fc)
+            offset += len(part_mesh.vertices)
+
+        if not all_verts:
+            self._mask_scene = "empty"
+            return
+
+        combined = trimesh.Trimesh(
+            vertices=np.concatenate(all_verts),
+            faces=np.concatenate(all_faces),
+            process=False,
+        )
+        combined.visual = trimesh.visual.ColorVisuals(
+            mesh=combined, face_colors=np.concatenate(all_colors))
+
+        scene = pyrender.Scene(
+            bg_color=[0, 0, 0, 0], ambient_light=[1.0, 1.0, 1.0])
+        scene.add(pyrender.Mesh.from_trimesh(combined, smooth=False))
+
+        transforms = self.get_transforms()
+        fov = transforms["frames"][0]["camera_angle_x"]
+        camera = pyrender.PerspectiveCamera(yfov=fov)
+        cam_node = scene.add(camera, pose=np.eye(4))
+
+        renderer = pyrender.OffscreenRenderer(
+            self._mask_resolution, self._mask_resolution)
+
+        self._mask_scene = scene
+        self._mask_cam_node = cam_node
+        self._mask_renderer = renderer
+
+    def _render_mask(self, view_idx: int) -> np.ndarray:
+        """Render a single mask on-demand."""
+        import pyrender
+
+        self._ensure_mask_renderer()
+        res = self._mask_resolution
+        if self._mask_scene == "empty":
+            return np.full((res, res), -1, dtype=np.int16)
+
+        transforms = self.get_transforms()
+        c2w = np.array(
+            transforms["frames"][view_idx]["transform_matrix"],
+            dtype=np.float64)
+
+        self._mask_scene.set_pose(self._mask_cam_node, c2w)
+        color, _ = self._mask_renderer.render(
+            self._mask_scene,
+            flags=pyrender.RenderFlags.FLAT | pyrender.RenderFlags.RGBA)
+
+        mask = np.full((res, res), -1, dtype=np.int16)
+        fg = color[:, :, 3] > 0
+        mask[fg] = (color[fg, 0].astype(np.int16)
+                    + color[fg, 1].astype(np.int16) * 256)
+        return mask
+
+    # ---- Transforms ----
+
+    def get_transforms(self) -> dict:
+        """Return camera transforms dict."""
+        self._ensure_render_npz()
+        return json.loads(
+            self._render_npz["transforms.json"].tobytes().decode("utf-8"))
+
+    # ---- Vertex color baking ----
+
+    def bake_vertex_colors(self, mesh: "trimesh.Trimesh",
+                           view_step: int = 1) -> "trimesh.Trimesh":
+        """Project colors from rendered views onto mesh vertices."""
+        assert Image is not None, "Pillow is required"
+        self._ensure_render_npz()
+
+        transforms = self.get_transforms()
+        frames = transforms["frames"]
+        vertices = np.array(mesh.vertices, dtype=np.float64)
+        n_verts = len(vertices)
+
+        color_sum = np.zeros((n_verts, 3), dtype=np.float64)
+        color_count = np.zeros(n_verts, dtype=np.float64)
+
+        # Detect resolution
+        H = W = self._mask_resolution
+        for ext in (".png", ".webp"):
+            k = f"000{ext}"
+            if k in self._render_npz:
+                img0 = Image.open(io.BytesIO(self._render_npz[k].tobytes()))
+                W, H = img0.size
+                break
+
+        verts_h = np.hstack([vertices, np.ones((n_verts, 1))])
+
+        for i in range(0, len(frames), view_step):
+            frame = frames[i]
+            img_bytes = None
+            for ext in (".png", ".webp"):
+                k = f"{i:03d}{ext}"
+                if k in self._render_npz:
+                    img_bytes = self._render_npz[k].tobytes()
+                    break
+            if img_bytes is None:
+                continue
+
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGBA").resize((W, H))
+            img_arr = np.array(img)
+            alpha = img_arr[:, :, 3].astype(np.float32) / 255.0
+            rgb = img_arr[:, :, :3].astype(np.float32)
+
+            c2w = np.array(frame["transform_matrix"], dtype=np.float64)
+            w2c = np.linalg.inv(c2w)
+            fov = frame["camera_angle_x"]
+            focal = (W / 2.0) / math.tan(fov / 2.0)
+
+            verts_cam = (w2c @ verts_h.T).T
+            z = verts_cam[:, 2]
+            in_front = z < 0
+
+            z_safe = np.where(in_front, z, -1e-8)
+            u = focal * verts_cam[:, 0] / (-z_safe) + W / 2.0
+            v = focal * (-verts_cam[:, 1]) / (-z_safe) + H / 2.0
+
+            u_safe = np.nan_to_num(u, nan=0.0, posinf=float(W), neginf=-1.0)
+            v_safe = np.nan_to_num(v, nan=0.0, posinf=float(H), neginf=-1.0)
+            u_int = np.clip(np.round(u_safe).astype(np.int32), 0, W - 1)
+            v_int = np.clip(np.round(v_safe).astype(np.int32), 0, H - 1)
+
+            in_bounds = (in_front & (u_safe >= 0) & (u_safe < W)
+                         & (v_safe >= 0) & (v_safe < H))
+            visible = in_bounds & (alpha[v_int, u_int] > 0.5)
+
+            color_sum[visible] += rgb[v_int[visible], u_int[visible]]
+            color_count[visible] += 1
+
+        has_color = color_count > 0
+        result = np.full((n_verts, 4), 128, dtype=np.uint8)
+        result[:, 3] = 255
+        if has_color.any():
+            result[has_color, :3] = np.clip(
+                color_sum[has_color] / color_count[has_color, None],
+                0, 255).astype(np.uint8)
+
+        mesh.visual.vertex_colors = result
+        return mesh
+
+    # ---- Mesh access ----
+
+    def get_full_mesh(self, colored: bool = True) -> "trimesh.Trimesh":
+        assert trimesh is not None, "trimesh is required"
+        self._ensure_mesh_npz()
+        mesh = trimesh.load(
+            io.BytesIO(self._mesh_npz["full.ply"].tobytes()), file_type="ply")
+        if colored:
+            self.bake_vertex_colors(mesh)
+        return mesh
+
+    def get_part_mesh(self, part_id: int,
+                      colored: bool = True) -> "trimesh.Trimesh":
+        assert trimesh is not None, "trimesh is required"
+        self._ensure_mesh_npz()
+        key = f"part_{part_id}.ply"
+        if key not in self._mesh_npz:
+            raise KeyError(f"'{key}' not found in {self.mesh_npz_path}")
+        mesh = trimesh.load(
+            io.BytesIO(self._mesh_npz[key].tobytes()), file_type="ply")
+        if colored:
+            self.bake_vertex_colors(mesh)
+        return mesh
+
+    def get_assembled_mesh(self, part_ids: list[int],
+                           colored: bool = True) -> "trimesh.Trimesh":
+        assert trimesh is not None, "trimesh is required"
+        meshes = []
+        for pid in part_ids:
+            try:
+                meshes.append(self.get_part_mesh(pid, colored=False))
+            except KeyError:
+                continue
+        if not meshes:
+            raise ValueError(f"No valid meshes for parts {part_ids}")
+        result = trimesh.util.concatenate(meshes)
+        if colored:
+            self.bake_vertex_colors(result)
+        return result
+
+    def get_mask_pixel_counts(self, view_idx: int) -> dict[int, int]:
+        mask = self.get_mask(view_idx)
+        unique, counts = np.unique(mask, return_counts=True)
+        return {int(v): int(c) for v, c in zip(unique, counts) if v >= 0}
+
+    def get_best_view_for_part(self, part_id: int) -> int:
+        best_view, best_count = 0, 0
+        for v in range(self.num_views):
+            mask = self.get_mask(v)
+            count = int(np.sum(mask == part_id))
+            if count > best_count:
+                best_count = count
+                best_view = v
+        return best_view
+
+
+# =========================================================================
+# Dataset class
+# =========================================================================
+
+class PartCraftDataset:
+    """PartCraft3D dataset: pre-rendered views + watertight part meshes."""
+
+    def __init__(self, render_dir: str, mesh_dir: str,
+                 shards: list[str] | None = None):
+        self.render_dir = Path(render_dir)
+        self.mesh_dir = Path(mesh_dir)
+
+        if shards is None:
+            shards = sorted(
+                d.name for d in self.render_dir.iterdir()
+                if d.is_dir() and d.name.isdigit()
+            )
+        self.shards = shards
+        self._index: list[tuple[str, str]] | None = None
+
+    def _build_index(self):
+        self._index = []
+        for shard in self.shards:
+            rdir = self.render_dir / shard
+            mdir = self.mesh_dir / shard
+            if not rdir.exists():
+                continue
+            for f in sorted(rdir.iterdir()):
+                if f.suffix != ".npz":
+                    continue
+                obj_id = f.stem
+                if (mdir / f.name).exists():
+                    self._index.append((shard, obj_id))
+
+    def __len__(self) -> int:
+        if self._index is None:
+            self._build_index()
+        return len(self._index)
+
+    def __iter__(self) -> Iterator[ObjectRecord]:
+        if self._index is None:
+            self._build_index()
+        for shard, obj_id in self._index:
+            yield self.load_object(shard, obj_id)
+
+    def load_object(self, shard: str, obj_id: str) -> ObjectRecord:
+        rpath = str(self.render_dir / shard / f"{obj_id}.npz")
+        mpath = str(self.mesh_dir / shard / f"{obj_id}.npz")
+
+        rnpz = np.load(rpath, allow_pickle=True)
+        sm = json.loads(rnpz["split_mesh.json"].tobytes().decode("utf-8"))
+        part_id_to_name = sm["part_id_to_name"]
+        valid_clusters = sm["valid_clusters"]
+
+        parts = []
+        for cluster_name, cluster_info in valid_clusters.items():
+            pid = int(cluster_name.split("_")[-1])
+            mesh_node_names = [
+                part_id_to_name[i] for i in cluster_info["part_ids"]
+                if i < len(part_id_to_name)
+            ]
+            parts.append(PartInfo(
+                part_id=pid,
+                cluster_name=cluster_name,
+                mesh_node_names=mesh_node_names,
+                cluster_size=cluster_info["cluster_size"],
+            ))
+
+        num_views = max(
+            sum(1 for k in rnpz.keys() if k.endswith(".png")),
+            sum(1 for k in rnpz.keys() if k.endswith(".webp")),
+        )
+        rnpz.close()
+
+        return ObjectRecord(
+            obj_id=obj_id,
+            shard=shard,
+            render_npz_path=rpath,
+            mesh_npz_path=mpath,
+            num_views=num_views,
+            parts=parts,
+            part_id_to_name=part_id_to_name,
+        )
+
+    # ---- Data preparation ----
+
+    @staticmethod
+    def prepare_from_prerender(
+        img_enc_base: str | Path,
+        source_dir: str | Path,
+        render_out_dir: str | Path,
+        mesh_out_dir: str | Path,
+        shard: str = "00",
+        limit: int = 0,
+        force: bool = False,
+    ) -> dict:
+        """Pack Vinedresser3D prerender outputs into PartCraft NPZ format.
+
+        Args:
+            img_enc_base: Path to Vinedresser3D outputs/img_Enc/
+            source_dir:   Path to source/ (semantic.json, instance_gt.zip, mesh.zip)
+            render_out_dir: Output dir for render NPZs (e.g., data/.../images)
+            mesh_out_dir:   Output dir for mesh NPZs (e.g., data/.../mesh)
+            shard: Shard name (default "00")
+            limit: Max objects (0 = all)
+            force: Overwrite existing NPZs
+
+        Returns:
+            Summary dict with counts.
+        """
+        img_enc_base = Path(img_enc_base)
+        source_dir = Path(source_dir)
+        render_out = Path(render_out_dir) / shard
+        mesh_out = Path(mesh_out_dir) / shard
+        render_out.mkdir(parents=True, exist_ok=True)
+        mesh_out.mkdir(parents=True, exist_ok=True)
+
+        # Load semantic labels
+        sem_path = source_dir / "semantic.json"
+        uid_labels: dict[str, list[str]] = {}
+        if sem_path.exists():
+            with open(sem_path) as f:
+                for cat, objs in json.load(f).items():
+                    for uid, lbls in objs.items():
+                        uid_labels[uid] = lbls
+
+        obj_ids = sorted(d.name for d in img_enc_base.iterdir() if d.is_dir())
+        if limit > 0:
+            obj_ids = obj_ids[:limit]
+
+        total = len(obj_ids)
+        print(f"Packing {total} objects ...")
+
+        ok, skip, fail = 0, 0, 0
+        for i, obj_id in enumerate(obj_ids):
+            out_r = render_out / f"{obj_id}.npz"
+            out_m = mesh_out / f"{obj_id}.npz"
+            if out_r.exists() and out_m.exists() and not force:
+                skip += 1
+                continue
+
+            result = _pack_one_object(
+                obj_id, img_enc_base / obj_id,
+                render_out, mesh_out,
+                source_dir, uid_labels.get(obj_id, []))
+
+            if result["status"] == "ok":
+                ok += 1
+                print(f"  [{i+1}/{total}] {obj_id}: "
+                      f"{result['views']} views, {result['parts']} parts")
+            else:
+                fail += 1
+                print(f"  [{i+1}/{total}] {obj_id}: SKIP - {result.get('reason','?')}")
+
+        return {"packed": ok, "skipped": skip, "failed": fail, "total": total}
+
+
+# =========================================================================
+# Internal helpers for prepare_from_prerender
+# =========================================================================
+
+def _pack_one_object(obj_id: str, img_enc_dir: Path,
+                     render_out: Path, mesh_out: Path,
+                     source_dir: Path, labels: list[str]) -> dict:
+    """Pack one object into render NPZ + mesh NPZ."""
+    transforms_path = img_enc_dir / "transforms.json"
+    mesh_ply_path = img_enc_dir / "mesh.ply"
+
+    if not transforms_path.exists() or not mesh_ply_path.exists():
+        return {"obj_id": obj_id, "status": "skip", "reason": "missing files"}
+
+    with open(transforms_path) as f:
+        transforms = json.load(f)
+    frames = transforms["frames"]
+
+    # ---- Render NPZ: PNGs + transforms + split_mesh ----
+    render_data = {}
+    found = 0
+    for i in range(len(frames)):
+        png = img_enc_dir / f"{i:03d}.png"
+        if not png.exists():
+            continue
+        with open(png, "rb") as f:
+            render_data[f"{i:03d}.png"] = np.frombuffer(f.read(), dtype=np.uint8)
+        found += 1
+
+    if found == 0:
+        return {"obj_id": obj_id, "status": "skip", "reason": "no PNGs"}
+
+    render_data["transforms.json"] = np.frombuffer(
+        json.dumps(transforms).encode("utf-8"), dtype=np.uint8)
+
+    # ---- Mesh NPZ: split mesh.ply by instance_gt ----
+    mesh_150 = trimesh.load(str(mesh_ply_path), file_type="ply")
+    instance_gt = _load_gt_npy(source_dir / "instance_gt.zip", obj_id)
+
+    if instance_gt is None:
+        return {"obj_id": obj_id, "status": "skip", "reason": "no instance_gt"}
+
+    # Handle face count mismatch (VD may remove degenerate faces)
+    if len(instance_gt) != len(mesh_150.faces):
+        instance_gt = _transfer_labels_nearest(
+            source_dir, obj_id, mesh_150, instance_gt)
+        if instance_gt is None:
+            return {"obj_id": obj_id, "status": "skip",
+                    "reason": "face transfer failed"}
+
+    parts, split_mesh_json = _split_mesh(mesh_150, instance_gt, labels)
+
+    render_data["split_mesh.json"] = np.frombuffer(
+        json.dumps(split_mesh_json).encode("utf-8"), dtype=np.uint8)
+
+    mesh_data = {
+        "full.ply": np.frombuffer(_to_ply(mesh_150), dtype=np.uint8),
+    }
+    for pid, label, sub in parts:
+        mesh_data[f"part_{pid}.ply"] = np.frombuffer(
+            _to_ply(sub), dtype=np.uint8)
+
+    np.savez_compressed(str(render_out / f"{obj_id}.npz"), **render_data)
+    np.savez_compressed(str(mesh_out / f"{obj_id}.npz"), **mesh_data)
+
+    return {"obj_id": obj_id, "status": "ok",
+            "views": found, "parts": len(parts)}
+
+
+def _load_gt_npy(zip_path: Path, obj_id: str) -> np.ndarray | None:
+    if not zip_path.exists():
+        return None
+    with zipfile.ZipFile(zip_path) as zf:
+        matches = [n for n in zf.namelist()
+                    if obj_id in n and n.endswith('.npy')]
+        if not matches:
+            return None
+        return np.load(io.BytesIO(zf.read(matches[0])))
+
+
+def _transfer_labels_nearest(source_dir: Path, obj_id: str,
+                              target_mesh, orig_gt) -> np.ndarray | None:
+    """Transfer per-face labels via nearest face centroid."""
+    from scipy.spatial import cKDTree
+
+    mesh_zip = source_dir / "mesh.zip"
+    if not mesh_zip.exists():
+        return None
+    with zipfile.ZipFile(mesh_zip) as zf:
+        matches = [n for n in zf.namelist()
+                    if obj_id in n and n.endswith('.glb')]
+        if not matches:
+            return None
+        scene = trimesh.load(io.BytesIO(zf.read(matches[0])), file_type='glb')
+        orig = (scene.to_geometry() if hasattr(scene, 'to_geometry')
+                else scene.dump(concatenate=True)
+                if isinstance(scene, trimesh.Scene) else scene)
+
+    if len(orig_gt) != len(orig.faces):
+        return None
+
+    # Centroids in original space → normalize to target space
+    oc = orig.vertices[orig.faces].mean(axis=1)
+    o_ctr = (orig.bounds[0] + orig.bounds[1]) / 2
+    o_ext = orig.extents.max()
+    t_ctr = (target_mesh.bounds[0] + target_mesh.bounds[1]) / 2
+    t_ext = target_mesh.extents.max()
+    if o_ext > 0:
+        oc = (oc - o_ctr) * (t_ext / o_ext) + t_ctr
+
+    tc = target_mesh.vertices[target_mesh.faces].mean(axis=1)
+    _, idx = cKDTree(oc).query(tc)
+    return orig_gt[idx]
+
+
+def _split_mesh(mesh, instance_gt, labels):
+    """Split mesh into per-instance parts."""
+    instance_ids = np.unique(instance_gt)
+    parts, pid_names, clusters = [], [], {}
+
+    for inst_id in sorted(instance_ids):
+        fi = np.where(instance_gt == inst_id)[0]
+        lbl = labels[inst_id] if inst_id < len(labels) else f"part_{inst_id}"
+        pid = int(inst_id)
+
+        sub_faces = mesh.faces[fi]
+        used = np.unique(sub_faces)
+        vmap = np.full(len(mesh.vertices), -1, dtype=int)
+        vmap[used] = np.arange(len(used))
+
+        sub = trimesh.Trimesh(
+            vertices=mesh.vertices[used],
+            faces=vmap[sub_faces],
+            process=False)
+
+        pid_names.append(f"{lbl}_{pid}")
+        clusters[f"part_{pid}"] = {
+            "part_ids": [pid], "cluster_size": int(len(fi))}
+        parts.append((pid, lbl, sub))
+
+    return parts, {"part_id_to_name": pid_names, "valid_clusters": clusters}
+
+
+def _to_ply(mesh) -> bytes:
+    buf = io.BytesIO()
+    mesh.export(buf, file_type="ply")
+    return buf.getvalue()

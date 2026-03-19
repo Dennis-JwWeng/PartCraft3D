@@ -64,7 +64,7 @@ DATASET_REPO = "yhyang-myron/PartObjaverse-Tiny"
 NUM_VIEWS = 42
 RENDER_RES = 518  # match HY3D-Part
 SHARD = "00"
-BLENDER_PATH = "/tmp/blender-3.0.1-linux-x64/blender"
+BLENDER_PATH = "/home/artgen/software/blender-3.3.1-linux-x64/blender"
 BLENDER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blender_render.py")
 
 

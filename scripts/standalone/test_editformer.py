@@ -259,7 +259,8 @@ def vlm_edit_image(ori_img: Image.Image, prompt: str, cfg: dict) -> Image.Image:
     if not api_key:
         raise RuntimeError("No VLM API key")
 
-    client = OpenAI(base_url=p0.get("vlm_base_url", ""), api_key=api_key)
+    image_edit_url = p25.get("image_edit_base_url") or p0.get("vlm_base_url", "")
+    client = OpenAI(base_url=image_edit_url, api_key=api_key)
     model = p25.get("image_edit_model", "gemini-2.5-flash-image")
 
     buf = io.BytesIO()

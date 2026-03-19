@@ -60,11 +60,9 @@ def prepare_input_image(obj_record, view_id: int,
                         edit_part_ids: list[int] | None = None) -> bytes:
     """Load view from NPZ, composite RGBA onto white, return PNG bytes.
 
-    If edit_part_ids is given, also draw a semi-transparent green overlay
-    and a red contour on the target part so the VLM knows exactly which
-    region to edit.  Returns (plain_png_bytes, annotated_pil, plain_pil).
+    Returns (png_bytes, pil_img). No mask annotation — the edit prompt
+    provides sufficient semantic clarity for the VLM.
     """
-    import numpy as np
     from PIL import Image
 
     view_bytes = obj_record.get_image_bytes(view_id)
@@ -73,75 +71,152 @@ def prepare_input_image(obj_record, view_id: int,
     bg = Image.new("RGBA", pil_img.size, (255, 255, 255, 255))
     pil_img = Image.alpha_composite(bg, pil_img).convert("RGB")
 
-    # Plain image (for saving as _input.png and for phase2.5 conditioning)
     buf = io.BytesIO()
     pil_img.save(buf, format="PNG")
-    plain_bytes = buf.getvalue()
+    return buf.getvalue(), pil_img
 
-    if not edit_part_ids:
-        return plain_bytes, pil_img, pil_img
 
-    # --- Build annotated image with part highlight ---
-    seg_mask = obj_record.get_mask(view_id)  # (H_orig, W_orig) int16
-    # Resize mask to match image (nearest to preserve IDs)
-    seg_pil = Image.fromarray(seg_mask.astype(np.int16))
-    seg_pil = seg_pil.resize((518, 518), Image.NEAREST)
-    seg_arr = np.array(seg_pil)
+def check_edit_server(base_url: str):
+    """Check that the image edit server is reachable."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(f"{base_url}/health")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            if data.get("status") == "ok":
+                return True
+    except Exception:
+        pass
+    return False
 
-    # Binary mask: True where target part is
-    part_binary = np.zeros_like(seg_arr, dtype=bool)
-    for pid in edit_part_ids:
-        part_binary |= (seg_arr == pid)
 
-    if not part_binary.any():
-        # Part not visible in this view, return plain
-        return plain_bytes, pil_img, pil_img
+def _build_edit_prompt(edit_prompt: str, after_part_desc: str,
+                       old_part_label: str = "",
+                       before_part_desc: str = "",
+                       edit_type: str = "modification") -> str:
+    """Build a constrained prompt for 2D image editing.
 
-    # Semi-transparent green overlay on the part
-    annotated = pil_img.copy()
-    overlay = np.array(annotated).copy()
-    overlay[part_binary] = (
-        overlay[part_binary] * 0.6 + np.array([0, 200, 0]) * 0.4
-    ).astype(np.uint8)
+    Adapts prompt structure to the edit type:
+      - deletion: instruct removal, generate clean closure
+      - modification: instruct part replacement, preserve others
+      - global: instruct whole-object style change
+    """
+    et = edit_type.lower()
 
-    # Red contour: dilate mask - erode mask = boundary
-    from scipy import ndimage
-    dilated = ndimage.binary_dilation(part_binary, iterations=3)
-    eroded = ndimage.binary_erosion(part_binary, iterations=1)
-    contour = dilated & ~eroded
-    overlay[contour] = [255, 50, 50]
+    if et == "deletion":
+        # Deletion: remove part(s), generate clean object without them
+        if old_part_label:
+            target = f"the '{old_part_label}'"
+        else:
+            target = "the specified part"
+        text = (
+            f"This is a 3D rendered object on a white background. "
+            f"{edit_prompt}. "
+            f"Generate the same object WITHOUT {target}. "
+            f"Fill in the area where {target} was with a smooth, "
+            f"natural surface continuous with the surrounding geometry."
+        )
+        if after_part_desc:
+            text += f"\nThe result should look like: {after_part_desc}"
+        text += (
+            "\nIMPORTANT constraints:"
+            "\n- Keep the exact same camera viewpoint and angle."
+            "\n- Keep the white background completely unchanged."
+            "\n- Keep ALL other parts of the object exactly as they are."
+            "\n- The removed area should blend naturally with surrounding surfaces."
+        )
+    elif et == "global":
+        # Global: whole-object style/theme change
+        text = (
+            f"This is a 3D rendered object on a white background. "
+            f"Apply the following style change to the ENTIRE object: "
+            f"{edit_prompt}"
+        )
+        if after_part_desc:
+            text += f"\nThe result should look like: {after_part_desc}"
+        text += (
+            "\nIMPORTANT constraints:"
+            "\n- Keep the exact same camera viewpoint and angle."
+            "\n- Keep the white background completely unchanged."
+            "\n- Keep the overall shape, pose, and position unchanged."
+            "\n- Only change the style, texture, or color as instructed."
+        )
+    else:
+        # Modification: edit specific part(s)
+        if old_part_label:
+            target = f"the '{old_part_label}' part"
+        else:
+            target = "the specified part"
+        text = (
+            f"This is a 3D rendered object on a white background. "
+            f"Edit ONLY {target} of this object. "
+            f"Editing instruction: {edit_prompt}"
+        )
+        if before_part_desc:
+            text += f"\nThe part currently looks like: {before_part_desc}"
+        if after_part_desc:
+            text += f"\nAfter editing, it should look like: {after_part_desc}"
+        text += (
+            "\nIMPORTANT constraints:"
+            "\n- Keep the exact same camera viewpoint and angle."
+            "\n- Keep the white background completely unchanged."
+            "\n- Keep ALL other parts of the object exactly as they are."
+            "\n- Do NOT change the overall shape, pose, or position of the object."
+            "\n- Only modify the target part as instructed."
+        )
+    return text
 
-    annotated = Image.fromarray(overlay)
-    buf2 = io.BytesIO()
-    annotated.save(buf2, format="PNG")
-    annotated_bytes = buf2.getvalue()
 
-    return annotated_bytes, annotated, pil_img
+def call_local_edit(base_url: str, img_bytes: bytes, edit_prompt: str,
+                    after_part_desc: str,
+                    old_part_label: str = "",
+                    before_part_desc: str = "",
+                    edit_type: str = "modification") -> "Image.Image | None":
+    """Edit image via local HTTP image edit server."""
+    import base64
+    import urllib.request
+    from PIL import Image
+
+    text_input = _build_edit_prompt(
+        edit_prompt, after_part_desc, old_part_label, before_part_desc,
+        edit_type=edit_type)
+
+    image_b64 = base64.b64encode(img_bytes).decode("utf-8")
+    payload = json.dumps({"image_b64": image_b64, "prompt": text_input}).encode()
+
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/edit",
+            data=payload,
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            data = json.loads(resp.read())
+
+        if data.get("status") == "ok":
+            img_data = base64.b64decode(data["image_b64"])
+            return Image.open(io.BytesIO(img_data))
+        else:
+            print(f"  Edit server error: {data.get('msg', 'unknown')}")
+            return None
+    except Exception as e:
+        print(f"  Edit server request failed: {e}")
+        return None
 
 
 def call_vlm_edit(client, img_bytes: bytes, edit_prompt: str,
                   after_part_desc: str, model: str,
-                  has_annotation: bool = False) -> "Image.Image | None":
-    """Call VLM to produce an edited image."""
+                  old_part_label: str = "",
+                  before_part_desc: str = "",
+                  edit_type: str = "modification",
+                  **kwargs) -> "Image.Image | None":
+    """Call VLM to produce an edited image via OpenAI-compatible API."""
     import base64
     from PIL import Image
 
     b64 = base64.b64encode(img_bytes).decode('utf-8')
-    if has_annotation:
-        text_input = (
-            "The image has a green highlighted region with a red outline. "
-            "This marks the ONLY part you should edit. "
-            "Do NOT modify anything outside the highlighted region. "
-            f"Edit that specific part with: {edit_prompt}"
-        )
-    else:
-        text_input = f"Edit the image provided with the editing prompt: {edit_prompt}"
-    if after_part_desc:
-        text_input += f"\nThe edited part should look like: {after_part_desc}"
-    text_input += (
-        "\nIMPORTANT: Output a clean edited image WITHOUT any annotations, "
-        "highlights, outlines, or overlays. The result should look natural."
-    )
+    text_input = _build_edit_prompt(
+        edit_prompt, after_part_desc, old_part_label, before_part_desc,
+        edit_type=edit_type)
 
     try:
         response = client.chat.completions.create(
@@ -186,8 +261,13 @@ def call_vlm_edit(client, img_bytes: bytes, edit_prompt: str,
 
 
 def process_one(spec: EditSpec, dataset, client, output_dir: Path,
-                model: str, logger) -> dict:
-    """Process a single edit spec: select view → edit → save."""
+                model: str, logger, edit_server_url=None) -> dict:
+    """Process a single edit spec: select view → edit → save.
+
+    Args:
+        client: OpenAI client for API backend (can be None if edit_server_url set).
+        edit_server_url: Base URL of local image edit server (e.g. http://localhost:8001).
+    """
     edit_id = spec.edit_id
     result = {"edit_id": edit_id, "obj_id": spec.obj_id}
 
@@ -197,31 +277,53 @@ def process_one(spec: EditSpec, dataset, client, output_dir: Path,
             edit_part_ids = spec.remove_part_ids
         elif spec.edit_type == "global":
             edit_part_ids = []  # no specific part — whole object
+        elif spec.edit_type == "modification" and spec.remove_part_ids:
+            # Group modification: use all parts in the group
+            edit_part_ids = spec.remove_part_ids
         else:
             edit_part_ids = [spec.old_part_id]
 
-        # 1. Select best view
-        best_view = select_best_view(obj, edit_part_ids or
-                                     [p.part_id for p in obj.parts])
+        # 1. Select best view — prefer Step 1's orthogonal selection
+        if hasattr(spec, 'best_view') and spec.best_view >= 0:
+            best_view = spec.best_view
+        else:
+            best_view = select_best_view(obj, edit_part_ids or
+                                         [p.part_id for p in obj.parts])
         result["view_id"] = best_view
 
-        # 2. Prepare input image (with part annotation for VLM)
-        annotated_bytes, annotated_pil, plain_pil = prepare_input_image(
+        # 2. Prepare input image (plain, no mask annotation)
+        img_bytes, pil_img = prepare_input_image(
             obj, best_view, edit_part_ids)
-        has_annotation = (annotated_pil is not plain_pil)
 
-        # Save both: plain for phase2.5 conditioning, annotated for debug
         input_path = output_dir / f"{edit_id}_input.png"
-        plain_pil.save(str(input_path))
-        if has_annotation:
-            debug_path = output_dir / f"{edit_id}_annotated.png"
-            annotated_pil.save(str(debug_path))
+        pil_img.save(str(input_path))
 
-        # 3. Call VLM with annotated image (part region highlighted)
-        edited = call_vlm_edit(
-            client, annotated_bytes, spec.edit_prompt,
-            spec.after_part_desc, model,
-            has_annotation=has_annotation)
+        # 3. Edit image — local server or API
+        after_desc = spec.after_desc or spec.after_part_desc or ""
+        before_desc = getattr(spec, 'before_part_desc', '') or ''
+
+        # Build part label: use all remove_labels for groups,
+        # fallback to old_label for single-part edits
+        remove_labels = getattr(spec, 'remove_labels', [])
+        old_label = getattr(spec, 'old_label', '') or ''
+        if remove_labels and len(remove_labels) > 1:
+            part_label = ", ".join(remove_labels)
+        elif remove_labels:
+            part_label = remove_labels[0]
+        else:
+            part_label = old_label
+
+        if edit_server_url is not None:
+            edited = call_local_edit(
+                edit_server_url, img_bytes, spec.edit_prompt, after_desc,
+                old_part_label=part_label, before_part_desc=before_desc,
+                edit_type=spec.edit_type)
+        else:
+            edited = call_vlm_edit(
+                client, img_bytes, spec.edit_prompt,
+                after_desc, model,
+                old_part_label=part_label, before_part_desc=before_desc,
+                edit_type=spec.edit_type)
 
         if edited is not None:
             edited = edited.resize((518, 518))
@@ -275,32 +377,50 @@ def main():
     p0 = cfg["phase0"]
     p25 = cfg.get("phase2_5", {})
 
-    # --- VLM client ---
-    from openai import OpenAI
-    api_key = p0.get("vlm_api_key", "")
-    if not api_key:
-        # Fallback to default.yaml
-        import yaml
-        default_cfg_path = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
-        if default_cfg_path.exists():
-            with open(default_cfg_path) as f:
-                default_cfg = yaml.safe_load(f)
-            api_key = default_cfg.get("phase0", {}).get("vlm_api_key", "")
-    if not api_key:
-        env_var = p0.get("vlm_api_key_env", "")
-        if env_var:
-            import os
-            api_key = os.environ.get(env_var, "")
-
-    if not api_key:
-        print("ERROR: No API key. Set phase0.vlm_api_key in config or default.yaml")
-        sys.exit(1)
-
-    client = OpenAI(
-        base_url=p0.get("vlm_base_url", ""),
-        api_key=api_key,
-    )
+    # --- Image edit backend ---
+    image_edit_backend = p25.get("image_edit_backend", "api")
+    client = None
+    edit_server_url = None
     model = args.model or p25.get("image_edit_model", "gemini-2.5-flash-image")
+
+    if image_edit_backend == "local_diffusers":
+        edit_server_url = p25.get("image_edit_base_url", "http://localhost:8001")
+        if not check_edit_server(edit_server_url):
+            print(f"ERROR: Image edit server not reachable at {edit_server_url}")
+            print("Start it first:  conda activate qwen_test && "
+                  "python scripts/tools/image_edit_server.py --gpu 2")
+            sys.exit(1)
+        print(f"Image edit server OK at {edit_server_url}")
+        # Use configured workers (default 1 for single-GPU sequential serving)
+        cfg_workers = p25.get("image_edit_workers", 1)
+        if args.workers != cfg_workers:
+            logger.info(f"local_diffusers backend: workers={cfg_workers} "
+                        f"(from config)")
+            args.workers = cfg_workers
+    else:
+        from openai import OpenAI
+        api_key = p0.get("vlm_api_key", "")
+        if not api_key:
+            import yaml
+            default_cfg_path = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
+            if default_cfg_path.exists():
+                with open(default_cfg_path) as f:
+                    default_cfg = yaml.safe_load(f)
+                api_key = default_cfg.get("phase0", {}).get("vlm_api_key", "")
+        if not api_key:
+            env_var = p0.get("vlm_api_key_env", "")
+            if env_var:
+                import os
+                api_key = os.environ.get(env_var, "")
+        if not api_key:
+            print("ERROR: No API key. Set phase0.vlm_api_key in config or default.yaml")
+            sys.exit(1)
+
+        image_edit_url = p25.get("image_edit_base_url") or p0.get("vlm_base_url", "")
+        client = OpenAI(
+            base_url=image_edit_url,
+            api_key=api_key,
+        )
 
     # --- Dataset ---
     dataset = HY3DPartDataset(
@@ -349,8 +469,9 @@ def main():
                     pass
 
     pending = [s for s in mod_specs if s.edit_id not in done_ids]
+    backend_label = edit_server_url or model
     logger.info(f"Phase 2D: {len(pending)} edits to process "
-                f"({len(done_ids)} already done), model={model}, "
+                f"({len(done_ids)} already done), backend={backend_label}, "
                 f"workers={args.workers}")
 
     if not pending:
@@ -365,7 +486,8 @@ def main():
                 logger.info(f"[{i+1}/{len(pending)}] {spec.edit_id}: "
                             f"{spec.edit_prompt[:60]}...")
                 result = process_one(spec, dataset, client, output_dir,
-                                     model, logger)
+                                     model, logger,
+                                     edit_server_url=edit_server_url)
                 fp.write(json.dumps(result, ensure_ascii=False) + "\n")
                 fp.flush()
                 if result["status"] == "success":
@@ -377,7 +499,8 @@ def main():
                 futures = {}
                 for spec in pending:
                     fut = pool.submit(process_one, spec, dataset, client,
-                                      output_dir, model, logger)
+                                      output_dir, model, logger,
+                                      edit_server_url=edit_server_url)
                     futures[fut] = spec
 
                 for i, fut in enumerate(as_completed(futures)):

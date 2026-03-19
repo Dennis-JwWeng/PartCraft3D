@@ -186,16 +186,24 @@ class TrellisRefiner:
         device: str = "cuda",
         image_edit_model: str = "gemini-2.5-flash-image",
         ckpt_dir: str | None = None,
+        image_edit_backend: str = "api",
+        image_edit_base_url: str | None = None,
     ):
         self.vinedresser_path = vinedresser_path
         self.cache_dir = Path(cache_dir)
         self.device = torch.device(device)
         self.image_edit_model = image_edit_model
 
+        # Local image edit server (HTTP)
+        self.image_edit_backend = image_edit_backend
+        self.image_edit_base_url = image_edit_base_url
+
         # Checkpoint directory: default to PartCraft3D/checkpoints
         if ckpt_dir is None:
             ckpt_dir = str(Path(__file__).resolve().parents[2] / "checkpoints")
         self.ckpt_dir = Path(ckpt_dir)
+
+        self.debug = os.environ.get("PARTCRAFT_DEBUG", "").lower() in ("1", "true")
 
         self.trellis_text = None
         self.trellis_img = None
@@ -277,7 +285,7 @@ class TrellisRefiner:
         edit_part_ids: list[int],
         slat,
         edit_type: str = "Modification",
-        large_part_threshold: float = 0.4,
+        large_part_threshold: float = 0.35,
     ) -> tuple[torch.Tensor, str]:
         """Build 64x64x64 voxel mask from HY3D-Part ground-truth parts.
 
@@ -424,9 +432,48 @@ class TrellisRefiner:
             mask = edit_parts.clone()
             mask = self._dilate_mask(mask, preserved_parts, slat, radius=1)
         elif edit_type == "Deletion":
-            # Same tight strategy — soft mask handles the transition.
-            mask = edit_parts.clone()
-            mask = self._dilate_mask(mask, preserved_parts, slat, radius=1)
+            # Contact-aware deletion: only apply soft mask at boundaries
+            # where the deleted part connects to preserved parts.
+            # Non-contact voxels are removed entirely (no S1 regeneration).
+            from scipy import ndimage as _ndi
+
+            # Find contact boundary: edit voxels adjacent to preserved voxels
+            preserved_np = preserved_parts.cpu().numpy().astype(np.uint8)
+            contact_struct = _ndi.generate_binary_structure(3, 1)  # 6-connected
+            preserved_dilated = _ndi.binary_dilation(
+                preserved_np, contact_struct, iterations=1)
+            preserved_dilated_t = torch.from_numpy(
+                preserved_dilated.astype(bool)).to(device)
+
+            contact_boundary = edit_parts & preserved_dilated_t
+            non_contact = edit_parts & ~contact_boundary
+
+            n_contact = int(contact_boundary.sum())
+            n_non_contact = int(non_contact.sum())
+            logger.info(f"Deletion contact analysis: "
+                        f"contact_boundary={n_contact}, "
+                        f"non_contact={n_non_contact} voxels")
+
+            # Store non-contact voxels for post-S1 removal in edit()
+            self._deletion_non_contact = non_contact
+
+            if n_contact > 0:
+                # Mask = contact boundary + small dilation for smooth closure
+                # S1 only regenerates at the connection seam, not the whole part
+                contact_ratio = n_contact / max(n_contact + n_non_contact, 1)
+                closure_radius = max(1, min(round(1 + contact_ratio * 3), 3))
+                mask = contact_boundary.clone()
+                mask = self._dilate_mask(mask, preserved_parts, slat,
+                                         radius=closure_radius)
+                logger.info(f"Deletion mask: contact_ratio={contact_ratio:.2f}, "
+                            f"closure_radius={closure_radius}, "
+                            f"mask={int(mask.sum())} voxels")
+            else:
+                # Pure deletion: part is completely floating (no contact)
+                # Skip S1 regeneration, just remove voxels
+                self._deletion_pure_remove = True
+                mask = edit_parts.clone()
+                logger.info("Deletion: no contact boundary, pure voxel removal")
         elif edit_type == "Addition":
             # Addition needs room for new geometry in empty space.
             mask = self._compute_editing_region(
@@ -455,8 +502,9 @@ class TrellisRefiner:
                            "Coordinate space may be misaligned.")
 
         # Debug: save mask projections + SLAT overlay
-        self._save_mask_debug(mask, edit_parts, preserved_parts,
-                              obj_id, edit_part_ids, slat=slat)
+        if self.debug:
+            self._save_mask_debug(mask, edit_parts, preserved_parts,
+                                  obj_id, edit_part_ids, slat=slat)
 
         return mask, edit_type
 
@@ -851,6 +899,10 @@ class TrellisRefiner:
 
         return Image.fromarray(composited.astype(np.uint8))
 
+    def _get_edit_server_url(self) -> str:
+        """Return the base URL of the image edit HTTP server."""
+        return self.image_edit_base_url or "http://localhost:8001"
+
     def _call_vlm_edit(
         self, client, img_pil: Image.Image,
         edit_prompt: str, new_part: str = "",
@@ -858,23 +910,73 @@ class TrellisRefiner:
     ) -> Image.Image | None:
         """Call VLM for 2D image editing.
 
-        Uses a constrained prompt to prevent background and non-target
-        part changes that would corrupt DINOv2 conditioning.
+        Dispatches to local diffusers pipeline or remote API based on
+        self.image_edit_backend.
         """
-        buf = io.BytesIO()
-        img_pil.save(buf, format="PNG")
-        img_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-
         # Constrained prompt: explicitly restrict edits to target part
+        target = f"the '{editing_part}' part" if editing_part else "the specified part"
         text_input = (
-            f"This is a 3D rendered object on a plain background. "
-            f"Edit ONLY the {editing_part} part of this object. "
-            f"Keep the background completely unchanged. "
-            f"Keep all other parts of the object exactly as they are. "
+            f"This is a 3D rendered object on a white background. "
+            f"Edit ONLY {target} of this object. "
             f"Editing instruction: {edit_prompt}"
         )
         if new_part:
-            text_input += f"\nTarget appearance for the edited part: {new_part}"
+            text_input += f"\nAfter editing, it should look like: {new_part}"
+        text_input += (
+            "\nIMPORTANT constraints:"
+            "\n- Keep the exact same camera viewpoint and angle."
+            "\n- Keep the white background completely unchanged."
+            "\n- Keep ALL other parts of the object exactly as they are."
+            "\n- Do NOT change the overall shape, pose, or position of the object."
+            "\n- Only modify the appearance of the target part."
+        )
+
+        if self.image_edit_backend == "local_diffusers":
+            return self._call_local_edit(img_pil, text_input)
+
+        return self._call_api_edit(client, img_pil, text_input)
+
+    def _call_local_edit(
+        self, img_pil: Image.Image, prompt: str,
+    ) -> Image.Image | None:
+        """Edit image via local HTTP image edit server."""
+        import json as _json
+        import urllib.request
+
+        url = self._get_edit_server_url()
+
+        buf = io.BytesIO()
+        img_pil.save(buf, format="PNG")
+        image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        payload = _json.dumps(
+            {"image_b64": image_b64, "prompt": prompt}).encode()
+
+        try:
+            req = urllib.request.Request(
+                f"{url}/edit", data=payload,
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                data = _json.loads(resp.read())
+
+            if data.get("status") == "ok":
+                img_data = base64.b64decode(data["image_b64"])
+                return Image.open(io.BytesIO(img_data))
+            else:
+                logger.warning(
+                    f"Edit server error: {data.get('msg', 'unknown')}")
+                return None
+        except Exception as e:
+            logger.warning(f"Local image editing failed: {e}")
+            return None
+
+    def _call_api_edit(
+        self, client, img_pil: Image.Image, text_input: str,
+    ) -> Image.Image | None:
+        """Edit image via OpenAI-compatible API (Gemini, etc.)."""
+        buf = io.BytesIO()
+        img_pil.save(buf, format="PNG")
+        img_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
 
         try:
             response = client.chat.completions.create(
@@ -949,32 +1051,48 @@ class TrellisRefiner:
             img_new: Single PIL image (legacy fallback, used if img_cond is None).
 
         For Modification/Addition: alternates text/image conditioning.
-        For Deletion: always routed through Modification pipeline so that
-            Stage 1 (SS) regenerates closing geometry in the mask region
-            instead of simply removing coordinates (which leaves holes).
-            cfg_strength is scaled by part size: smaller parts get lower
-            cfg to stay close to the original, larger parts get higher cfg
-            to generate more new geometry.
+        For Deletion (contact-aware):
+            - Non-contact voxels: removed entirely (no S1 regeneration).
+            - Contact boundary: S1 regenerates closing geometry via soft mask.
+            - Pure deletion (no contact): skip S1/S2, directly remove voxels.
+        For Global: routed through TextureOnly — S1 is skipped entirely
+            (original shape preserved), only S2 repaint changes texture.
         """
         from interweave_Trellis import interweave_Trellis_TI
+        from trellis.modules import sparse as sp
 
         edit_type = prompts.get('edit_type', 'Modification')
 
         # --- Route edit types ---
-        # Deletion → Modification: avoids the old "just drop voxels" path
-        #   that leaves open holes. Uses guided Modification with adaptive cfg.
-        # Global → Modification with full mask: Flow Inversion preserves
-        #   structure through inverted noise; everything is re-paintable.
-        guided_deletion = (edit_type == "Deletion")
+        is_deletion = (edit_type == "Deletion")
         is_global = (edit_type == "Global")
 
+        # --- Pure deletion: no contact boundary, skip S1/S2 entirely ---
+        if is_deletion and getattr(self, '_deletion_pure_remove', False):
+            del self._deletion_pure_remove
+            non_contact = getattr(self, '_deletion_non_contact', None)
+            if non_contact is not None:
+                del self._deletion_non_contact
+            sc = slat.coords[:, 1:]
+            in_edit = mask[sc[:, 0], sc[:, 1], sc[:, 2]]
+            keep = ~in_edit
+            slat_new = sp.SparseTensor(
+                feats=slat.feats[keep],
+                coords=slat.coords[keep],
+            )
+            n_removed = int(in_edit.sum())
+            logger.info(f"Pure deletion: removed {n_removed} voxels, "
+                        f"kept {int(keep.sum())} (no S1/S2 needed)")
+            return [slat_new]
+
         if combinations is None:
-            if guided_deletion:
+            if is_deletion:
                 part_ratio = self._deletion_part_ratio(slat, mask)
-                cfg = round(3.0 + part_ratio * 15.0, 1)
-                cfg = max(3.0, min(cfg, 6.0))
+                # Contact-only mask → lower cfg since we only close the seam
+                cfg = round(3.0 + part_ratio * 6.0, 1)
+                cfg = max(3.0, min(cfg, 5.5))
                 logger.info(
-                    f"Deletion guided as Modification: "
+                    f"Deletion (contact closure): S1 regenerates seam, "
                     f"part_ratio={part_ratio:.2f}, cfg_strength={cfg}")
                 combinations = [
                     {"s1_pos_cond": "new_s1_cpl", "s1_neg_cond": "ori_s1_cpl",
@@ -982,11 +1100,11 @@ class TrellisRefiner:
                      "cnt": 1, "cfg_strength": cfg},
                 ]
             elif is_global:
-                # Global: moderate cfg to balance edit strength vs shape fidelity.
-                # Inverted noise already anchors the structure; cfg controls
-                # how far the style/appearance departs from the original.
+                # Global (texture only): S1 is skipped, S2 repaint drives
+                # all texture change.  Moderate cfg so appearance departs
+                # noticeably from the original without hallucinating geometry.
                 combinations = [
-                    {"s1_pos_cond": "new_s1_cpl", "s1_neg_cond": "ori_s1_cpl",
+                    {"s1_pos_cond": "ori_s1_cpl", "s1_neg_cond": "ori_s1_cpl",
                      "s2_pos_cond": "new_s2_cpl", "s2_neg_cond": "ori_s2_cpl",
                      "cnt": 1, "cfg_strength": 5.0},
                 ]
@@ -998,8 +1116,14 @@ class TrellisRefiner:
                      "cnt": 1, "cfg_strength": 7.5},
                 ]
 
-        # Deletion/Global both route through Modification code path
-        effective_edit_type = "Modification" if (guided_deletion or is_global) else edit_type
+        # Deletion → Modification: S1 repaint fills the hole with new geometry
+        # Global → TextureOnly: skip S1, keep original coords, S2 only
+        if is_deletion:
+            effective_edit_type = "Modification"
+        elif is_global:
+            effective_edit_type = "TextureOnly"
+        else:
+            effective_edit_type = edit_type
 
         # Setup image conditioning
         # Priority: img_cond (multi-view averaged) > img_new (single) > blank
@@ -1044,6 +1168,30 @@ class TrellisRefiner:
                 self.trellis_img.preprocess_image = _orig_preprocess
                 self.trellis_img.get_cond = _orig_get_cond
 
+        # --- Post-process deletion: remove non-contact voxels ---
+        non_contact = getattr(self, '_deletion_non_contact', None)
+        if is_deletion and non_contact is not None:
+            del self._deletion_non_contact
+            for i, slat_new in enumerate(slats_edited):
+                sc = slat_new.coords[:, 1:]  # [N, 3]
+                valid = ((sc >= 0) & (sc < 64)).all(dim=1)
+                in_non_contact = torch.zeros(
+                    sc.shape[0], device=sc.device, dtype=torch.bool)
+                if valid.any():
+                    vc = sc[valid]
+                    in_non_contact[valid] = non_contact[
+                        vc[:, 0], vc[:, 1], vc[:, 2]]
+                n_remove = int(in_non_contact.sum())
+                if n_remove > 0:
+                    keep = ~in_non_contact
+                    slats_edited[i] = sp.SparseTensor(
+                        feats=slat_new.feats[keep],
+                        coords=slat_new.coords[keep],
+                    )
+                    logger.info(
+                        f"Deletion post-process: removed {n_remove} "
+                        f"non-contact voxels, kept {int(keep.sum())}")
+
         return slats_edited
 
     # ---- Step 6: Export ----
@@ -1080,6 +1228,69 @@ class TrellisRefiner:
 
             logger.info(f"Exported {tag}: {ply_path}")
 
+        return paths
+
+    def export_pair_shared_before(
+        self,
+        slat_before,
+        slat_edited,
+        output_dir: str | Path,
+        shared_before_dir: str | Path | None = None,
+    ) -> dict:
+        """Export before/after pair, reusing a shared 'before' directory.
+
+        When multiple edits share the same original object, the 'before'
+        PLY + SLAT only needs to be saved once. Pass ``shared_before_dir``
+        pointing to the already-exported before data to create symlinks
+        instead of re-exporting.
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        paths = {}
+
+        # ---- Before: reuse or export ----
+        if shared_before_dir and Path(shared_before_dir).exists():
+            src = Path(shared_before_dir)
+            # Symlink before.ply
+            before_ply = output_dir / "before.ply"
+            if not before_ply.exists():
+                src_ply = src / "before.ply"
+                if src_ply.exists():
+                    before_ply.symlink_to(src_ply.resolve())
+            paths['before_ply'] = str(before_ply)
+
+            # Symlink before_slat directory
+            before_slat = output_dir / "before_slat"
+            if not before_slat.exists():
+                src_slat = src / "before_slat"
+                if src_slat.exists():
+                    before_slat.symlink_to(src_slat.resolve())
+            paths['before_slat'] = str(before_slat)
+        else:
+            # First edit for this object: export before
+            gaussian = self.decode_to_gaussian(slat_before)
+            ply_path = output_dir / "before.ply"
+            gaussian.save_ply(str(ply_path))
+            paths['before_ply'] = str(ply_path)
+            slat_path = output_dir / "before_slat"
+            slat_path.mkdir(parents=True, exist_ok=True)
+            torch.save(slat_before.feats, slat_path / "feats.pt")
+            torch.save(slat_before.coords, slat_path / "coords.pt")
+            paths['before_slat'] = str(slat_path)
+
+        # ---- After: always export ----
+        gaussian = self.decode_to_gaussian(slat_edited)
+        ply_path = output_dir / "after.ply"
+        gaussian.save_ply(str(ply_path))
+        paths['after_ply'] = str(ply_path)
+        slat_path = output_dir / "after_slat"
+        slat_path.mkdir(parents=True, exist_ok=True)
+        torch.save(slat_edited.feats, slat_path / "feats.pt")
+        torch.save(slat_edited.coords, slat_path / "coords.pt")
+        paths['after_slat'] = str(slat_path)
+
+        logger.info(f"Exported: after={ply_path}, "
+                    f"before={'shared' if shared_before_dir else 'new'}")
         return paths
 
     # ---- Utility ----

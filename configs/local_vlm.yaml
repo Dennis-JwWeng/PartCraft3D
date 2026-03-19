@@ -20,10 +20,12 @@ phase0:
   local_max_model_len: 8192
   local_tensor_parallel: 1
 
-  # Keep vlm_model/vlm_base_url for fallback to API
-  vlm_model: "gemini-2.5-flash"
-  vlm_base_url: "https://llm-api.mmchat.xyz/v1"
-  vlm_api_key: ""
+  # VLM model and API settings — used by enricher, filter, etc.
+  # For full local: point vlm_base_url to local and set vlm_api_key to "dummy"
+  # For API fallback: use remote URL and real key
+  vlm_model: "Qwen3.5-27B"
+  vlm_base_url: "http://localhost:8000/v1"
+  vlm_api_key: "dummy"
 
   views_for_labeling: [0, 10, 20, 30]
   max_workers: 2          # local GPU: fewer workers to avoid OOM

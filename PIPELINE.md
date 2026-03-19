@@ -28,8 +28,8 @@
                              ↓
  ┌──────────────────────────────────────────────────────────────────┐
  │  STEP 3: 2D IMAGE EDITING           [VLM API, parallelizable]  │
- │  For each spec: annotated input → Gemini → edited reference     │
- │  Part annotation: green overlay + red contour (GT segmentation) │
+ │  For each spec: plain view image + edit prompt → Gemini          │
+ │  Prompt provides semantic context (no mask annotation needed)   │
  │  Output: 2d_edits/{edit_id}_edited.png                          │
  │  Cost: ~458 input tokens + 1 image output per spec              │
  └───────────────────────────┬──────────────────────────────────────┘
@@ -37,9 +37,11 @@
  ┌──────────────────────────────────────────────────────────────────┐
  │  STEP 4: 3D EDITING — TRELLIS       [GPU, main workload]        │
  │                                                                  │
- │  ┌─ Deletion ──────────────────────────────────────────────┐    │
- │  │  Guided Modification: tight mask + soft blend            │    │
- │  │  S1 regenerates closing geometry, S2 matches appearance  │    │
+ │  ┌─ Deletion (contact-aware) ───────────────────────────────┐    │
+ │  │  Non-contact voxels: removed entirely (no S1 regen)      │    │
+ │  │  Contact boundary: S1 closes seam via soft mask           │    │
+ │  │  Pure floating part: skip S1/S2, direct voxel removal    │    │
+ │  │  cfg_strength=3.0-5.5 (contact closure only)             │    │
  │  └──────────────────────────────────────────────────────────┘    │
  │                                                                  │
  │  ┌─ Modification ──────────────────────────────────────────┐    │
@@ -48,8 +50,9 @@
  │  └──────────────────────────────────────────────────────────┘    │
  │                                                                  │
  │  ┌─ Global (auto-promoted if part > 40% SLAT) ────────────┐    │
- │  │  Full mask + Inverse Flow: preserves structure           │    │
- │  │  cfg_strength=5.0 controls style departure               │    │
+ │  │  TextureOnly: S1 skipped (shape preserved)               │    │
+ │  │  S2 repaint only — changes color/material/texture        │    │
+ │  │  cfg_strength=5.0 controls appearance departure          │    │
  │  └──────────────────────────────────────────────────────────┘    │
  │                                                                  │
  │  ┌─ Addition ──────────────────────────────────────────────┐    │
@@ -207,15 +210,15 @@ Input: edit_spec (type, part_ids)
   │   │   ├─ Voxelize GT parts → 64³ mask
   │   │   ├─ Align to SLAT coordinates (KNN)
   │   │   └─ Check part ratio:
-  │   │       ├─ ratio > 40% → AUTO-PROMOTE to Global
-  │   │       └─ ratio ≤ 40% → tight mask + 1-voxel dilation
+  │   │       ├─ ratio > 40% → AUTO-PROMOTE to Global (TextureOnly)
+  │   │       └─ ratio ≤ 40% → tight mask + dilation
   │   │
-  │   ├─ [if Global] full 64³ mask, cfg=5.0
-  │   ├─ [if Deletion] guided Modification, cfg=3.0~6.0
+  │   ├─ [if Deletion] → Modification path, dynamic mask (radius 2-4),
+  │   │                   dynamic cfg (3.0-7.0), S1 fills hole
   │   └─ [if Modification] standard edit, cfg=7.5
   │
   └─ type == "global"
-      └─ Full 64³ mask, Inverse Flow, cfg=5.0
+      └─ TextureOnly: S1 skipped, S2 repaint only, cfg=5.0
 ```
 
 ## Output Structure

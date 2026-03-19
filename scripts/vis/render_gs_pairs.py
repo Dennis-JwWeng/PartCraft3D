@@ -164,8 +164,12 @@ def build_comparison_video(before_frames: list[np.ndarray],
         frame = compose_comparison_frame(bf, af, prompt, edit_type)
         frames.append(frame)
 
-    imageio.mimsave(output_path, frames, fps=fps, codec="libx264",
-                    quality=8, pixelformat="yuv420p")
+    writer = imageio.get_writer(output_path, format="FFMPEG", fps=fps,
+                                codec="libx264", quality=8,
+                                pixelformat="yuv420p")
+    for frame in frames:
+        writer.append_data(frame)
+    writer.close()
 
 
 # ---------------------------------------------------------------------------

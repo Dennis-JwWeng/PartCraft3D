@@ -161,8 +161,9 @@ def main():
         api_key = _resolve_api_key(cfg)
         if api_key:
             p0 = cfg["phase0"]
+            image_edit_url = p25_cfg.get("image_edit_base_url") or p0.get("vlm_base_url", "")
             vlm_client = OpenAI(
-                base_url=p0.get("vlm_base_url", ""),
+                base_url=image_edit_url,
                 api_key=api_key,
             )
             logger.info(f"2D image editing enabled "

@@ -32,8 +32,9 @@ Pipeline Steps:
                            ↓
   ┌─────────────────────────────────────────────────────────────┐
   │ Step 4: 3D EDIT — TRELLIS (GPU, main workload)             │
-  │   Flow Inversion + Repaint for del/mod/global              │
-  │   Large parts (>40%) auto-promote to Global                │
+  │   Deletion → S1 fills hole + S2 texture (dynamic mask/cfg)│
+  │   Modification → Flow Inversion + Repaint                  │
+  │   Global → TextureOnly (S1 unchanged, S2 repaint only)     │
   │   Cost: GPU only, 0 API tokens                             │
   └────────────────────────┬────────────────────────────────────┘
                            ↓
@@ -80,7 +81,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from partcraft.utils.config import load_config
 from partcraft.utils.logging import setup_logging
-from partcraft.io.hy3d_loader import HY3DPartDataset
+from partcraft.io.partcraft_loader import PartCraftDataset
 from partcraft.phase1_planning.planner import EditSpec
 
 
@@ -167,27 +168,64 @@ def estimate_cost(n_objects: int, n_edits: int, steps: set) -> dict:
 # Step 1: Semantic Labeling + Enrichment
 # =========================================================================
 
-def run_step_semantic(cfg, dataset, logger, limit=None, force=False):
-    """Step 1: VLM semantic labeling (Phase 0) + enrichment."""
-    from partcraft.phase0_semantic.labeler import run_phase0
+def run_step_semantic(cfg, dataset, logger, limit=None, force=False, tag=None):
+    """Step 1: VLM semantic labeling via enricher (action style).
+
+    Uses enricher as the primary path: 1-view thumbnail + text labels → VLM
+    generates desc, desc_without, deletion/addition prompts, swap mods, global edits.
+
+    Falls back to Phase 0 labeler (42-view / 150-view) if enricher cannot run
+    (e.g., missing semantic.json).
+    """
+    from pathlib import Path as _Path
 
     logger.info("=" * 60)
     logger.info("STEP 1: Semantic Labeling + Enrichment")
     logger.info("=" * 60)
 
-    labels_path = run_phase0(cfg, dataset, limit=limit, force=force)
-    logger.info(f"Labels: {labels_path}")
+    cache_dir = _Path(cfg["phase0"]["cache_dir"])
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tag_suffix = f"_{tag}" if tag else ""
+    labels_path = cache_dir / f"semantic_labels{tag_suffix}.jsonl"
 
-    # Enrichment (if run_enrich module available)
-    try:
+    # Resolve semantic.json for enricher
+    data_dir = _Path(cfg["data"].get("data_dir", "data/partobjaverse_tiny"))
+    if not data_dir.exists():
+        data_dir = _Path(cfg["data"]["image_npz_dir"]).parent
+    sem_json = data_dir / "source" / "semantic.json"
+
+    if sem_json.exists():
+        # Primary path: enricher (action style, swap + global)
         from partcraft.phase1_planning.enricher import enrich_semantic_labels
-        enrich_cfg = cfg.get("enrich", {})
-        if enrich_cfg.get("enabled", True):
-            enrich_semantic_labels(cfg, limit=limit or 0)
-            logger.info("Enrichment complete")
-    except ImportError:
-        logger.info("Enrichment module not available, skipping")
 
+        image_npz_dir = cfg["data"].get("image_npz_dir")
+        shards = cfg["data"].get("shards", ["00"])
+        max_workers = cfg["phase0"].get("max_workers", 4)
+
+        if force and labels_path.exists():
+            backup = labels_path.with_suffix(".jsonl.bak")
+            labels_path.rename(backup)
+            logger.info(f"--force: backed up old labels to {backup}")
+
+        enrich_semantic_labels(
+            cfg,
+            semantic_json_path=str(sem_json),
+            output_path=str(labels_path),
+            image_npz_dir=image_npz_dir,
+            shard=shards[0] if shards else "00",
+            limit=limit or 0,
+            max_workers=max_workers,
+            visual_grounding=cfg.get("phase0", {}).get("visual_grounding", True),
+            dataset=dataset,
+        )
+        logger.info(f"Enrichment complete → {labels_path}")
+    else:
+        # Fallback: Phase 0 labeler (42-view / 150-view)
+        logger.info("semantic.json not found, falling back to Phase 0 labeler")
+        from partcraft.phase0_semantic.labeler import run_phase0
+        labels_path = run_phase0(cfg, dataset, limit=limit, force=force)
+
+    logger.info(f"Labels: {labels_path}")
     return labels_path
 
 
@@ -209,7 +247,7 @@ def run_step_planning(cfg, labels_path, logger, suffix=""):
     catalog.save(catalog_path)
     logger.info(f"Catalog: {catalog_path}")
 
-    specs = run_phase1(cfg, catalog, suffix=suffix)
+    specs = run_phase1(cfg, catalog, output_suffix=suffix)
     specs_path = Path(cfg["phase1"]["cache_dir"]) / f"edit_specs{suffix}.jsonl"
     logger.info(f"Specs: {specs_path}")
     return specs_path
@@ -220,32 +258,55 @@ def run_step_planning(cfg, labels_path, logger, suffix=""):
 # =========================================================================
 
 def run_step_2d_edit(cfg, specs_path, dataset, logger,
-                     tag=None, workers=4, limit=None, edit_types=None):
+                     tag=None, workers=4, limit=None, edit_types=None,
+                     edit_ids=None):
     """Step 3: Pre-generate 2D edited images for all specs.
 
     Runs independently of GPU — can execute in parallel with other work.
     """
     logger.info("=" * 60)
-    logger.info("STEP 3: 2D Image Editing (VLM API)")
+    logger.info("STEP 3: 2D Image Editing")
     logger.info("=" * 60)
 
     p0 = cfg["phase0"]
     p25 = cfg.get("phase2_5", {})
 
-    from openai import OpenAI
-    api_key = _resolve_api_key(cfg)
-    if not api_key:
-        logger.warning("No API key — skipping 2D editing")
-        return None
+    image_edit_backend = p25.get("image_edit_backend", "api")
 
-    client = OpenAI(
-        base_url=p0.get("vlm_base_url", ""),
-        api_key=api_key,
-    )
+    # Local edit server or API client
+    client = None  # OpenAI client (for API backend)
+    edit_server_url = None  # local HTTP edit server URL
     model = p25.get("image_edit_model", "gemini-2.5-flash-image")
 
+    if image_edit_backend == "local_diffusers":
+        from scripts.run_2d_edit import check_edit_server
+        edit_server_url = p25.get("image_edit_base_url", "http://localhost:8001")
+        if not check_edit_server(edit_server_url):
+            logger.warning(f"Image edit server not reachable at {edit_server_url}, "
+                           "skipping 2D editing")
+            return None
+        logger.info(f"Image edit server OK at {edit_server_url}")
+        # Use configured workers (default 1 for single-GPU sequential serving)
+        cfg_workers = p25.get("image_edit_workers", 1)
+        if workers != cfg_workers:
+            logger.info(f"local_diffusers backend: workers={cfg_workers} "
+                         f"(from config)")
+            workers = cfg_workers
+    else:
+        from openai import OpenAI
+        api_key = _resolve_api_key(cfg)
+        if not api_key:
+            logger.warning("No API key — skipping 2D editing")
+            return None
+
+        image_edit_url = p25.get("image_edit_base_url") or p0.get("vlm_base_url", "")
+        client = OpenAI(
+            base_url=image_edit_url,
+            api_key=api_key,
+        )
+
     # Load specs
-    edit_types = edit_types or ["modification", "deletion"]
+    edit_types = edit_types or ["modification", "deletion", "global"]
     specs = []
     with open(specs_path) as f:
         for line in f:
@@ -253,10 +314,12 @@ def run_step_2d_edit(cfg, specs_path, dataset, logger,
                 continue
             d = json.loads(line)
             spec = EditSpec(**d)
+            if edit_ids and spec.edit_id not in edit_ids:
+                continue
             if spec.edit_type in edit_types:
                 specs.append(spec)
 
-    if limit:
+    if not edit_ids and limit:
         specs = specs[:limit]
 
     # Output directory
@@ -283,8 +346,9 @@ def run_step_2d_edit(cfg, specs_path, dataset, logger,
                     pass
 
     pending = [s for s in specs if s.edit_id not in done_ids]
+    backend_label = edit_server_url or model
     logger.info(f"2D edits: {len(pending)} pending ({len(done_ids)} done), "
-                f"model={model}, workers={workers}")
+                f"backend={backend_label}, workers={workers}")
 
     if not pending:
         logger.info("All 2D edits already done")
@@ -297,7 +361,8 @@ def run_step_2d_edit(cfg, specs_path, dataset, logger,
             for i, spec in enumerate(pending):
                 logger.info(f"[{i+1}/{len(pending)}] {spec.edit_id}")
                 result = process_one(spec, dataset, client, output_dir,
-                                     model, logger)
+                                     model, logger,
+                                     edit_server_url=edit_server_url)
                 fp.write(json.dumps(result, ensure_ascii=False) + "\n")
                 fp.flush()
                 if result["status"] == "success":
@@ -309,7 +374,8 @@ def run_step_2d_edit(cfg, specs_path, dataset, logger,
                 futures = {}
                 for spec in pending:
                     fut = pool.submit(process_one, spec, dataset, client,
-                                      output_dir, model, logger)
+                                      output_dir, model, logger,
+                                      edit_server_url=edit_server_url)
                     futures[fut] = spec
 
                 for i, fut in enumerate(as_completed(futures)):
@@ -344,9 +410,9 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
     """Step 4: TRELLIS 3D editing for all edit types.
 
     This is the primary editing step. Handles:
-      - Deletion → guided Modification (closes holes)
-      - Modification → Flow Inversion + Repaint
-      - Global → full mask + Inverse Flow (auto-promoted from large parts)
+      - Deletion → Modification (S1 regenerates closing geometry, dynamic mask/cfg)
+      - Modification → Flow Inversion + Repaint (contact-aware soft mask)
+      - Global → TextureOnly (skip S1, only S2 repaint changes texture)
       - Addition → swaps before/after from corresponding deletion
     """
     logger.info("=" * 60)
@@ -420,14 +486,16 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
         return output_path
 
     # ---- VLM client for inline 2D editing ----
+    image_edit_backend = p25_cfg.get("image_edit_backend", "api")
     vlm_client = None
-    if use_2d:
+    if use_2d and image_edit_backend != "local_diffusers":
         from openai import OpenAI
         api_key = _resolve_api_key(cfg)
         if api_key:
             p0 = cfg["phase0"]
+            image_edit_url = p25_cfg.get("image_edit_base_url") or p0.get("vlm_base_url", "")
             vlm_client = OpenAI(
-                base_url=p0.get("vlm_base_url", ""),
+                base_url=image_edit_url,
                 api_key=api_key,
             )
 
@@ -437,6 +505,8 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
         cache_dir=str(cache_dir),
         device="cuda",
         image_edit_model=p25_cfg.get("image_edit_model", "gemini-2.5-flash-image"),
+        image_edit_backend=image_edit_backend,
+        image_edit_base_url=p25_cfg.get("image_edit_base_url", "http://localhost:8001"),
     )
     refiner.load_models()
 
@@ -520,7 +590,11 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
                     if edit_type == "Deletion":
                         edit_part_ids = spec.remove_part_ids
                     elif edit_type == "Modification":
-                        edit_part_ids = [spec.old_part_id]
+                        # Group modifications: mask ALL parts in the group
+                        if spec.remove_part_ids:
+                            edit_part_ids = spec.remove_part_ids
+                        else:
+                            edit_part_ids = [spec.old_part_id]
                     elif edit_type == "Global":
                         edit_part_ids = []
                     elif edit_type == "Addition":
@@ -592,12 +666,67 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
                     if edit_type in ("Modification", "Deletion", "Global") and use_2d:
                         num_edit_views = p25_cfg.get("num_edit_views", 4)
                         edit_strength = p25_cfg.get("edit_strength", 1.0)
-                        original_images, edited_images = \
-                            refiner.obtain_edited_images(
-                                ori_gaussian, prompts, vlm_client,
-                                obj_id, spec.edit_id,
-                                num_views=num_edit_views,
-                                edit_dir=edit_dir)
+
+                        # Use prerendered orthogonal view if best_view set
+                        prerender_img = None
+                        if hasattr(spec, 'best_view') and spec.best_view >= 0:
+                            try:
+                                from scripts.run_2d_edit import (
+                                    prepare_input_image, call_local_edit,
+                                    call_vlm_edit)
+                                img_bytes, pil_img = prepare_input_image(
+                                    obj_record, spec.best_view)
+                                after_desc = spec.after_desc or spec.after_part_desc or ""
+                                before_desc = getattr(spec, 'before_part_desc', '') or ''
+
+                                # Build part label: all labels for groups
+                                remove_labels = getattr(spec, 'remove_labels', [])
+                                old_label = getattr(spec, 'old_label', '') or ''
+                                if remove_labels and len(remove_labels) > 1:
+                                    part_label = ", ".join(remove_labels)
+                                elif remove_labels:
+                                    part_label = remove_labels[0]
+                                else:
+                                    part_label = old_label
+
+                                if image_edit_backend == "local_diffusers":
+                                    edit_url = p25_cfg.get("image_edit_base_url",
+                                                           "http://localhost:8001")
+                                    edited = call_local_edit(
+                                        edit_url, img_bytes, spec.edit_prompt,
+                                        after_desc, old_part_label=part_label,
+                                        before_part_desc=before_desc,
+                                        edit_type=spec.edit_type)
+                                elif vlm_client is not None:
+                                    edited = call_vlm_edit(
+                                        vlm_client, img_bytes, spec.edit_prompt,
+                                        after_desc,
+                                        p25_cfg.get("image_edit_model", ""),
+                                        old_part_label=part_label,
+                                        before_part_desc=before_desc,
+                                        edit_type=spec.edit_type)
+                                else:
+                                    edited = None
+                                if edited is not None:
+                                    edited = edited.resize((518, 518))
+                                    prerender_img = (pil_img.resize((518, 518)),
+                                                     edited)
+                                    logger.info(f"  2D edit from prerender "
+                                                f"view {spec.best_view}")
+                            except Exception as e:
+                                logger.warning(f"  Prerender 2D edit failed: {e}")
+
+                        if prerender_img is not None:
+                            original_images = [prerender_img[0]]
+                            edited_images = [prerender_img[1]]
+                        else:
+                            original_images, edited_images = \
+                                refiner.obtain_edited_images(
+                                    ori_gaussian, prompts, vlm_client,
+                                    obj_id, spec.edit_id,
+                                    num_views=num_edit_views,
+                                    edit_dir=edit_dir)
+
                         if edited_images:
                             img_cond = refiner.encode_multiview_cond(
                                 edited_images, original_images,
@@ -776,90 +905,493 @@ def _resolve_api_key(cfg: dict) -> str:
 
     return api_key
 
+# =========================================================================
+# Streaming Mode: per-object pipeline (Step 1 → 2 → 4 per object)
+# =========================================================================
 
-def print_cost_report(cost: dict, n_objects: int, n_edits: int):
-    """Print a formatted cost estimation report."""
-    print("\n" + "=" * 60)
-    print("TOKEN COST ESTIMATION (per pipeline run)")
-    print("=" * 60)
-    print(f"Objects: {n_objects}  |  Edit specs: {n_edits}")
-    print(f"Avg edits/object: {n_edits/max(n_objects,1):.1f}")
-    print("-" * 60)
+def run_streaming(cfg, dataset, logger, args):
+    """Streaming pipeline: each object goes through the full chain before
+    moving to the next.
 
-    for step, detail in cost["breakdown"].items():
-        label = step.replace("_", " ").title()
-        inp = detail.get("input_tokens", 0)
-        out = detail.get("output_tokens", 0)
-        imgs = detail.get("output_images", 0)
-        usd = detail["usd"]
-        parts = []
-        if inp:
-            parts.append(f"in={inp:,}")
-        if out:
-            parts.append(f"out={out:,}")
-        if imgs:
-            parts.append(f"imgs={imgs}")
-        print(f"  {label:30s}  {' | '.join(parts):30s}  ${usd:.4f}")
+    Per object:
+      1. VLM enrichment → semantic record
+      2. Plan edits from record → EditSpecs
+      4. For each spec: 2D edit → 3D TRELLIS edit (inline)
 
-    print("-" * 60)
-    print(f"  {'TOTAL':30s}  "
-          f"in={cost['total_input_tokens']:,} | "
-          f"out={cost['total_output_tokens']:,} | "
-          f"imgs={cost['total_output_images']}")
-    print(f"  {'':30s}  ${cost['total_usd']:.4f}")
-    print(f"\n  Per object: ${cost['per_object_usd']:.4f}")
-    print(f"  Per edit:   ${cost['per_edit_usd']:.4f}")
-    print("=" * 60)
+    Advantages:
+      - First results appear fast (no waiting for all objects)
+      - Lower peak memory (one object's SLAT at a time)
+      - Immediate feedback on failures
+    """
+    from openai import OpenAI
+    from partcraft.phase1_planning.enricher import (
+        _enrich_one_object_visual, _call_vlm, _fallback_enrichment,
+        _result_to_phase0_record, load_thumbnail_from_npz,
+    )
+    from partcraft.phase1_planning.planner import plan_edits_for_record
 
-    # Single item breakdown
-    print("\n" + "=" * 60)
-    print("SINGLE DATA ITEM (1 edit spec) TOKEN BREAKDOWN")
-    print("=" * 60)
-    c = COST
-    avg_edits = n_edits / max(n_objects, 1)
-    print(f"""
-  ┌─ Step 1: Semantic (amortized over {avg_edits:.0f} edits/object) ──────┐
-  │  Phase 0 labeling:  {c['phase0_input_tokens']:>6} in + {c['phase0_output_tokens']:>5} out tokens  │
-  │  VLM enrichment:    {c['enrich_input_tokens']:>6} in + {c['enrich_output_tokens']:>5} out tokens  │
-  │  Subtotal/object:   {c['phase0_input_tokens']+c['enrich_input_tokens']:>6} in + {c['phase0_output_tokens']+c['enrich_output_tokens']:>5} out tokens  │
-  │  Amortized/edit:    {int((c['phase0_input_tokens']+c['enrich_input_tokens'])/avg_edits):>6} in + {int((c['phase0_output_tokens']+c['enrich_output_tokens'])/avg_edits):>5} out tokens  │
-  └────────────────────────────────────────────────────────┘
+    logger.info("=" * 60)
+    logger.info("STREAMING MODE: per-object pipeline")
+    logger.info("=" * 60)
 
-  ┌─ Step 2: Planning (CPU) ───────────────────────────────┐
-  │  0 tokens                                              │
-  └────────────────────────────────────────────────────────┘
+    p0 = cfg.get("phase0", {})
+    p25 = cfg.get("phase2_5", {})
 
-  ┌─ Step 3: 2D Image Editing ─────────────────────────────┐
-  │  Input:   {c['2d_edit_input_tokens']:>6} tokens (1 annotated image + prompt)   │
-  │  Output:  {c['2d_edit_output_images']:>6} generated image (~$0.02)             │
-  └────────────────────────────────────────────────────────┘
+    # ---- Paths (resolve relative paths against project root) ----
+    project_root = Path(__file__).resolve().parents[1]
 
-  ┌─ Step 4: 3D Editing — TRELLIS (GPU) ───────────────────┐
-  │  0 API tokens (GPU compute ~60-120s per edit)          │
-  └────────────────────────────────────────────────────────┘
+    def _resolve(p: str | Path) -> Path:
+        pp = Path(p)
+        return pp if pp.is_absolute() else project_root / pp
 
-  ┌─ Step 5: Quality Scoring ──────────────────────────────┐
-  │  Input:   {c['quality_input_tokens']:>6} tokens (8 rendered views + prompt)    │
-  │  Output:  {c['quality_output_tokens']:>6} tokens (scores + rationale)          │
-  └────────────────────────────────────────────────────────┘
+    tag_suffix = f"_{args.tag}" if args.tag else ""
+    num_workers = getattr(args, 'num_workers_stream', 1)
+    worker_id = getattr(args, 'worker_id', 0)
+    # Per-worker output files to avoid write conflicts
+    worker_suffix = f"_w{worker_id}" if num_workers > 1 else ""
+    labels_path = _resolve(p0["cache_dir"]) / f"semantic_labels{tag_suffix}{worker_suffix}.jsonl"
+    labels_path.parent.mkdir(parents=True, exist_ok=True)
+    specs_path = _resolve(cfg["phase1"]["cache_dir"]) / f"edit_specs{tag_suffix}{worker_suffix}.jsonl"
+    specs_path.parent.mkdir(parents=True, exist_ok=True)
+    results_path = _resolve(p25["cache_dir"]) / f"edit_results{tag_suffix}{worker_suffix}.jsonl"
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    output_dir = _resolve(cfg["data"]["output_dir"])
+    mesh_pairs_dir = output_dir / f"mesh_pairs{tag_suffix}"
 
-  ┌─ Step 6: Export (CPU) ─────────────────────────────────┐
-  │  0 tokens                                              │
-  └────────────────────────────────────────────────────────┘
-""")
-    per_edit_in = (int((c['phase0_input_tokens'] + c['enrich_input_tokens']) / avg_edits)
-                   + c['2d_edit_input_tokens'] + c['quality_input_tokens'])
-    per_edit_out = (int((c['phase0_output_tokens'] + c['enrich_output_tokens']) / avg_edits)
-                    + c['quality_output_tokens'])
-    per_edit_imgs = c['2d_edit_output_images']
-    per_edit_usd = (per_edit_in / 1e6 * c['input_price_per_m']
-                    + per_edit_out / 1e6 * c['output_price_per_m']
-                    + per_edit_imgs * c['image_output_price'])
-    print(f"  TOTAL per edit: {per_edit_in:,} in + {per_edit_out:,} out + "
-          f"{per_edit_imgs} img = ${per_edit_usd:.4f}")
-    print(f"  At 1000 edits: ${per_edit_usd * 1000:.2f}")
-    print(f"  At 10000 edits: ${per_edit_usd * 10000:.2f}")
-    print("=" * 60)
+    # ---- Resolve semantic.json ----
+    data_dir = Path(cfg["data"].get("data_dir", "data/partobjaverse_tiny"))
+    if not data_dir.is_absolute():
+        data_dir = project_root / data_dir
+    if not data_dir.exists():
+        data_dir = Path(cfg["data"]["image_npz_dir"])
+        if not data_dir.is_absolute():
+            data_dir = project_root / data_dir
+        data_dir = data_dir.parent
+    sem_json_path = data_dir / "source" / "semantic.json"
+    if not sem_json_path.exists():
+        logger.error(f"semantic.json not found at {sem_json_path}")
+        return
+
+    with open(sem_json_path) as f:
+        semantic_json = json.load(f)
+
+    uid_info: dict[str, tuple[str, list[str]]] = {}
+    for category, objects in semantic_json.items():
+        for uid, labels in objects.items():
+            uid_info[uid] = (category, labels)
+
+    all_uids = sorted(uid_info.keys())
+    if args.limit:
+        all_uids = all_uids[:args.limit]
+
+    # ---- Worker partitioning for multi-GPU parallel ----
+    num_workers = getattr(args, 'num_workers_stream', 1)
+    worker_id = getattr(args, 'worker_id', 0)
+    if num_workers > 1:
+        all_uids = [uid for i, uid in enumerate(all_uids)
+                     if i % num_workers == worker_id]
+        logger.info(f"Worker {worker_id}/{num_workers}: "
+                    f"processing {len(all_uids)} objects")
+
+    # ---- VLM client for enrichment ----
+    api_key = _resolve_api_key(cfg)
+    if not api_key:
+        logger.error("No API key for VLM enrichment")
+        return
+    vlm_model = p0.get("vlm_model", "gemini-2.5-flash")
+    vlm_base_url = p0.get("vlm_base_url", "")
+    vlm_client = OpenAI(base_url=vlm_base_url, api_key=api_key)
+
+    # ---- Image edit setup ----
+    image_edit_backend = p25.get("image_edit_backend", "api")
+    edit_vlm_client = None
+    if image_edit_backend != "local_diffusers":
+        image_edit_url = p25.get("image_edit_base_url") or vlm_base_url
+        edit_vlm_client = OpenAI(base_url=image_edit_url, api_key=api_key)
+
+    # ---- TRELLIS setup ----
+    vinedresser_path = p25.get(
+        "vinedresser_path", "/Node11_nvme/wjw/3D_Editing/Vinedresser3D-main")
+    sys.path.insert(0, vinedresser_path)
+    from partcraft.phase2_assembly.trellis_refine import (
+        TrellisRefiner, build_prompts_from_spec)
+
+    data_dir_mesh = _resolve(cfg["data"].get("data_dir", "data/partobjaverse_tiny"))
+    mesh_zip = data_dir_mesh / "source" / "mesh.zip"
+    if not mesh_zip.exists():
+        data_dir_mesh = _resolve(cfg["data"]["image_npz_dir"]).parent
+        mesh_zip = data_dir_mesh / "source" / "mesh.zip"
+
+    refiner = TrellisRefiner(
+        vinedresser_path=vinedresser_path,
+        cache_dir=str(_resolve(p25["cache_dir"])),
+        device="cuda",
+        image_edit_model=p25.get("image_edit_model", "gemini-2.5-flash-image"),
+        image_edit_backend=image_edit_backend,
+        image_edit_base_url=p25.get("image_edit_base_url", "http://localhost:8001"),
+    )
+    refiner.load_models()
+
+    # ---- Resume tracking ----
+    done_labels: set[str] = set()
+    if labels_path.exists():
+        with open(labels_path) as f:
+            for line in f:
+                try:
+                    done_labels.add(json.loads(line)["obj_id"])
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+    done_edits: set[str] = set()
+    if results_path.exists():
+        with open(results_path) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                    if rec.get("status") == "success":
+                        done_edits.add(rec["edit_id"])
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+    pending = [uid for uid in all_uids if uid not in done_labels]
+    if not pending:
+        logger.info(f"All {len(all_uids)} objects already enriched")
+        pending = []  # still process edits for already-enriched objects
+
+    logger.info(f"Streaming: {len(pending)} objects to enrich, "
+                f"{len(done_labels)} already done")
+
+    # ---- Image source ----
+    npz_dir = _resolve(cfg["data"]["image_npz_dir"])
+    shard = cfg["data"].get("shards", ["00"])[0]
+
+    # Import 2D edit helpers
+    from scripts.run_2d_edit import (
+        prepare_input_image, call_local_edit, call_vlm_edit)
+
+    # ---- Main loop ----
+    counters = {"del": 0, "add": 0, "mod": 0, "glb": 0}
+    glb_tmp_dir = tempfile.mkdtemp(prefix="partcraft_stream_")
+    total_specs = 0
+    total_success = 0
+    total_fail = 0
+
+    # If some objects are already enriched, count their spec IDs to avoid
+    # counter collisions
+    if done_labels:
+        existing_specs = []
+        if specs_path.exists():
+            with open(specs_path) as f:
+                for line in f:
+                    if line.strip():
+                        d = json.loads(line)
+                        existing_specs.append(d)
+        # Update counters to continue from existing
+        for s in existing_specs:
+            eid = s["edit_id"]
+            if eid.startswith("del_") or eid.startswith("gdel_"):
+                counters["del"] = max(counters["del"],
+                                      int(eid.split("_")[-1]) + 1)
+            elif eid.startswith("add_") or eid.startswith("gadd_"):
+                counters["add"] = max(counters["add"],
+                                      int(eid.split("_")[-1]) + 1)
+            elif eid.startswith("mod_"):
+                counters["mod"] = max(counters["mod"],
+                                      int(eid.split("_")[-1]) + 1)
+            elif eid.startswith("glb_"):
+                counters["glb"] = max(counters["glb"],
+                                      int(eid.split("_")[-1]) + 1)
+
+    with open(labels_path, "a") as lbl_fp, \
+         open(specs_path, "a") as spec_fp, \
+         open(results_path, "a") as res_fp:
+
+        for obj_idx, uid in enumerate(pending):
+            category, labels = uid_info[uid]
+            logger.info(f"\n{'='*60}")
+            logger.info(f"[{obj_idx+1}/{len(pending)}] Object: {uid}")
+            logger.info(f"  Category: {category}, Parts: {len(labels)}")
+
+            # ---- Step 1: Enrich ----
+            record = None
+            try:
+                obj = dataset.load_object(shard, uid)
+                result = _enrich_one_object_visual(
+                    vlm_client, vlm_model, obj, category, labels)
+                obj.close()
+            except Exception as e:
+                logger.warning(f"  Visual enrichment failed: {e}")
+                result = None
+
+            if result is None:
+                # Fallback to thumbnail-based single call
+                npz_path = npz_dir / shard / f"{uid}.npz"
+                thumb = None
+                if npz_path.exists():
+                    thumb = load_thumbnail_from_npz(str(npz_path), view_id=0)
+                result = _call_vlm(vlm_client, vlm_model, category, labels, thumb)
+
+            if result is None:
+                result = _fallback_enrichment(category, labels)
+                logger.warning(f"  Using fallback enrichment for {uid}")
+
+            record = _result_to_phase0_record(result, uid, category, shard)
+            lbl_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+            lbl_fp.flush()
+
+            n_grp = len(record.get("group_edits", []))
+            n_glb = len(record.get("global_edits", []))
+            logger.info(f"  Enriched: {n_grp} groups, {n_glb} global edits")
+
+            # ---- Step 2: Plan edits for this object ----
+            obj_specs = plan_edits_for_record(record, cfg, counters)
+            for spec in obj_specs:
+                spec_fp.write(json.dumps(spec.to_dict(), ensure_ascii=False)
+                              + "\n")
+            spec_fp.flush()
+
+            n_del = sum(1 for s in obj_specs if s.edit_type == "deletion")
+            n_add = sum(1 for s in obj_specs if s.edit_type == "addition")
+            n_mod = sum(1 for s in obj_specs if s.edit_type == "modification")
+            n_g = sum(1 for s in obj_specs if s.edit_type == "global")
+            logger.info(f"  Planned: {len(obj_specs)} specs "
+                        f"(del={n_del} add={n_add} mod={n_mod} glb={n_g})")
+            total_specs += len(obj_specs)
+
+            if not obj_specs:
+                continue
+
+            # ---- Step 4: 3D edit (with inline 2D) ----
+            # Filter out already-done and addition specs
+            run_specs = [s for s in obj_specs
+                         if s.edit_id not in done_edits
+                         and s.edit_type != "addition"]
+            add_specs = [s for s in obj_specs if s.edit_type == "addition"]
+
+            if not run_specs and not add_specs:
+                logger.info("  All edits already done, skipping")
+                continue
+
+            # Prepare object for TRELLIS
+            try:
+                glb_path = refiner.extract_glb(str(mesh_zip), uid, glb_tmp_dir)
+                ori_slat = refiner.encode_object(glb_path, uid)
+                ori_gaussian = refiner.decode_to_gaussian(ori_slat)
+                obj_record = dataset.load_object(shard, uid)
+            except Exception as e:
+                logger.error(f"  Failed to prepare for TRELLIS: {e}")
+                for spec in run_specs:
+                    res_fp.write(json.dumps({
+                        "edit_id": spec.edit_id, "status": "failed",
+                        "reason": f"Preparation failed: {e}",
+                    }) + "\n")
+                    total_fail += 1
+                res_fp.flush()
+                continue
+
+            # Sort: deletion → modification → global
+            type_order = {"deletion": 0, "modification": 1, "global": 2}
+            run_specs.sort(key=lambda s: type_order.get(s.edit_type, 9))
+
+            # Track first pair dir for shared before export
+            first_pair_dir = None
+
+            for spec in run_specs:
+                if spec.edit_id in done_edits:
+                    continue
+
+                logger.info(f"\n  [{spec.edit_id}] {spec.edit_type}: "
+                            f"\"{spec.edit_prompt[:60]}\"")
+
+                try:
+                    edit_type = spec.edit_type.capitalize()
+
+                    if edit_type == "Deletion":
+                        edit_part_ids = spec.remove_part_ids
+                    elif edit_type == "Modification":
+                        if spec.remove_part_ids:
+                            edit_part_ids = spec.remove_part_ids
+                        else:
+                            edit_part_ids = [spec.old_part_id]
+                    elif edit_type == "Global":
+                        edit_part_ids = []
+                    else:
+                        continue
+
+                    # Build mask
+                    mask, effective_type = refiner.build_part_mask(
+                        uid, obj_record, edit_part_ids, ori_slat, edit_type)
+                    if effective_type != edit_type:
+                        logger.info(f"    Auto-promoted → {effective_type}")
+                        edit_type = effective_type
+                    if mask.sum() == 0:
+                        raise RuntimeError("Empty mask")
+
+                    # Build prompts
+                    prompts = build_prompts_from_spec(spec)
+                    if prompts["edit_type"] != edit_type:
+                        prompts["edit_type"] = edit_type
+
+                    # Inline 2D edit
+                    img_cond = None
+                    if args.use_2d:
+                        num_edit_views = p25.get("num_edit_views", 4)
+                        edit_strength = p25.get("edit_strength", 1.0)
+                        prerender_img = None
+
+                        if hasattr(spec, 'best_view') and spec.best_view >= 0:
+                            try:
+                                img_bytes, pil_img = prepare_input_image(
+                                    obj_record, spec.best_view)
+                                after_desc = (spec.after_desc
+                                              or spec.after_part_desc or "")
+                                before_desc = getattr(
+                                    spec, 'before_part_desc', '') or ''
+                                remove_labels = getattr(
+                                    spec, 'remove_labels', [])
+                                old_label = getattr(
+                                    spec, 'old_label', '') or ''
+                                if (remove_labels
+                                        and len(remove_labels) > 1):
+                                    part_label = ", ".join(remove_labels)
+                                elif remove_labels:
+                                    part_label = remove_labels[0]
+                                else:
+                                    part_label = old_label
+
+                                if image_edit_backend == "local_diffusers":
+                                    edit_url = p25.get(
+                                        "image_edit_base_url",
+                                        "http://localhost:8001")
+                                    edited = call_local_edit(
+                                        edit_url, img_bytes,
+                                        spec.edit_prompt, after_desc,
+                                        old_part_label=part_label,
+                                        before_part_desc=before_desc,
+                                        edit_type=spec.edit_type)
+                                elif edit_vlm_client is not None:
+                                    edited = call_vlm_edit(
+                                        edit_vlm_client, img_bytes,
+                                        spec.edit_prompt, after_desc,
+                                        p25.get("image_edit_model", ""),
+                                        old_part_label=part_label,
+                                        before_part_desc=before_desc,
+                                        edit_type=spec.edit_type)
+                                else:
+                                    edited = None
+                                if edited is not None:
+                                    edited = edited.resize((518, 518))
+                                    prerender_img = (
+                                        pil_img.resize((518, 518)),
+                                        edited)
+                                    logger.info(
+                                        f"    2D edit from view "
+                                        f"{spec.best_view}")
+                            except Exception as e:
+                                logger.warning(
+                                    f"    Prerender 2D edit failed: {e}")
+
+                        if prerender_img is not None:
+                            original_images = [prerender_img[0]]
+                            edited_images = [prerender_img[1]]
+                        else:
+                            original_images, edited_images = \
+                                refiner.obtain_edited_images(
+                                    ori_gaussian, prompts, edit_vlm_client,
+                                    uid, spec.edit_id,
+                                    num_views=num_edit_views)
+                        if edited_images:
+                            img_cond = refiner.encode_multiview_cond(
+                                edited_images, original_images,
+                                edit_strength=edit_strength)
+
+                    # Run TRELLIS
+                    slats_edited = refiner.edit(
+                        ori_slat, mask, prompts,
+                        img_cond=img_cond, seed=args.seed)
+                    if not slats_edited:
+                        raise RuntimeError("No edited SLATs produced")
+
+                    # Export (reuse shared before for same object)
+                    pair_dir = mesh_pairs_dir / spec.edit_id
+                    export_paths = refiner.export_pair_shared_before(
+                        ori_slat, slats_edited[0], pair_dir,
+                        shared_before_dir=first_pair_dir)
+
+                    record = {
+                        "edit_id": spec.edit_id,
+                        "edit_type": spec.edit_type,
+                        "effective_edit_type": edit_type,
+                        "obj_id": uid,
+                        "edit_prompt": spec.edit_prompt,
+                        **export_paths,
+                        "status": "success",
+                    }
+                    res_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    res_fp.flush()
+                    total_success += 1
+                    done_edits.add(spec.edit_id)
+                    # First successful export → reuse its before for rest
+                    if first_pair_dir is None:
+                        first_pair_dir = pair_dir
+                    logger.info(f"    OK → {pair_dir}")
+
+                except Exception as e:
+                    import traceback
+                    logger.error(f"    Failed: {e}")
+                    traceback.print_exc()
+                    res_fp.write(json.dumps({
+                        "edit_id": spec.edit_id, "status": "failed",
+                        "reason": str(e),
+                    }) + "\n")
+                    res_fp.flush()
+                    total_fail += 1
+
+            # Handle additions (swap from deletion)
+            for spec in add_specs:
+                if spec.edit_id in done_edits:
+                    continue
+                del_pair = mesh_pairs_dir / spec.source_del_id
+                add_pair = mesh_pairs_dir / spec.edit_id
+                if (del_pair / "before_slat").exists():
+                    add_pair.mkdir(parents=True, exist_ok=True)
+                    for src, dst in [
+                        (del_pair / "before_slat", add_pair / "after_slat"),
+                        (del_pair / "after_slat", add_pair / "before_slat"),
+                        (del_pair / "before.ply", add_pair / "after.ply"),
+                        (del_pair / "after.ply", add_pair / "before.ply"),
+                    ]:
+                        if src.exists() and not dst.exists():
+                            if src.is_dir():
+                                shutil.copytree(str(src), str(dst))
+                            else:
+                                shutil.copy2(str(src), str(dst))
+                    res_fp.write(json.dumps({
+                        "edit_id": spec.edit_id, "edit_type": "addition",
+                        "obj_id": uid, "status": "success",
+                        "source_del_id": spec.source_del_id,
+                    }, ensure_ascii=False) + "\n")
+                    res_fp.flush()
+                    total_success += 1
+                else:
+                    res_fp.write(json.dumps({
+                        "edit_id": spec.edit_id, "status": "failed",
+                        "reason": f"Source deletion {spec.source_del_id} "
+                                  f"not found",
+                    }) + "\n")
+                    res_fp.flush()
+                    total_fail += 1
+
+            obj_record.close()
+
+    shutil.rmtree(glb_tmp_dir, ignore_errors=True)
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Streaming complete: {total_specs} specs planned, "
+                f"{total_success} ok, {total_fail} fail")
+    logger.info(f"  Labels:  {labels_path}")
+    logger.info(f"  Specs:   {specs_path}")
+    logger.info(f"  Results: {results_path}")
+    logger.info("=" * 60)
 
 
 # =========================================================================
@@ -908,25 +1440,52 @@ Examples:
                         help="Cost estimation only, no actual processing")
     parser.add_argument("--suffix", type=str, default="",
                         help="Suffix for spec files (e.g. '_action')")
+    parser.add_argument("--force", action="store_true",
+                        help="Force re-run (delete and regenerate cached results)")
+    parser.add_argument("--streaming", action="store_true",
+                        help="Streaming mode: process each object through the "
+                             "full chain (enrich → plan → 2D+3D edit) before "
+                             "moving to the next. Faster first results, no "
+                             "cross-object swap modifications.")
+    parser.add_argument("--num-workers", type=int, default=1,
+                        dest="num_workers_stream",
+                        help="Number of parallel streaming workers (for "
+                             "multi-GPU). Each worker processes a different "
+                             "subset of objects.")
+    parser.add_argument("--worker-id", type=int, default=0,
+                        help="This worker's ID (0-indexed). Use with "
+                             "--num-workers for multi-GPU parallel.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+
+    # Set ATTN_BACKEND from config (unless already set via env)
+    attn_backend = cfg.get("pipeline", {}).get("attn_backend", "")
+    if attn_backend and "ATTN_BACKEND" not in os.environ:
+        os.environ["ATTN_BACKEND"] = attn_backend
+
     logger = setup_logging(cfg, "pipeline")
 
     steps = set(args.steps) if args.steps else {1, 2, 3, 4, 5, 6}
 
-    dataset = HY3DPartDataset(
+    dataset = PartCraftDataset(
         cfg["data"]["image_npz_dir"],
         cfg["data"]["mesh_npz_dir"],
         cfg["data"]["shards"],
     )
     logger.info(f"Dataset: {len(dataset)} objects")
 
+    # ---- Streaming mode: per-object full pipeline ----
+    if args.streaming:
+        run_streaming(cfg, dataset, logger, args)
+        return
+
     # ---- Resolve paths ----
+    # Labels are per-dataset (no suffix); specs may vary by semantic style.
     suffix = args.suffix
     tag_suffix = f"_{args.tag}" if args.tag else ""
-    labels_path = Path(cfg["phase0"]["cache_dir"]) / f"semantic_labels{suffix}.jsonl"
-    specs_path = Path(cfg["phase1"]["cache_dir"]) / f"edit_specs{suffix}.jsonl"
+    labels_path = Path(cfg["phase0"]["cache_dir"]) / f"semantic_labels{tag_suffix}.jsonl"
+    specs_path = Path(cfg["phase1"]["cache_dir"]) / f"edit_specs{suffix}{tag_suffix}.jsonl"
 
     # ---- Dry run: cost estimation ----
     if args.dry_run:
@@ -946,7 +1505,8 @@ Examples:
     # ---- Step 1: Semantic ----
     if 1 in steps:
         labels_path = run_step_semantic(
-            cfg, dataset, logger, limit=args.limit)
+            cfg, dataset, logger, limit=args.limit,
+            force=args.force, tag=args.tag)
 
     if not labels_path.exists():
         logger.error(f"Labels not found: {labels_path}")
@@ -955,7 +1515,8 @@ Examples:
 
     # ---- Step 2: Planning ----
     if 2 in steps:
-        specs_path = run_step_planning(cfg, labels_path, logger, suffix=suffix)
+        specs_path = run_step_planning(cfg, labels_path, logger,
+                                       suffix=f"{suffix}{tag_suffix}")
 
     if not specs_path.exists():
         logger.error(f"Specs not found: {specs_path}")
@@ -967,17 +1528,24 @@ Examples:
     if 3 in steps:
         edit_2d_dir = run_step_2d_edit(
             cfg, specs_path, dataset, logger,
-            tag=args.tag, workers=args.workers, limit=args.limit)
+            tag=args.tag, workers=args.workers, limit=args.limit,
+            edit_ids=set(args.edit_ids) if args.edit_ids else None)
 
     # ---- Step 4: 3D Edit ----
+    # Resolve 2D edit subdir name from tag (e.g. "2d_edits_v1")
+    edit_subdir = args.edit_dir
+    if not edit_subdir and args.tag:
+        edit_subdir = f"2d_edits_{args.tag}"
+    elif not edit_subdir:
+        edit_subdir = "2d_edits"
+
     results_path = None
     if 4 in steps:
         results_path = run_step_3d_edit(
             cfg, specs_path, dataset, logger,
             tag=args.tag, seed=args.seed, limit=args.limit,
             use_2d=args.use_2d, edit_ids=args.edit_ids,
-            edit_dir=args.edit_dir or (
-                str(edit_2d_dir) if edit_2d_dir else None))
+            edit_dir=edit_subdir)
 
     if results_path is None:
         p25_cfg = cfg.get("phase2_5", {})

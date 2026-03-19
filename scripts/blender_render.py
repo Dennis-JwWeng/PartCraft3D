@@ -120,7 +120,7 @@ def normalize_scene():
         scene = roots[0]
 
     bbox_min, bbox_max = scene_bbox()
-    scale = 1 / max(bbox_max - bbox_min)
+    scale = 2 / max(bbox_max - bbox_min)  # match pyrender: fit in [-1,1]^3
     scene.scale = scene.scale * scale
     bpy.context.view_layer.update()
     bbox_min, bbox_max = scene_bbox()
@@ -162,9 +162,13 @@ def main(args):
     transforms = {"frames": []}
 
     for i, view in enumerate(views):
+        # OpenGL Y-up → Blender Z-up coordinate conversion:
+        #   blender_x =  opengl_x = r·sin(yaw)·cos(pitch)
+        #   blender_y = -opengl_z = -r·cos(yaw)·cos(pitch)
+        #   blender_z =  opengl_y = r·sin(pitch)
         cam.location = (
-            view['radius'] * math.cos(view['yaw']) * math.cos(view['pitch']),
             view['radius'] * math.sin(view['yaw']) * math.cos(view['pitch']),
+            -view['radius'] * math.cos(view['yaw']) * math.cos(view['pitch']),
             view['radius'] * math.sin(view['pitch']),
         )
         cam.data.lens = 16 / math.tan(view['fov'] / 2)

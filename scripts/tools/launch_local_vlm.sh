@@ -1,56 +1,129 @@
 #!/bin/bash
-# Launch a local vLLM server for VLM to save API token costs.
+# Launch local model servers via SGLang/vLLM for PartCraft3D pipeline.
 #
 # Prerequisites:
-#   pip install vllm>=0.6.0
-#   # or for SGLang:
-#   pip install sglang[all]
+#   conda activate qwen_test   # SGLang 0.5.6 pre-installed
+#   # or: pip install sglang[all]
+#   # or: pip install vllm>=0.6.0
 #
 # Usage:
-#   bash scripts/launch_local_vlm.sh                    # default: local Qwen3-VL-2B-Instruct
-#   bash scripts/launch_local_vlm.sh /path/to/model 1   # custom model path
-#   BACKEND=sglang bash scripts/launch_local_vlm.sh     # use SGLang instead
+#   # Single VLM server (default — sufficient for local_sglang.yaml)
+#   bash scripts/tools/launch_local_vlm.sh
 #
-# Then in configs/local_vlm.yaml, set:
-#   phase0:
-#     vlm_backend: "local"
-#     local_base_url: "http://localhost:8000/v1"
+#   # Custom model paths
+#   VLM_MODEL=/path/to/model bash scripts/tools/launch_local_vlm.sh
+#
+#   # Use vLLM instead of SGLang
+#   BACKEND=vllm bash scripts/tools/launch_local_vlm.sh
+#
+# Note: Image editing (Qwen-Image-Edit-2511) is now loaded directly via
+# diffusers in the pipeline — no separate server needed.
+#
+# Then use: --config configs/local_sglang.yaml
 
 set -e
 
-MODEL="${1:-/Node11_nvme/wjw/checkpoints/Qwen3-VL-2B-Instruct}"
-TP="${2:-1}"
-GPU_IDS="${3:-0}"
-PORT="${4:-8000}"
-BACKEND="${BACKEND:-vllm}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
+# ---- Mode: vlm | image-edit | both ----
+MODE="${MODE:-vlm}"
+BACKEND="${BACKEND:-sglang}"
+
+# ---- VLM server settings (Qwen3.5-VL-27B) ----
+VLM_MODEL="${VLM_MODEL:-/Node11_nvme/zsn/checkpoints/Qwen3.5-27B}"
+VLM_PORT="${VLM_PORT:-8002}"
+VLM_TP="${VLM_TP:-1}"
+VLM_GPUS="${VLM_GPUS:-0}"
+VLM_MAX_LEN="${VLM_MAX_LEN:-32768}"
+
+# ---- Image edit server settings (qwen-image-2511) ----
+IMG_MODEL="${IMG_MODEL:-/Node11_nvme/wjw/checkpoints/Qwen-Image-Edit-2511}"
+IMG_PORT="${IMG_PORT:-8001}"
+IMG_TP="${IMG_TP:-1}"
+IMG_GPUS="${IMG_GPUS:-2}"
+IMG_MAX_LEN="${IMG_MAX_LEN:-8192}"
+
+# ---- Legacy single-model overrides (backward compat) ----
+# If positional args given, use them for single-server mode
+if [ $# -ge 1 ]; then VLM_MODEL="$1"; fi
+if [ $# -ge 2 ]; then VLM_TP="$2"; fi
+if [ $# -ge 3 ]; then VLM_GPUS="$3"; fi
+if [ $# -ge 4 ]; then VLM_PORT="$4"; fi
+
+launch_sglang() {
+    local model="$1" port="$2" tp="$3" gpus="$4" max_len="$5"
+    echo "Starting SGLang: model=$model port=$port tp=$tp gpus=$gpus"
+    CUDA_VISIBLE_DEVICES="$gpus" python -m sglang.launch_server \
+        --model-path "$model" \
+        --port "$port" \
+        --tp "$tp" \
+        --max-total-tokens "$max_len" \
+        --chat-template chatml \
+        --attention-backend triton
+}
+
+launch_vllm() {
+    local model="$1" port="$2" tp="$3" gpus="$4" max_len="$5"
+    echo "Starting vLLM: model=$model port=$port tp=$tp gpus=$gpus"
+    CUDA_VISIBLE_DEVICES="$gpus" python -m vllm.entrypoints.openai.api_server \
+        --model "$model" \
+        --port "$port" \
+        --tensor-parallel-size "$tp" \
+        --max-model-len "$max_len" \
+        --trust-remote-code \
+        --dtype auto
+}
+
+launch_server() {
+    if [ "$BACKEND" = "sglang" ]; then
+        launch_sglang "$@"
+    else
+        launch_vllm "$@"
+    fi
+}
 
 echo "============================================"
-echo "  Local VLM Server"
-echo "  Model:  $MODEL"
-echo "  TP:     $TP GPU(s)"
-echo "  GPUs:   $GPU_IDS"
-echo "  Port:   $PORT"
+echo "  PartCraft3D Local Model Server"
+echo "  Mode:    $MODE"
 echo "  Backend: $BACKEND"
 echo "============================================"
 
-export CUDA_VISIBLE_DEVICES="$GPU_IDS"
-
-if [ "$BACKEND" = "sglang" ]; then
-    echo "Starting SGLang server..."
-    python -m sglang.launch_server \
-        --model-path "$MODEL" \
-        --port "$PORT" \
-        --tp "$TP" \
-        --max-total-tokens "$MAX_MODEL_LEN" \
-        --chat-template chatml
-else
-    echo "Starting vLLM server..."
-    python -m vllm.entrypoints.openai.api_server \
-        --model "$MODEL" \
-        --port "$PORT" \
-        --tensor-parallel-size "$TP" \
-        --max-model-len "$MAX_MODEL_LEN" \
-        --trust-remote-code \
-        --dtype auto
-fi
+case "$MODE" in
+    vlm)
+        echo ""
+        echo "  VLM Model:  $VLM_MODEL"
+        echo "  VLM Port:   $VLM_PORT"
+        echo "  VLM GPUs:   $VLM_GPUS (TP=$VLM_TP)"
+        echo "============================================"
+        launch_server "$VLM_MODEL" "$VLM_PORT" "$VLM_TP" "$VLM_GPUS" "$VLM_MAX_LEN"
+        ;;
+    image-edit)
+        echo ""
+        echo "  IMG Model:  $IMG_MODEL"
+        echo "  IMG Port:   $IMG_PORT"
+        echo "  IMG GPUs:   $IMG_GPUS (TP=$IMG_TP)"
+        echo "============================================"
+        launch_server "$IMG_MODEL" "$IMG_PORT" "$IMG_TP" "$IMG_GPUS" "$IMG_MAX_LEN"
+        ;;
+    both)
+        echo ""
+        echo "  VLM Model:  $VLM_MODEL"
+        echo "  VLM Port:   $VLM_PORT"
+        echo "  VLM GPUs:   $VLM_GPUS (TP=$VLM_TP)"
+        echo ""
+        echo "  IMG Model:  $IMG_MODEL"
+        echo "  IMG Port:   $IMG_PORT"
+        echo "  IMG GPUs:   $IMG_GPUS (TP=$IMG_TP)"
+        echo "============================================"
+        launch_server "$VLM_MODEL" "$VLM_PORT" "$VLM_TP" "$VLM_GPUS" "$VLM_MAX_LEN" &
+        PID_VLM=$!
+        launch_server "$IMG_MODEL" "$IMG_PORT" "$IMG_TP" "$IMG_GPUS" "$IMG_MAX_LEN" &
+        PID_IMG=$!
+        echo "VLM server PID: $PID_VLM"
+        echo "IMG server PID: $PID_IMG"
+        trap "kill $PID_VLM $PID_IMG 2>/dev/null" EXIT
+        wait
+        ;;
+    *)
+        echo "ERROR: Unknown MODE=$MODE (use: vlm, image-edit, both)"
+        exit 1
+        ;;
+esac

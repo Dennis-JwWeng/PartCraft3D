@@ -80,6 +80,9 @@ class PartCatalog:
         self.by_category: dict[str, list[int]] = defaultdict(list)  # category → entry indices
         self.by_object: dict[str, list[int]] = defaultdict(list)    # obj_id → entry indices
         self.object_descs: dict[str, str] = {}                      # obj_id → description
+        self.object_global_edits: dict[str, list[dict]] = {}        # obj_id → global edit prompts
+        self.object_group_edits: dict[str, list[dict]] = {}         # obj_id → group-level edits
+        self.object_ortho_views: dict[str, list[int]] = {}          # obj_id → [front,right,back,left] NPZ view indices
         self._object_types: dict[str, str] = {}                     # obj_id → coarse type
 
     def add(self, entry: CatalogEntry):
@@ -188,6 +191,7 @@ class PartCatalog:
                 for e in self.entries
             ],
             "object_descs": self.object_descs,
+            "object_global_edits": self.object_global_edits,
         }
         with open(path, "w") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -198,6 +202,7 @@ class PartCatalog:
             data = json.load(f)
         catalog = cls()
         catalog.object_descs = data.get("object_descs", {})
+        catalog.object_global_edits = data.get("object_global_edits", {})
         for e in data["entries"]:
             catalog.add(CatalogEntry(**e))
         return catalog
@@ -238,6 +243,14 @@ class PartCatalog:
                 obj_id = rec["obj_id"]
                 shard = rec.get("shard", "00")
                 catalog.object_descs[obj_id] = rec.get("object_desc", "")
+                # Global edits (whole-object style/theme changes)
+                if rec.get("global_edits"):
+                    catalog.object_global_edits[obj_id] = rec["global_edits"]
+                # Group edits (from orthogonal 4-view enrichment)
+                if rec.get("group_edits"):
+                    catalog.object_group_edits[obj_id] = rec["group_edits"]
+                if rec.get("orthogonal_views"):
+                    catalog.object_ortho_views[obj_id] = rec["orthogonal_views"]
 
                 for p in rec.get("parts", []):
                     label = p.get("label", f"part_{p['part_id']}")
