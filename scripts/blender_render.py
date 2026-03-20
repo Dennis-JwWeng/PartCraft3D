@@ -142,13 +142,65 @@ def get_transform_matrix(obj):
     return matrix
 
 
+def import_mesh(filepath):
+    """Import a mesh file, supporting GLB/GLTF, PLY, OBJ, FBX."""
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in ('.glb', '.gltf'):
+        bpy.ops.import_scene.gltf(filepath=filepath, merge_vertices=True,
+                                   import_shading='NORMALS')
+    elif ext == '.ply':
+        # Blender 3.6+ uses wm.ply_import; older versions use import_mesh.ply
+        try:
+            bpy.ops.import_mesh.ply(filepath=filepath)
+        except (AttributeError, RuntimeError):
+            bpy.ops.wm.ply_import(filepath=filepath)
+        # PLY vertex colors — create a material so Cycles renders them.
+        for obj in bpy.context.scene.objects:
+            if obj.type != 'MESH':
+                continue
+            mesh = obj.data
+            # Detect vertex color layer (API differs by Blender version)
+            color_layer_name = None
+            if hasattr(mesh, 'color_attributes') and mesh.color_attributes:
+                color_layer_name = mesh.color_attributes[0].name
+            elif mesh.vertex_colors:
+                color_layer_name = mesh.vertex_colors[0].name
+            if not color_layer_name:
+                continue
+            mat = bpy.data.materials.new(name="VertexColorMat")
+            mat.use_nodes = True
+            nodes = mat.node_tree.nodes
+            links = mat.node_tree.links
+            nodes.clear()
+            attr_node = nodes.new('ShaderNodeVertexColor')
+            attr_node.layer_name = color_layer_name
+            bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+            bsdf.inputs['Roughness'].default_value = 0.7
+            # 'Specular' in Blender <=3.x, 'Specular IOR Level' in 4.x
+            spec_key = 'Specular IOR Level' if 'Specular IOR Level' in bsdf.inputs else 'Specular'
+            bsdf.inputs[spec_key].default_value = 0.3
+            output = nodes.new('ShaderNodeOutputMaterial')
+            links.new(attr_node.outputs['Color'], bsdf.inputs['Base Color'])
+            links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+            obj.data.materials.clear()
+            obj.data.materials.append(mat)
+    elif ext == '.obj':
+        try:
+            bpy.ops.import_scene.obj(filepath=filepath)
+        except (AttributeError, RuntimeError):
+            bpy.ops.wm.obj_import(filepath=filepath)
+    elif ext == '.fbx':
+        bpy.ops.import_scene.fbx(filepath=filepath)
+    else:
+        raise ValueError(f"Unsupported mesh format: {ext}")
+
+
 def main(args):
     os.makedirs(args.output_folder, exist_ok=True)
 
     init_render(resolution=args.resolution)
     init_scene()
-    bpy.ops.import_scene.gltf(filepath=args.object, merge_vertices=True,
-                               import_shading='NORMALS')
+    import_mesh(args.object)
     print('[INFO] Object loaded.')
 
     normalize_scene()

@@ -419,7 +419,7 @@ class TrellisRefiner:
         # Promote to Global: full mask + Inverse Flow preserves structure,
         # TRELLIS regenerates the whole object guided by the edit prompt.
         n_slat_total = slat.coords.shape[0]
-        if n_slat_total > 0 and edit_type in ("Modification", "Deletion"):
+        if n_slat_total > 0 and edit_type == "Modification":
             part_ratio = n_edit_slat / n_slat_total
             if part_ratio > large_part_threshold:
                 logger.warning(
@@ -442,15 +442,12 @@ class TrellisRefiner:
             mask = self._compute_editing_region(
                 slat, edit_parts, preserved_parts, pad=3)
         elif edit_type == "Deletion":
-            # Deletion: mask covers the ENTIRE edit part + small dilation
-            # into preserved for boundary smoothing.
-            # interweave_Trellis_TI "Deletion" path directly removes all
-            # voxels inside the mask (no S1 repaint), then S2 blends
-            # texture at the contact boundary for a smooth seam.
+            # Direct deletion: mask = exact edit part, no dilation needed.
+            # Voxels in mask are directly removed from SLAT; remaining
+            # voxels keep original features (including texture) unchanged.
             mask = edit_parts.clone()
-            mask = self._dilate_mask(mask, preserved_parts, slat, radius=1)
-            logger.info(f"Deletion mask: edit={int(edit_parts.sum())} voxels, "
-                        f"mask(+dilation)={int(mask.sum())} voxels")
+            logger.info(f"Deletion mask: {int(mask.sum())} voxels "
+                        f"(direct removal, no generation)")
         elif edit_type == "Addition":
             # Addition needs room for new geometry in empty space.
             mask = self._compute_editing_region(
@@ -1015,11 +1012,58 @@ class TrellisRefiner:
 
     # ---- Step 5: TRELLIS editing ----
 
-    def _deletion_part_ratio(self, slat, mask: torch.Tensor) -> float:
-        """Compute what fraction of SLAT voxels fall inside the mask."""
-        sc = slat.coords[:, 1:]
-        in_mask = mask[sc[:, 0], sc[:, 1], sc[:, 2]].sum().item()
-        return in_mask / max(sc.shape[0], 1)
+    @staticmethod
+    def direct_delete_mesh(
+        obj_record,
+        remove_part_ids: list[int],
+        output_dir: str | Path,
+    ) -> dict:
+        """Delete parts by assembling remaining GT meshes directly.
+
+        No SLAT encoding, no generation — just removes the target parts
+        from the ground-truth mesh and exports before/after PLY with
+        original vertex colors preserved.
+
+        Returns dict of exported file paths.
+        """
+        import trimesh as _trimesh
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        paths = {}
+
+        all_part_ids = [p.part_id for p in obj_record.parts]
+        keep_ids = [pid for pid in all_part_ids
+                    if pid not in set(remove_part_ids)]
+
+        n_all = len(all_part_ids)
+        n_remove = len(remove_part_ids)
+        n_keep = len(keep_ids)
+        logger.info(f"DirectDeletion (GT mesh): removing parts "
+                    f"{remove_part_ids} ({n_remove}/{n_all}), "
+                    f"keeping {n_keep} parts")
+
+        # Before: full mesh with all parts
+        before_mesh = obj_record.get_assembled_mesh(
+            all_part_ids, colored=True)
+        before_path = output_dir / "before.ply"
+        before_mesh.export(str(before_path))
+        paths['before_ply'] = str(before_path)
+
+        # After: remaining parts only
+        if keep_ids:
+            after_mesh = obj_record.get_assembled_mesh(
+                keep_ids, colored=True)
+        else:
+            logger.warning("DirectDeletion: all parts removed!")
+            after_mesh = _trimesh.Trimesh()
+        after_path = output_dir / "after.ply"
+        after_mesh.export(str(after_path))
+        paths['after_ply'] = str(after_path)
+
+        logger.info(f"Exported GT mesh pair: before={before_path}, "
+                    f"after={after_path}")
+        return paths
 
     def edit(
         self,
@@ -1042,11 +1086,10 @@ class TrellisRefiner:
             img_new: Single PIL image (legacy fallback, used if img_cond is None).
 
         For Modification/Addition: alternates text/image conditioning.
-        For Deletion: routed through "Deletion" path — S1 is skipped,
-            mask voxels are directly removed, S2 blends texture at the
-            contact boundary for a smooth seam.
         For Global: routed through TextureOnly — S1 is skipped entirely
             (original shape preserved), only S2 repaint changes texture.
+        Note: Deletion is handled by direct_delete_mesh() using GT meshes,
+            not by this method.
         """
         from interweave_Trellis import interweave_Trellis_TI
         from trellis.modules import sparse as sp
@@ -1054,19 +1097,10 @@ class TrellisRefiner:
         edit_type = prompts.get('edit_type', 'Modification')
 
         # --- Route edit types ---
-        is_deletion = (edit_type == "Deletion")
         is_global = (edit_type == "Global")
 
         if combinations is None:
-            if is_deletion:
-                # Deletion: skip S1, directly remove voxels, S2 blends at seam.
-                # cfg controls how much S2 departs from original at boundary.
-                combinations = [
-                    {"s1_pos_cond": "new_s1_cpl", "s1_neg_cond": "ori_s1_cpl",
-                     "s2_pos_cond": "new_s2_cpl", "s2_neg_cond": "ori_s2_cpl",
-                     "cnt": 1, "cfg_strength": 3.0},
-                ]
-            elif is_global:
+            if is_global:
                 combinations = [
                     {"s1_pos_cond": "ori_s1_cpl", "s1_neg_cond": "ori_s1_cpl",
                      "s2_pos_cond": "new_s2_cpl", "s2_neg_cond": "ori_s2_cpl",
@@ -1080,12 +1114,8 @@ class TrellisRefiner:
                      "cnt": 1, "cfg_strength": 7.5},
                 ]
 
-        # Deletion → "Deletion": skip S1 repaint, directly remove mask voxels,
-        #   S2 blends texture at the contact boundary.
         # Global → "TextureOnly": skip S1, keep original coords, S2 only.
-        if is_deletion:
-            effective_edit_type = "Deletion"
-        elif is_global:
+        if is_global:
             effective_edit_type = "TextureOnly"
         else:
             effective_edit_type = edit_type
@@ -1110,14 +1140,6 @@ class TrellisRefiner:
             # blank white image produces neutral features.
             logger.info("No reference image — using blank white image")
             effective_img = Image.new("RGB", (518, 518), (255, 255, 255))
-
-        if is_deletion:
-            sc = slat.coords[:, 1:]
-            in_mask = mask[sc[:, 0], sc[:, 1], sc[:, 2]]
-            n_total = sc.shape[0]
-            n_in_mask = int(in_mask.sum())
-            logger.info(f"Deletion: removing {n_in_mask}/{n_total} SLAT voxels "
-                        f"({n_in_mask/n_total*100:.1f}%)")
 
         try:
             slats_edited = []

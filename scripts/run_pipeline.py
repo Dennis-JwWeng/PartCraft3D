@@ -441,7 +441,30 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
                     edit_type = spec.edit_type.capitalize()
 
                     if edit_type == "Deletion":
-                        edit_part_ids = spec.remove_part_ids
+                        # Direct GT mesh deletion — no SLAT/generation needed
+                        from partcraft.phase2_assembly.trellis_refine import TrellisRefiner
+                        pair_dir = mesh_pairs_dir / spec.edit_id
+                        export_paths = TrellisRefiner.direct_delete_mesh(
+                            obj_record, spec.remove_part_ids, pair_dir)
+                        record = {
+                            "edit_id": spec.edit_id,
+                            "edit_type": spec.edit_type,
+                            "effective_edit_type": "DirectDeletion",
+                            "obj_id": obj_id,
+                            "shard": spec.shard,
+                            "object_desc": spec.object_desc,
+                            "edit_prompt": spec.edit_prompt,
+                            "after_desc": spec.after_desc,
+                            **export_paths,
+                            "status": "success",
+                        }
+                        out_fp.write(json.dumps(record,
+                                                ensure_ascii=False) + "\n")
+                        out_fp.flush()
+                        success += 1
+                        logger.info(f"  → direct deletion (GT mesh) "
+                                    f"saved {pair_dir}")
+                        continue
                     elif edit_type == "Modification":
                         if spec.remove_part_ids:
                             edit_part_ids = spec.remove_part_ids
@@ -452,7 +475,9 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
                     elif edit_type == "Addition":
                         del_pair_dir = mesh_pairs_dir / spec.source_del_id
                         add_pair_dir = mesh_pairs_dir / spec.edit_id
-                        if (del_pair_dir / "before_slat").exists():
+                        del_has_output = ((del_pair_dir / "before_slat").exists()
+                                          or (del_pair_dir / "before.ply").exists())
+                        if del_has_output:
                             add_pair_dir.mkdir(parents=True, exist_ok=True)
                             for src, dst in [
                                 (del_pair_dir / "before_slat",
@@ -514,7 +539,7 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
 
                     # 2D image conditioning
                     img_cond = None
-                    if edit_type in ("Modification", "Deletion", "Global") and use_2d:
+                    if edit_type in ("Modification", "Global") and use_2d:
                         num_edit_views = p25_cfg.get("num_edit_views", 4)
                         edit_strength = p25_cfg.get("edit_strength", 1.0)
 
