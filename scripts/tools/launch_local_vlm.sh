@@ -23,6 +23,11 @@
 
 set -e
 
+# Save outer CUDA_VISIBLE_DEVICES if set (so launch functions respect it)
+if [ -n "${CUDA_VISIBLE_DEVICES+x}" ]; then
+    _OUTER_CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES"
+fi
+
 # ---- Mode: vlm | image-edit | both ----
 MODE="${MODE:-vlm}"
 BACKEND="${BACKEND:-sglang}"
@@ -50,13 +55,38 @@ if [ $# -ge 4 ]; then VLM_PORT="$4"; fi
 
 launch_sglang() {
     local model="$1" port="$2" tp="$3" gpus="$4" max_len="$5"
+
+    # If CUDA_VISIBLE_DEVICES is already set externally, respect it
+    # (don't override with VLM_GPUS/IMG_GPUS)
+    if [ -n "${_OUTER_CUDA_VISIBLE_DEVICES+x}" ]; then
+        gpus="$_OUTER_CUDA_VISIBLE_DEVICES"
+    fi
     echo "Starting SGLang: model=$model port=$port tp=$tp gpus=$gpus"
-    CUDA_VISIBLE_DEVICES="$gpus" python -m sglang.launch_server \
+
+    # Auto-detect CUDA_HOME from nvcc location (fixes FlashInfer JIT)
+    if [ -z "$CUDA_HOME" ]; then
+        local nvcc_path
+        nvcc_path=$(which nvcc 2>/dev/null)
+        if [ -n "$nvcc_path" ]; then
+            export CUDA_HOME="$(dirname "$(dirname "$(readlink -f "$nvcc_path")")")"
+            echo "  Auto-detected CUDA_HOME=$CUDA_HOME"
+        fi
+    fi
+
+    # Clear stale FlashInfer JIT cache (may have wrong nvcc path baked in)
+    if [ -d "$HOME/.cache/flashinfer" ]; then
+        echo "  Clearing FlashInfer JIT cache..."
+        rm -rf "$HOME/.cache/flashinfer"
+    fi
+
+    CUDA_VISIBLE_DEVICES="$gpus" \
+    CUDA_HOME="$CUDA_HOME" \
+    python -m sglang.launch_server \
         --model-path "$model" \
         --port "$port" \
         --tp "$tp" \
         --max-total-tokens "$max_len" \
-        --chat-template chatml \
+        --mem-fraction-static 0.5 \
         --attention-backend triton
 }
 

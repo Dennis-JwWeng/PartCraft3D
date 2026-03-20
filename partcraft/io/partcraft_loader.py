@@ -568,28 +568,42 @@ def _pack_one_object(obj_id: str, img_enc_dir: Path,
     render_data["transforms.json"] = np.frombuffer(
         json.dumps(transforms).encode("utf-8"), dtype=np.uint8)
 
-    # ---- Mesh NPZ: split mesh.ply by instance_gt ----
-    mesh_150 = trimesh.load(str(mesh_ply_path), file_type="ply")
+    # ---- Mesh NPZ: split source mesh by instance_gt ----
+    # Use the SOURCE mesh (mesh.glb) directly — its face order matches
+    # instance_gt exactly.  VD mesh.ply has reordered faces (even when
+    # face count matches), causing ~84% of faces to get wrong part labels.
+    # VD mesh.ply is still used for rendering images (transforms.json),
+    # and build_part_mask uses it for coordinate alignment.
     instance_gt = _load_gt_npy(source_dir / "instance_gt.zip", obj_id)
 
     if instance_gt is None:
         return {"obj_id": obj_id, "status": "skip", "reason": "no instance_gt"}
 
-    # Handle face count mismatch (VD may remove degenerate faces)
-    if len(instance_gt) != len(mesh_150.faces):
-        instance_gt = _transfer_labels_nearest(
-            source_dir, obj_id, mesh_150, instance_gt)
-        if instance_gt is None:
-            return {"obj_id": obj_id, "status": "skip",
-                    "reason": "face transfer failed"}
+    source_mesh = _load_source_mesh(source_dir, obj_id)
+    if source_mesh is None:
+        return {"obj_id": obj_id, "status": "skip",
+                "reason": "no source mesh.glb"}
 
-    parts, split_mesh_json = _split_mesh(mesh_150, instance_gt, labels)
+    if len(instance_gt) != len(source_mesh.faces):
+        return {"obj_id": obj_id, "status": "skip",
+                "reason": f"instance_gt ({len(instance_gt)}) != "
+                          f"source faces ({len(source_mesh.faces)})"}
+
+    # ---- Align source mesh to VD coordinate space ----
+    # Source GLB is Y-up; VD mesh.ply is Z-up (re-centered at origin).
+    # Use exact normalization params from transforms.json (recorded by
+    # VD's Blender prerender): axis conversion + offset + scale.
+    # This ensures full.ply and part PLYs in the NPZ are in VD space,
+    # so build_part_mask's HY3D→VD→SLAT transform works correctly.
+    source_mesh = _align_source_to_vd(source_mesh, transforms)
+
+    parts, split_mesh_json = _split_mesh(source_mesh, instance_gt, labels)
 
     render_data["split_mesh.json"] = np.frombuffer(
         json.dumps(split_mesh_json).encode("utf-8"), dtype=np.uint8)
 
     mesh_data = {
-        "full.ply": np.frombuffer(_to_ply(mesh_150), dtype=np.uint8),
+        "full.ply": np.frombuffer(_to_ply(source_mesh), dtype=np.uint8),
     }
     for pid, label, sub in parts:
         mesh_data[f"part_{pid}.ply"] = np.frombuffer(
@@ -611,6 +625,52 @@ def _load_gt_npy(zip_path: Path, obj_id: str) -> np.ndarray | None:
         if not matches:
             return None
         return np.load(io.BytesIO(zf.read(matches[0])))
+
+
+def _align_source_to_vd(source_mesh, transforms: dict):
+    """Transform source mesh (GLB, Y-up) to VD coordinate space (Z-up).
+
+    Uses the exact normalization parameters recorded in transforms.json
+    by VD's Blender prerender pipeline:
+      1. Blender GLB import converts Y-up → Z-up: (x, y, z) → (x, -z, y)
+      2. Normalize: vertex = (blender_vertex + offset) * scale
+
+    Modifies source_mesh in-place and returns it.
+    """
+    scale = transforms["scale"]
+    offset = np.array(transforms["offset"])
+
+    sv = np.array(source_mesh.vertices)
+
+    # Step 1: Blender GLB import axis conversion (Y-up → Z-up)
+    blender = np.empty_like(sv)
+    blender[:, 0] = sv[:, 0]    # x stays
+    blender[:, 1] = -sv[:, 2]   # y = -z_glb
+    blender[:, 2] = sv[:, 1]    # z = y_glb
+
+    # Step 2: Blender scene normalization
+    aligned = (blender + offset) * scale
+
+    source_mesh.vertices = aligned
+    return source_mesh
+
+
+def _load_source_mesh(source_dir: Path, obj_id: str):
+    """Load original source mesh from mesh.zip (GLB format)."""
+    mesh_zip = source_dir / "mesh.zip"
+    if not mesh_zip.exists():
+        return None
+    with zipfile.ZipFile(mesh_zip) as zf:
+        matches = [n for n in zf.namelist()
+                    if obj_id in n and (n.endswith('.glb') or n.endswith('.ply'))]
+        if not matches:
+            return None
+        data = zf.read(matches[0])
+        ext = matches[0].rsplit('.', 1)[-1]
+        mesh = trimesh.load(io.BytesIO(data), file_type=ext)
+        if isinstance(mesh, trimesh.Scene):
+            mesh = mesh.to_geometry()
+        return mesh
 
 
 def _transfer_labels_nearest(source_dir: Path, obj_id: str,

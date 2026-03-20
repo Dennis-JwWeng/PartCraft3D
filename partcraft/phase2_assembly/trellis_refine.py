@@ -123,14 +123,9 @@ def build_prompts_from_spec(spec) -> dict:
     after_desc = spec.after_desc or obj_desc
     edit_prompt = spec.edit_prompt or ""
 
-    # For deletion: enrich after_desc to emphasize surface closure,
-    # so TRELLIS Stage 1 generates closed geometry instead of leaving holes
-    if edit_type == "Deletion" and after_desc:
-        remove_labels = getattr(spec, 'remove_labels', [])
-        part_name = remove_labels[0] if remove_labels else "the part"
-        after_desc = (
-            f"{after_desc}, with smooth closed surface "
-            f"where the {part_name} was removed")
+    # Deletion now uses the "Deletion" path in interweave_Trellis_TI
+    # which directly removes voxels (no S1 repaint), so the "smooth
+    # closed surface" prompt enrichment is no longer needed.
 
     old_label = getattr(spec, 'old_label', '') or ''
     before_part = getattr(spec, 'before_part_desc', '') or old_label
@@ -188,6 +183,7 @@ class TrellisRefiner:
         ckpt_dir: str | None = None,
         image_edit_backend: str = "api",
         image_edit_base_url: str | None = None,
+        debug: bool = False,
     ):
         self.vinedresser_path = vinedresser_path
         self.cache_dir = Path(cache_dir)
@@ -200,10 +196,10 @@ class TrellisRefiner:
 
         # Checkpoint directory: default to PartCraft3D/checkpoints
         if ckpt_dir is None:
-            ckpt_dir = str(Path(__file__).resolve().parents[2] / "checkpoints")
+            ckpt_dir = str(Path(__file__).parents[2] / "checkpoints")
         self.ckpt_dir = Path(ckpt_dir)
 
-        self.debug = os.environ.get("PARTCRAFT_DEBUG", "").lower() in ("1", "true")
+        self.debug = debug or os.environ.get("PARTCRAFT_DEBUG", "").lower() in ("1", "true")
 
         self.trellis_text = None
         self.trellis_img = None
@@ -334,55 +330,66 @@ class TrellisRefiner:
         logger.info(f"Part mask transform: scale={scale_factor:.4f}, "
                     f"hy3d_extent={hy3d_extent:.4f}, vd_extent={vd_extent:.4f}")
 
-        # Voxelize each part
+        # Merge group parts into combined meshes, then voxelize once each.
+        # This treats multi-part groups as a single contiguous region,
+        # producing accurate contact boundaries and consistent voxelization.
+        import trimesh as _trimesh
+
         all_part_ids = [p.part_id for p in obj_record.parts]
-        edit_parts = torch.zeros(64, 64, 64, device=device, dtype=torch.bool)
-        preserved_parts = torch.zeros(64, 64, 64, device=device, dtype=torch.bool)
+        edit_set = set(edit_part_ids)
+        edit_meshes = []
+        preserved_meshes = []
 
         for pid in all_part_ids:
             try:
                 part_mesh = obj_record.get_part_mesh(pid, colored=False)
             except KeyError:
                 continue
+            if pid in edit_set:
+                edit_meshes.append(part_mesh)
+            else:
+                preserved_meshes.append(part_mesh)
 
-            # Transform vertices: HY3D → VD space → SLAT space
-            part_verts = np.array(part_mesh.vertices)
-            part_verts_vd = (part_verts - hy3d_center) * scale_factor + vd_center
-            # VD space → SLAT space: swap Y/Z axes and negate new Y
-            # SLAT encoding maps (x, y, z) → (x, -z, y)
-            part_verts_slat = part_verts_vd[:, [0, 2, 1]].copy()
-            part_verts_slat[:, 1] = -part_verts_slat[:, 1]
-            part_verts_slat = np.clip(part_verts_slat, -0.5 + 1e-6, 0.5 - 1e-6)
+        def _voxelize_combined(meshes: list) -> torch.Tensor:
+            """Merge trimesh list → transform to VD space → voxelize once.
 
-            # Voxelize using Open3D (same as VD's voxelize function)
-            o3d_part = o3d.geometry.TriangleMesh()
-            o3d_part.vertices = o3d.utility.Vector3dVector(part_verts_slat)
-            o3d_part.triangles = o3d.utility.Vector3iVector(
-                np.array(part_mesh.faces))
+            SLAT coordinates are voxelized directly from VD space (no axis
+            reorder).  VD's voxelize() clips mesh.ply to [-0.5, 0.5] and
+            creates a 64³ grid — SLAT coords are those grid indices.
+            """
+            grid = torch.zeros(64, 64, 64, device=device, dtype=torch.bool)
+            if not meshes:
+                return grid
+            combined = _trimesh.util.concatenate(meshes)
+            verts = np.array(combined.vertices)
+            verts_vd = (verts - hy3d_center) * scale_factor + vd_center
+            # No axis reorder — SLAT coords are in VD space directly
+            verts_vd = np.clip(verts_vd, -0.5 + 1e-6, 0.5 - 1e-6)
 
+            o3d_mesh = o3d.geometry.TriangleMesh()
+            o3d_mesh.vertices = o3d.utility.Vector3dVector(verts_vd)
+            o3d_mesh.triangles = o3d.utility.Vector3iVector(
+                np.array(combined.faces))
             try:
                 vg = o3d.geometry.VoxelGrid.create_from_triangle_mesh_within_bounds(
-                    o3d_part, voxel_size=1/64,
+                    o3d_mesh, voxel_size=1/64,
                     min_bound=(-0.5, -0.5, -0.5),
                     max_bound=(0.5, 0.5, 0.5))
                 voxels = np.array([v.grid_index for v in vg.get_voxels()])
             except Exception:
-                # Fallback: vertex-only voxelization
-                grid = ((part_verts_slat + 0.5) * 64).astype(np.int32)
-                voxels = np.unique(np.clip(grid, 0, 63), axis=0)
+                vg_grid = ((verts_vd + 0.5) * 64).astype(np.int32)
+                voxels = np.unique(np.clip(vg_grid, 0, 63), axis=0)
+            if len(voxels) > 0:
+                vt = torch.from_numpy(voxels).long().to(device)
+                grid[vt[:, 0], vt[:, 1], vt[:, 2]] = True
+            return grid
 
-            if len(voxels) == 0:
-                continue
+        edit_parts = _voxelize_combined(edit_meshes)
+        preserved_parts = _voxelize_combined(preserved_meshes)
 
-            vt = torch.from_numpy(voxels).long().to(device)
-
-            if pid in edit_part_ids:
-                edit_parts[vt[:, 0], vt[:, 1], vt[:, 2]] = True
-            else:
-                preserved_parts[vt[:, 0], vt[:, 1], vt[:, 2]] = True
-
-        logger.info(f"Part mask (mesh-voxelized): edit={int(edit_parts.sum())} voxels, "
-                    f"preserved={int(preserved_parts.sum())} voxels")
+        logger.info(f"Part mask (combined-voxelized): "
+                    f"edit={int(edit_parts.sum())} voxels ({len(edit_meshes)} parts), "
+                    f"preserved={int(preserved_parts.sum())} voxels ({len(preserved_meshes)} parts)")
 
         # ---- Align masks to SLAT coordinates ----
         # VD builds masks from SLAT coords directly (via PartField).
@@ -427,53 +434,23 @@ class TrellisRefiner:
         # TRELLIS generation fills the edit region; soft mask handles
         # boundary continuity without cutting into preserved geometry.
         if edit_type == "Modification":
-            # Tight mask: edit_parts + minimal 1-voxel dilation for
-            # boundary contact, no KNN expansion into empty space.
+            # Expanded mask: edit_parts + surrounding empty space (pad=3).
+            # S1 repaint needs room to generate a replacement part that
+            # may differ in size/shape from the original.  Using only
+            # edit_parts + 1-voxel dilation constrains S1 to regenerate
+            # in the exact same footprint, producing near-identical output.
+            mask = self._compute_editing_region(
+                slat, edit_parts, preserved_parts, pad=3)
+        elif edit_type == "Deletion":
+            # Deletion: mask covers the ENTIRE edit part + small dilation
+            # into preserved for boundary smoothing.
+            # interweave_Trellis_TI "Deletion" path directly removes all
+            # voxels inside the mask (no S1 repaint), then S2 blends
+            # texture at the contact boundary for a smooth seam.
             mask = edit_parts.clone()
             mask = self._dilate_mask(mask, preserved_parts, slat, radius=1)
-        elif edit_type == "Deletion":
-            # Contact-aware deletion: only apply soft mask at boundaries
-            # where the deleted part connects to preserved parts.
-            # Non-contact voxels are removed entirely (no S1 regeneration).
-            from scipy import ndimage as _ndi
-
-            # Find contact boundary: edit voxels adjacent to preserved voxels
-            preserved_np = preserved_parts.cpu().numpy().astype(np.uint8)
-            contact_struct = _ndi.generate_binary_structure(3, 1)  # 6-connected
-            preserved_dilated = _ndi.binary_dilation(
-                preserved_np, contact_struct, iterations=1)
-            preserved_dilated_t = torch.from_numpy(
-                preserved_dilated.astype(bool)).to(device)
-
-            contact_boundary = edit_parts & preserved_dilated_t
-            non_contact = edit_parts & ~contact_boundary
-
-            n_contact = int(contact_boundary.sum())
-            n_non_contact = int(non_contact.sum())
-            logger.info(f"Deletion contact analysis: "
-                        f"contact_boundary={n_contact}, "
-                        f"non_contact={n_non_contact} voxels")
-
-            # Store non-contact voxels for post-S1 removal in edit()
-            self._deletion_non_contact = non_contact
-
-            if n_contact > 0:
-                # Mask = contact boundary + small dilation for smooth closure
-                # S1 only regenerates at the connection seam, not the whole part
-                contact_ratio = n_contact / max(n_contact + n_non_contact, 1)
-                closure_radius = max(1, min(round(1 + contact_ratio * 3), 3))
-                mask = contact_boundary.clone()
-                mask = self._dilate_mask(mask, preserved_parts, slat,
-                                         radius=closure_radius)
-                logger.info(f"Deletion mask: contact_ratio={contact_ratio:.2f}, "
-                            f"closure_radius={closure_radius}, "
-                            f"mask={int(mask.sum())} voxels")
-            else:
-                # Pure deletion: part is completely floating (no contact)
-                # Skip S1 regeneration, just remove voxels
-                self._deletion_pure_remove = True
-                mask = edit_parts.clone()
-                logger.info("Deletion: no contact boundary, pure voxel removal")
+            logger.info(f"Deletion mask: edit={int(edit_parts.sum())} voxels, "
+                        f"mask(+dilation)={int(mask.sum())} voxels")
         elif edit_type == "Addition":
             # Addition needs room for new geometry in empty space.
             mask = self._compute_editing_region(
@@ -570,21 +547,22 @@ class TrellisRefiner:
     def _dilate_mask(
         self, mask: torch.Tensor, preserved: torch.Tensor,
         slat, radius: int = 2,
+        exclude: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Dilate mask by `radius` voxels along the boundary with preserved parts.
 
         Only dilates INTO preserved regions that are adjacent to the edit mask,
-        creating a smooth transition zone.  Empty space (neither edit nor
-        preserved) is also included if within radius.
-
-        This prevents sharp cuts at part boundaries that cause broken geometry
-        and disconnected surfaces after editing.
+        creating a smooth transition zone.
 
         Args:
             mask: current edit mask (64³ bool tensor)
             preserved: preserved parts mask (64³ bool tensor)
             slat: SLAT object (used to limit dilation to occupied voxels)
             radius: number of voxels to dilate (default 2)
+            exclude: voxels to never include in dilation result (64³ bool).
+                     For deletion, this should be the non-contact edit voxels
+                     to prevent dilation from expanding back into the part
+                     being deleted.
 
         Returns:
             Dilated mask (64³ bool tensor)
@@ -604,6 +582,12 @@ class TrellisRefiner:
         slat_occupied = torch.zeros(64, 64, 64, device=mask.device, dtype=torch.bool)
         sc = slat.coords[:, 1:]
         slat_occupied[sc[:, 0], sc[:, 1], sc[:, 2]] = True
+
+        # For deletion: exclude non-contact edit voxels from slat_occupied
+        # so dilation only expands into preserved geometry, not back into
+        # the part being deleted.
+        if exclude is not None:
+            slat_occupied = slat_occupied & ~exclude
 
         # Final mask: original edit region + boundary transition zone
         # Transition = newly dilated voxels that are on occupied geometry
@@ -765,20 +749,22 @@ class TrellisRefiner:
                 return [input_img], [edited_img]
 
         views_dir = self.cache_dir / "2d_edits"
-        views_dir.mkdir(parents=True, exist_ok=True)
+        if self.debug:
+            views_dir.mkdir(parents=True, exist_ok=True)
 
-        # ---- 2. Check cached multi-view images ----
-        cached_edited = []
-        cached_original = []
-        for v in range(num_views):
-            p_edited = views_dir / f"{edit_id}_edited_v{v}.png"
-            p_input = views_dir / f"{edit_id}_input_v{v}.png"
-            if p_edited.exists() and p_input.exists():
-                cached_edited.append(Image.open(str(p_edited)).resize((518, 518)))
-                cached_original.append(Image.open(str(p_input)).resize((518, 518)))
-        if len(cached_edited) == num_views:
-            logger.info(f"Loading {num_views} cached edited images for {edit_id}")
-            return cached_original, cached_edited
+        # ---- 2. Check cached multi-view images (only if debug saved them) ----
+        if self.debug:
+            cached_edited = []
+            cached_original = []
+            for v in range(num_views):
+                p_edited = views_dir / f"{edit_id}_edited_v{v}.png"
+                p_input = views_dir / f"{edit_id}_input_v{v}.png"
+                if p_edited.exists() and p_input.exists():
+                    cached_edited.append(Image.open(str(p_edited)).resize((518, 518)))
+                    cached_original.append(Image.open(str(p_input)).resize((518, 518)))
+            if len(cached_edited) == num_views:
+                logger.info(f"Loading {num_views} cached edited images for {edit_id}")
+                return cached_original, cached_edited
 
         # ---- 3. Call VLM API to generate multi-view edits ----
         if vlm_client is None:
@@ -799,7 +785,6 @@ class TrellisRefiner:
         for v, img_arr in enumerate(imgs):
             img_pil = Image.fromarray(img_arr).resize(
                 (518, 518), Image.Resampling.LANCZOS)
-            img_pil.save(str(views_dir / f"{edit_id}_input_v{v}.png"))
             original_images.append(img_pil)
 
             img_edited = self._call_vlm_edit(
@@ -813,11 +798,17 @@ class TrellisRefiner:
                     (518, 518), Image.Resampling.LANCZOS)
                 # Composite: keep original background, blend edit on foreground
                 img_edited = self._composite_edit(img_pil, img_edited)
-                img_edited.save(str(views_dir / f"{edit_id}_edited_v{v}.png"))
                 edited_images.append(img_edited)
             else:
                 logger.warning(f"2D edit failed for view {v}, using original")
                 edited_images.append(img_pil)
+
+            # Save debug views
+            if self.debug:
+                img_pil.save(str(views_dir / f"{edit_id}_input_v{v}.png"))
+                if img_edited is not None:
+                    edited_images[-1].save(
+                        str(views_dir / f"{edit_id}_edited_v{v}.png"))
 
         logger.info(f"Generated {len(edited_images)} edited views for {edit_id}")
         return original_images, edited_images
@@ -1051,10 +1042,9 @@ class TrellisRefiner:
             img_new: Single PIL image (legacy fallback, used if img_cond is None).
 
         For Modification/Addition: alternates text/image conditioning.
-        For Deletion (contact-aware):
-            - Non-contact voxels: removed entirely (no S1 regeneration).
-            - Contact boundary: S1 regenerates closing geometry via soft mask.
-            - Pure deletion (no contact): skip S1/S2, directly remove voxels.
+        For Deletion: routed through "Deletion" path — S1 is skipped,
+            mask voxels are directly removed, S2 blends texture at the
+            contact boundary for a smooth seam.
         For Global: routed through TextureOnly — S1 is skipped entirely
             (original shape preserved), only S2 repaint changes texture.
         """
@@ -1067,42 +1057,16 @@ class TrellisRefiner:
         is_deletion = (edit_type == "Deletion")
         is_global = (edit_type == "Global")
 
-        # --- Pure deletion: no contact boundary, skip S1/S2 entirely ---
-        if is_deletion and getattr(self, '_deletion_pure_remove', False):
-            del self._deletion_pure_remove
-            non_contact = getattr(self, '_deletion_non_contact', None)
-            if non_contact is not None:
-                del self._deletion_non_contact
-            sc = slat.coords[:, 1:]
-            in_edit = mask[sc[:, 0], sc[:, 1], sc[:, 2]]
-            keep = ~in_edit
-            slat_new = sp.SparseTensor(
-                feats=slat.feats[keep],
-                coords=slat.coords[keep],
-            )
-            n_removed = int(in_edit.sum())
-            logger.info(f"Pure deletion: removed {n_removed} voxels, "
-                        f"kept {int(keep.sum())} (no S1/S2 needed)")
-            return [slat_new]
-
         if combinations is None:
             if is_deletion:
-                part_ratio = self._deletion_part_ratio(slat, mask)
-                # Contact-only mask → lower cfg since we only close the seam
-                cfg = round(3.0 + part_ratio * 6.0, 1)
-                cfg = max(3.0, min(cfg, 5.5))
-                logger.info(
-                    f"Deletion (contact closure): S1 regenerates seam, "
-                    f"part_ratio={part_ratio:.2f}, cfg_strength={cfg}")
+                # Deletion: skip S1, directly remove voxels, S2 blends at seam.
+                # cfg controls how much S2 departs from original at boundary.
                 combinations = [
                     {"s1_pos_cond": "new_s1_cpl", "s1_neg_cond": "ori_s1_cpl",
                      "s2_pos_cond": "new_s2_cpl", "s2_neg_cond": "ori_s2_cpl",
-                     "cnt": 1, "cfg_strength": cfg},
+                     "cnt": 1, "cfg_strength": 3.0},
                 ]
             elif is_global:
-                # Global (texture only): S1 is skipped, S2 repaint drives
-                # all texture change.  Moderate cfg so appearance departs
-                # noticeably from the original without hallucinating geometry.
                 combinations = [
                     {"s1_pos_cond": "ori_s1_cpl", "s1_neg_cond": "ori_s1_cpl",
                      "s2_pos_cond": "new_s2_cpl", "s2_neg_cond": "ori_s2_cpl",
@@ -1116,10 +1080,11 @@ class TrellisRefiner:
                      "cnt": 1, "cfg_strength": 7.5},
                 ]
 
-        # Deletion → Modification: S1 repaint fills the hole with new geometry
-        # Global → TextureOnly: skip S1, keep original coords, S2 only
+        # Deletion → "Deletion": skip S1 repaint, directly remove mask voxels,
+        #   S2 blends texture at the contact boundary.
+        # Global → "TextureOnly": skip S1, keep original coords, S2 only.
         if is_deletion:
-            effective_edit_type = "Modification"
+            effective_edit_type = "Deletion"
         elif is_global:
             effective_edit_type = "TextureOnly"
         else:
@@ -1129,24 +1094,30 @@ class TrellisRefiner:
         # Priority: img_cond (multi-view averaged) > img_new (single) > blank
         _patched = False
         if img_cond is not None:
-            # Monkey-patch trellis_img to return pre-computed averaged features
             _orig_preprocess = self.trellis_img.preprocess_image
             _orig_get_cond = self.trellis_img.get_cond
             null_cond = torch.zeros_like(img_cond)
             self.trellis_img.preprocess_image = lambda x: x
             self.trellis_img.get_cond = lambda x: {
                 "cond": img_cond, "neg_cond": null_cond}
-            # Dummy image so interweave_Trellis_TI enters the image branch
             effective_img = Image.new("RGB", (518, 518), (255, 255, 255))
             _patched = True
             logger.info("Using multi-view averaged DINOv2 conditioning")
         elif img_new is not None:
             effective_img = img_new
-        elif effective_edit_type in ("Modification", "Addition"):
+        else:
+            # S2 image model always needs a conditioning image;
+            # blank white image produces neutral features.
             logger.info("No reference image — using blank white image")
             effective_img = Image.new("RGB", (518, 518), (255, 255, 255))
-        else:
-            effective_img = None
+
+        if is_deletion:
+            sc = slat.coords[:, 1:]
+            in_mask = mask[sc[:, 0], sc[:, 1], sc[:, 2]]
+            n_total = sc.shape[0]
+            n_in_mask = int(in_mask.sum())
+            logger.info(f"Deletion: removing {n_in_mask}/{n_total} SLAT voxels "
+                        f"({n_in_mask/n_total*100:.1f}%)")
 
         try:
             slats_edited = []
@@ -1156,7 +1127,7 @@ class TrellisRefiner:
                     **combo,
                 }
                 logger.info(f"Running combination {i}/{len(combinations)}: "
-                            f"s1_pos={combo['s1_pos_cond']}, "
+                            f"edit_type={effective_edit_type}, "
                             f"cfg={combo['cfg_strength']}")
 
                 slat_new = interweave_Trellis_TI(
@@ -1167,30 +1138,6 @@ class TrellisRefiner:
             if _patched:
                 self.trellis_img.preprocess_image = _orig_preprocess
                 self.trellis_img.get_cond = _orig_get_cond
-
-        # --- Post-process deletion: remove non-contact voxels ---
-        non_contact = getattr(self, '_deletion_non_contact', None)
-        if is_deletion and non_contact is not None:
-            del self._deletion_non_contact
-            for i, slat_new in enumerate(slats_edited):
-                sc = slat_new.coords[:, 1:]  # [N, 3]
-                valid = ((sc >= 0) & (sc < 64)).all(dim=1)
-                in_non_contact = torch.zeros(
-                    sc.shape[0], device=sc.device, dtype=torch.bool)
-                if valid.any():
-                    vc = sc[valid]
-                    in_non_contact[valid] = non_contact[
-                        vc[:, 0], vc[:, 1], vc[:, 2]]
-                n_remove = int(in_non_contact.sum())
-                if n_remove > 0:
-                    keep = ~in_non_contact
-                    slats_edited[i] = sp.SparseTensor(
-                        feats=slat_new.feats[keep],
-                        coords=slat_new.coords[keep],
-                    )
-                    logger.info(
-                        f"Deletion post-process: removed {n_remove} "
-                        f"non-contact voxels, kept {int(keep.sum())}")
 
         return slats_edited
 
@@ -1251,20 +1198,22 @@ class TrellisRefiner:
         # ---- Before: reuse or export ----
         if shared_before_dir and Path(shared_before_dir).exists():
             src = Path(shared_before_dir)
-            # Symlink before.ply
+            # Symlink before.ply (relative path so it works across machines)
             before_ply = output_dir / "before.ply"
             if not before_ply.exists():
                 src_ply = src / "before.ply"
                 if src_ply.exists():
-                    before_ply.symlink_to(src_ply.resolve())
+                    rel = os.path.relpath(src_ply, output_dir)
+                    before_ply.symlink_to(rel)
             paths['before_ply'] = str(before_ply)
 
-            # Symlink before_slat directory
+            # Symlink before_slat directory (relative path)
             before_slat = output_dir / "before_slat"
             if not before_slat.exists():
                 src_slat = src / "before_slat"
                 if src_slat.exists():
-                    before_slat.symlink_to(src_slat.resolve())
+                    rel = os.path.relpath(src_slat, output_dir)
+                    before_slat.symlink_to(rel)
             paths['before_slat'] = str(before_slat)
         else:
             # First edit for this object: export before

@@ -29,7 +29,7 @@ CORE_KEYWORDS = frozenset({
 })
 
 BLENDER_PATH = "/home/artgen/software/blender-3.3.1-linux-x64/blender"
-BLENDER_SCRIPT = str(Path(__file__).resolve().parents[2] / "scripts" / "blender_render.py")
+BLENDER_SCRIPT = str(Path(__file__).parents[2] / "scripts" / "blender_render.py")
 
 
 def _is_core_part(label: str) -> bool:
@@ -127,7 +127,7 @@ Return JSON only, no fences:
     "swaps":[{{"prompt":"Replace the knife with a battle axe","before_desc":"curved knife","after_desc":"heavy battle axe"}}]}},
   {{"group_name":"accessories","part_ids":[1,9,10,11],"is_core":false,"desc":"clothing and straps"}}
 ],
-"global_edits":[{{"prompt":"Make the entire object wooden","after_desc":"wooden carved version"}},{{"prompt":"Transform into sci-fi style","after_desc":"metallic sci-fi version"}}]}}
+"global_edits":[{{"prompt":"Make the entire object wooden","after_desc":"wooden carved version","best_view_idx":0}},{{"prompt":"Transform into sci-fi style","after_desc":"metallic sci-fi version","best_view_idx":1}}]}}
 
 RULES:
 - part_groups: Group parts by semantic relatedness (e.g. monkey_body + monkey_head + monkey_tail → "monkey"). A single part can be its own group.
@@ -145,7 +145,7 @@ RULES:
   before_desc / after_desc: part appearance before/after (under 8 words each).
   BAD: "Make the blade golden"
   GOOD: "Replace the blade with an axe head"
-- global_edits: 2-3 whole-object style/material/theme changes (no add/remove parts).
+- global_edits: 2-3 whole-object style/material/theme changes (no add/remove parts). Include best_view_idx (0-3) for the view that best represents the object for this edit.
 - object_desc: 1 sentence, under 15 words."""
 
 
@@ -172,7 +172,7 @@ def _vlm_call_with_images(client, model: str, prompt: str,
                 model=model,
                 messages=messages,
                 temperature=0.7,
-                max_tokens=4096,
+                max_tokens=8192,
                 timeout=120,
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
@@ -557,54 +557,75 @@ def _fallback_enrichment(category: str, labels: list[str]) -> dict:
 # ---------------------------------------------------------------------------
 
 def _result_groups_to_record(result: dict, uid: str, category: str,
-                              shard: str = "00") -> dict:
+                              shard: str = "00",
+                              actual_part_ids: list[int] | None = None,
+                              ) -> dict:
     """Convert group-based VLM result (from orthogonal enrichment) to record.
 
     Output format has per-part metadata in ``parts`` and editing instructions
     in ``group_edits`` (each group is an edit unit).
+
+    Args:
+        actual_part_ids: Real NPZ part_ids in the same order as the labels
+            list.  VLM ``part_ids`` are label-list indices (0..N-1); this
+            mapping converts them back to NPZ part_ids so downstream mask
+            building uses the correct IDs.
     """
     obj_desc = result.get("object_desc", f"A 3D {category} object")
     labels = result.get("_labels", [])
 
-    # Map part_id → group info
-    part_group_map: dict[int, str] = {}
-    core_pids: set[int] = set()
-    part_descs: dict[int, str] = {}
+    # Build label-index → actual NPZ part_id mapping
+    # If actual_part_ids not provided, assume identity (0, 1, 2, ...)
+    if actual_part_ids is not None and len(actual_part_ids) == len(labels):
+        idx_to_pid = actual_part_ids
+    else:
+        idx_to_pid = list(range(len(labels)))
+
+    def _map_pids(vlm_indices: list[int]) -> list[int]:
+        """Map VLM label indices to actual NPZ part_ids."""
+        return [idx_to_pid[i] for i in vlm_indices if i < len(idx_to_pid)]
+
+    # Map label-index → group info (using label indices for lookup)
+    part_group_map: dict[int, str] = {}   # keyed by actual part_id
+    core_pids: set[int] = set()           # actual part_ids
+    part_descs: dict[int, str] = {}       # keyed by actual part_id
 
     for group in result.get("part_groups", []):
         gname = group.get("group_name", "")
         is_core = group.get("is_core", False)
         gdesc = group.get("desc", "")
-        for pid in group.get("part_ids", []):
-            part_group_map[pid] = gname
-            part_descs[pid] = gdesc
+        for label_idx in group.get("part_ids", []):
+            real_pid = idx_to_pid[label_idx] if label_idx < len(idx_to_pid) else label_idx
+            part_group_map[real_pid] = gname
+            part_descs[real_pid] = gdesc
             if is_core:
-                core_pids.add(pid)
+                core_pids.add(real_pid)
 
-    # Build parts list (metadata only — edits live in group_edits)
+    # Build parts list using actual NPZ part_ids
     phase0_parts = []
-    for pid in range(len(labels)):
-        lbl = labels[pid]
-        is_core = pid in core_pids or _is_core_part(lbl)
+    for label_idx, lbl in enumerate(labels):
+        real_pid = idx_to_pid[label_idx] if label_idx < len(idx_to_pid) else label_idx
+        is_core = real_pid in core_pids or _is_core_part(lbl)
         phase0_parts.append({
-            "part_id": pid,
+            "part_id": real_pid,
             "label": lbl.lower().replace(" ", "_"),
             "core": is_core,
-            "desc": part_descs.get(pid, lbl.replace("_", " ")),
-            "group": part_group_map.get(pid, ""),
+            "desc": part_descs.get(real_pid, lbl.replace("_", " ")),
+            "group": part_group_map.get(real_pid, ""),
         })
 
     # Resolve orthogonal view indices (VLM returns 0-3 → map to NPZ view ids)
     ortho_views = result.get("orthogonal_views", [])
 
-    # Build group edits
+    # Build group edits (map VLM label indices → actual NPZ part_ids)
     group_edits_out: list[dict] = []
     for group in result.get("part_groups", []):
         if group.get("is_core", False):
             continue
 
         gname = group.get("group_name", "")
-        part_ids = group.get("part_ids", [])
+        vlm_part_ids = group.get("part_ids", [])
+        real_part_ids = _map_pids(vlm_part_ids)
         gdesc = group.get("desc", "")
         desc_without = group.get("desc_without", "")
         best_view_idx = group.get("best_view_idx", 0)
@@ -648,7 +669,7 @@ def _result_groups_to_record(result: dict, uid: str, category: str,
 
         group_edits_out.append({
             "group_name": gname,
-            "part_ids": part_ids,
+            "part_ids": real_part_ids,
             "desc": gdesc,
             "desc_without": desc_without,
             "best_view_idx": best_view_idx,
@@ -682,7 +703,9 @@ def _result_groups_to_record(result: dict, uid: str, category: str,
 
 
 def _result_to_phase0_record(result: dict, uid: str, category: str,
-                              shard: str = "00") -> dict:
+                              shard: str = "00",
+                              actual_part_ids: list[int] | None = None,
+                              ) -> dict:
     """Convert VLM result dict to output record.
 
     Dispatches to group-based format if ``part_groups`` present,
@@ -692,7 +715,8 @@ def _result_to_phase0_record(result: dict, uid: str, category: str,
     """
     # --- Dispatch: group-based format (orthogonal enrichment) ---
     if "part_groups" in result:
-        return _result_groups_to_record(result, uid, category, shard)
+        return _result_groups_to_record(result, uid, category, shard,
+                                        actual_part_ids=actual_part_ids)
 
     # --- Legacy per-part format ---
     obj_desc = result.get("object_desc", f"A 3D {category} object")
@@ -823,6 +847,7 @@ def enrich_semantic_labels(
     max_workers: int = 4,
     visual_grounding: bool = True,
     dataset=None,
+    debug: bool = False,
 ) -> Path:
     """Enrich all objects via VLM.
 
@@ -865,7 +890,7 @@ def enrich_semantic_labels(
         # Try loading from default.yaml as fallback
         try:
             import yaml
-            default_cfg_path = Path(__file__).resolve().parents[2] / "configs" / "default.yaml"
+            default_cfg_path = Path(__file__).parents[2] / "configs" / "default.yaml"
             if default_cfg_path.exists():
                 with open(default_cfg_path) as _f:
                     _dcfg = yaml.safe_load(_f)
@@ -878,14 +903,37 @@ def enrich_semantic_labels(
 
     client = OpenAI(base_url=base_url, api_key=api_key)
 
-    # Load semantic annotations
-    with open(semantic_json_path) as f:
-        semantic_json = json.load(f)
-
-    uid_info: dict[str, tuple[str, list[str]]] = {}
-    for category, objects in semantic_json.items():
-        for uid, labels in objects.items():
-            uid_info[uid] = (category, labels)
+    # Load object list: from semantic.json or from dataset
+    # uid_info maps uid → (category, labels, actual_part_ids)
+    # actual_part_ids: real NPZ part_ids in same order as labels
+    uid_info: dict[str, tuple[str, list[str], list[int]]] = {}
+    if semantic_json_path and Path(semantic_json_path).exists():
+        with open(semantic_json_path) as f:
+            semantic_json = json.load(f)
+        for category, objects in semantic_json.items():
+            for uid, labels in objects.items():
+                # Legacy: no actual_part_ids, assume identity
+                uid_info[uid] = (category, labels, list(range(len(labels))))
+    elif dataset is not None:
+        # Derive UIDs and labels from dataset NPZ files
+        if dataset._index is None:
+            dataset._build_index()
+        for shard_id, obj_id in dataset._index:
+            obj_rec = dataset.load_object(shard_id, obj_id)
+            labels = []
+            actual_pids = []
+            for p in obj_rec.parts:
+                if p.mesh_node_names:
+                    raw = p.mesh_node_names[0]
+                    label = raw.rsplit("_", 1)[0] if "_" in raw else raw
+                else:
+                    label = p.cluster_name
+                labels.append(label)
+                actual_pids.append(p.part_id)
+            uid_info[obj_id] = ("object", labels, actual_pids)
+            obj_rec.close()
+    else:
+        raise ValueError("Need either semantic_json_path or dataset")
 
     all_uids = sorted(uid_info.keys())
     if limit > 0:
@@ -894,19 +942,7 @@ def enrich_semantic_labels(
     # Resolve image sources
     npz_dir = Path(image_npz_dir) if image_npz_dir else None
     glb_sources = [Path(glb_dir)] if glb_dir else []
-
-    # Objaverse GLB mapping as fallback
-    mapping_path = Path(semantic_json_path).parent / "objaverse_mapping.json"
     glb_mapping: dict[str, str] = {}
-    if mapping_path.exists():
-        try:
-            mapping_data = json.load(open(mapping_path))
-            for uid, info in mapping_data.get("objects", {}).items():
-                glb = info.get("objaverse_glb")
-                if glb and os.path.exists(glb):
-                    glb_mapping[uid] = glb
-        except Exception:
-            pass
 
     # Resume
     done_ids: set[str] = set()
@@ -946,9 +982,9 @@ def enrich_semantic_labels(
         logger.info("visual_grounding=True but no dataset provided, "
                      "falling back to single-call mode")
 
-    # Debug output directory for visual grounding
+    # Debug output directory for visual grounding (only when --debug)
     cache_dir = output_path.parent
-    debug_base = cache_dir / "debug_enricher" if use_visual else None
+    debug_base = (cache_dir / "debug_enricher") if (debug and use_visual) else None
 
     n_with_npz = sum(1 for uid in pending
                      if npz_dir and (npz_dir / shard / f"{uid}.npz").exists())
@@ -966,7 +1002,7 @@ def enrich_semantic_labels(
         pbar = tqdm(pending, desc="Enriching (visual)", unit="obj")
         with open(output_path, "a") as out_fp:
             for uid in pbar:
-                category, labels = uid_info[uid]
+                category, labels, actual_pids = uid_info[uid]
                 try:
                     obj = dataset.load_object(shard, uid)
                 except Exception as e:
@@ -1001,7 +1037,9 @@ def enrich_semantic_labels(
                 else:
                     success += 1
 
-                record = _result_to_phase0_record(result, uid, category, shard)
+                record = _result_to_phase0_record(
+                    result, uid, category, shard,
+                    actual_part_ids=actual_pids)
                 out_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
                 out_fp.flush()
 
@@ -1026,16 +1064,17 @@ def enrich_semantic_labels(
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = {}
                 for uid in pending:
-                    category, labels = uid_info[uid]
+                    category, labels, actual_pids = uid_info[uid]
                     thumbnail = _get_thumbnail(uid)
                     fut = pool.submit(
                         _call_vlm, client, model, category, labels, thumbnail)
-                    futures[fut] = (uid, category, labels, thumbnail is not None)
+                    futures[fut] = (uid, category, labels, actual_pids,
+                                    thumbnail is not None)
 
                 pbar = tqdm(as_completed(futures), total=len(futures),
                             desc="Enriching", unit="obj")
                 for fut in pbar:
-                    uid, category, labels, had_image = futures[fut]
+                    uid, category, labels, actual_pids, had_image = futures[fut]
                     try:
                         result = fut.result()
                         if result is None:
@@ -1045,7 +1084,8 @@ def enrich_semantic_labels(
                             success += 1
 
                         record = _result_to_phase0_record(
-                            result, uid, category, shard)
+                            result, uid, category, shard,
+                            actual_part_ids=actual_pids)
                         out_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
                         out_fp.flush()
 

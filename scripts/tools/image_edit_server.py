@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""HTTP server for Qwen-Image-Edit-2511 (diffusers pipeline).
+"""HTTP server for image editing (supports multiple backends).
+
+Supported backends:
+  - flux-klein:  FLUX.2-klein-9B (DiffusionPipeline, 4 steps, fast)
+  - qwen:        Qwen-Image-Edit-2511 (QwenImageEditPlusPipeline, 50 steps)
 
 Run in the conda env that has diffusers (e.g. qwen_test).
 Model is loaded once on startup, then serves edit requests over HTTP.
@@ -14,7 +18,12 @@ API:
 
 Usage:
   conda activate qwen_test
-  python scripts/tools/image_edit_server.py --gpu 2
+
+  # FLUX.2-klein (default, fast 4-step editing, use CUDA_VISIBLE_DEVICES for GPU)
+  CUDA_VISIBLE_DEVICES=2 python scripts/tools/image_edit_server.py
+
+  # Qwen (legacy)
+  python scripts/tools/image_edit_server.py --backend qwen --gpu 2
 
   # Then the pipeline connects via:
   #   image_edit_base_url: "http://localhost:8001"
@@ -34,15 +43,16 @@ logger = logging.getLogger("image_edit_server")
 
 # Global pipeline reference (set in main)
 PIPE = None
-STEPS = 40
-CFG_SCALE = 4.0
+BACKEND = "flux-klein"
+STEPS = 4
+CFG_SCALE = 1.0
 
 
 class EditHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._json_response({"status": "ok"})
+            self._json_response({"status": "ok", "backend": BACKEND})
         else:
             self.send_error(404)
 
@@ -65,20 +75,35 @@ class EditHandler(BaseHTTPRequestHandler):
                 {"status": "error", "msg": "image_b64 and prompt required"}, 400)
             return
 
+        # Per-request overrides (optional)
+        steps = body.get("steps", STEPS)
+        cfg = body.get("cfg_scale", CFG_SCALE)
+
         try:
             img_data = base64.b64decode(image_b64)
             img = Image.open(io.BytesIO(img_data)).convert("RGB")
-            logger.info(f"Edit request: image={img.size}, prompt={prompt[:80]!r}")
+            logger.info(f"Edit request: image={img.size}, steps={steps}, "
+                        f"backend={BACKEND}, prompt={prompt!r}")
 
             with torch.inference_mode():
-                output = PIPE(
-                    image=[img],
-                    prompt=prompt,
-                    negative_prompt=" ",
-                    num_inference_steps=STEPS,
-                    true_cfg_scale=CFG_SCALE,
-                    num_images_per_prompt=1,
-                )
+                if BACKEND == "flux-klein":
+                    output = PIPE(
+                        image=img,
+                        prompt=prompt,
+                        num_inference_steps=steps,
+                        num_images_per_prompt=1,
+                    )
+                else:
+                    # Qwen backend
+                    output = PIPE(
+                        image=[img],
+                        prompt=prompt,
+                        negative_prompt="blurry, artifacts, ghost, shadow, "
+                                       "residual, double, transparent",
+                        num_inference_steps=steps,
+                        true_cfg_scale=cfg,
+                        num_images_per_prompt=1,
+                    )
             result_img = output.images[0]
 
             buf = io.BytesIO()
@@ -110,30 +135,64 @@ class EditHandler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="HTTP server for Qwen-Image-Edit-2511")
-    parser.add_argument("--model", default="/Node11_nvme/wjw/checkpoints/Qwen-Image-Edit-2511")
+        description="HTTP server for image editing (FLUX.2-klein / Qwen)")
+    parser.add_argument("--backend", default="flux-klein",
+                        choices=["flux-klein", "qwen"],
+                        help="Model backend (default: flux-klein)")
+    parser.add_argument("--model", default=None,
+                        help="Model path override. Defaults: "
+                             "flux-klein → /Node11_nvme/wjw/checkpoints/FLUX.2-klein-9B, "
+                             "qwen → /Node11_nvme/wjw/checkpoints/Qwen-Image-Edit-2511")
     parser.add_argument("--gpu", type=int, default=None)
     parser.add_argument("--port", type=int, default=8001)
-    parser.add_argument("--steps", type=int, default=40)
-    parser.add_argument("--cfg-scale", type=float, default=4.0)
+    parser.add_argument("--steps", type=int, default=None,
+                        help="Inference steps (default: 4 for flux-klein, 50 for qwen)")
+    parser.add_argument("--cfg-scale", type=float, default=None,
+                        help="CFG scale (default: 1.0 for flux-klein, 5.0 for qwen)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
 
-    global PIPE, STEPS, CFG_SCALE
-    STEPS = args.steps
-    CFG_SCALE = args.cfg_scale
+    global PIPE, BACKEND, STEPS, CFG_SCALE
+    BACKEND = args.backend
 
-    from diffusers import QwenImageEditPlusPipeline
+    # Resolve defaults per backend
+    model_defaults = {
+        "flux-klein": {
+            "model": "/Node11_nvme/wjw/checkpoints/FLUX.2-klein-9B",
+            "steps": 4,
+            "cfg_scale": 1.0,
+        },
+        "qwen": {
+            "model": "/Node11_nvme/wjw/checkpoints/Qwen-Image-Edit-2511",
+            "steps": 50,
+            "cfg_scale": 5.0,
+        },
+    }
+    defaults = model_defaults[BACKEND]
+    model_path = args.model or defaults["model"]
+    STEPS = args.steps if args.steps is not None else defaults["steps"]
+    CFG_SCALE = args.cfg_scale if args.cfg_scale is not None else defaults["cfg_scale"]
 
     device = f"cuda:{args.gpu}" if args.gpu is not None else "cuda"
-    logger.info(f"Loading model from {args.model} ...")
-    PIPE = QwenImageEditPlusPipeline.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16)
-    PIPE.to(device)
+    logger.info(f"Backend: {BACKEND}")
+    logger.info(f"Loading model from {model_path} ...")
+
+    if BACKEND == "flux-klein":
+        # FLUX.2-klein uses DiffusionPipeline with device_map="cuda".
+        # To select a specific GPU, set CUDA_VISIBLE_DEVICES before launch.
+        from diffusers import DiffusionPipeline
+        PIPE = DiffusionPipeline.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16, device_map="cuda")
+    else:
+        from diffusers import QwenImageEditPlusPipeline
+        PIPE = QwenImageEditPlusPipeline.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16)
+        PIPE.to(device)
+
     PIPE.set_progress_bar_config(disable=True)
-    logger.info(f"Model loaded on {device}")
+    logger.info(f"Model loaded on {device}, steps={STEPS}, cfg={CFG_SCALE}")
 
     server = HTTPServer(("0.0.0.0", args.port), EditHandler)
     logger.info(f"Serving on http://0.0.0.0:{args.port}")

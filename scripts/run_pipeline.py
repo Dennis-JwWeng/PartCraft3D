@@ -77,7 +77,17 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from PIL import Image
+
+# Use $PWD to preserve symlinks (os.getcwd() resolves them on Linux)
+def _get_project_root() -> Path:
+    script = Path(__file__)
+    if not script.is_absolute():
+        script = Path(os.environ.get('PWD', os.getcwd())) / script
+    return script.parents[1]
+
+PROJECT_ROOT = _get_project_root()
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from partcraft.utils.config import load_config
 from partcraft.utils.logging import setup_logging
@@ -107,77 +117,19 @@ COST = {
     "image_output_price": 0.02,     # per image generated
 }
 
-
-def estimate_cost(n_objects: int, n_edits: int, steps: set) -> dict:
-    """Estimate API token cost for the pipeline.
-
-    Returns dict with token counts and USD cost breakdown.
-    """
-    c = COST
-    total_input = 0
-    total_output = 0
-    total_images = 0
-    breakdown = {}
-
-    if 1 in steps:
-        inp = n_objects * (c["phase0_input_tokens"] + c["enrich_input_tokens"])
-        out = n_objects * (c["phase0_output_tokens"] + c["enrich_output_tokens"])
-        total_input += inp
-        total_output += out
-        breakdown["step1_semantic"] = {
-            "input_tokens": inp, "output_tokens": out,
-            "usd": inp / 1e6 * c["input_price_per_m"] + out / 1e6 * c["output_price_per_m"],
-        }
-
-    if 3 in steps:
-        inp = n_edits * c["2d_edit_input_tokens"]
-        imgs = n_edits * c["2d_edit_output_images"]
-        total_input += inp
-        total_images += imgs
-        breakdown["step3_2d_edit"] = {
-            "input_tokens": inp, "output_images": imgs,
-            "usd": inp / 1e6 * c["input_price_per_m"] + imgs * c["image_output_price"],
-        }
-
-    if 5 in steps:
-        inp = n_edits * c["quality_input_tokens"]
-        out = n_edits * c["quality_output_tokens"]
-        total_input += inp
-        total_output += out
-        breakdown["step5_quality"] = {
-            "input_tokens": inp, "output_tokens": out,
-            "usd": inp / 1e6 * c["input_price_per_m"] + out / 1e6 * c["output_price_per_m"],
-        }
-
-    total_usd = (total_input / 1e6 * c["input_price_per_m"]
-                 + total_output / 1e6 * c["output_price_per_m"]
-                 + total_images * c["image_output_price"])
-
-    return {
-        "total_input_tokens": total_input,
-        "total_output_tokens": total_output,
-        "total_output_images": total_images,
-        "total_usd": total_usd,
-        "per_object_usd": total_usd / max(n_objects, 1),
-        "per_edit_usd": total_usd / max(n_edits, 1),
-        "breakdown": breakdown,
-    }
-
-
 # =========================================================================
 # Step 1: Semantic Labeling + Enrichment
 # =========================================================================
 
-def run_step_semantic(cfg, dataset, logger, limit=None, force=False, tag=None):
-    """Step 1: VLM semantic labeling via enricher (action style).
+def run_step_semantic(cfg, dataset, logger, limit=None, force=False, tag=None,
+                      debug=False):
+    """Step 1: VLM semantic labeling via enricher.
 
-    Uses enricher as the primary path: 1-view thumbnail + text labels → VLM
-    generates desc, desc_without, deletion/addition prompts, swap mods, global edits.
-
-    Falls back to Phase 0 labeler (42-view / 150-view) if enricher cannot run
-    (e.g., missing semantic.json).
+    Uses dataset NPZ files to discover objects and part labels.
+    No dependency on source/semantic.json.
     """
     from pathlib import Path as _Path
+    from partcraft.phase1_planning.enricher import enrich_semantic_labels
 
     logger.info("=" * 60)
     logger.info("STEP 1: Semantic Labeling + Enrichment")
@@ -188,42 +140,27 @@ def run_step_semantic(cfg, dataset, logger, limit=None, force=False, tag=None):
     tag_suffix = f"_{tag}" if tag else ""
     labels_path = cache_dir / f"semantic_labels{tag_suffix}.jsonl"
 
-    # Resolve semantic.json for enricher
-    data_dir = _Path(cfg["data"].get("data_dir", "data/partobjaverse_tiny"))
-    if not data_dir.exists():
-        data_dir = _Path(cfg["data"]["image_npz_dir"]).parent
-    sem_json = data_dir / "source" / "semantic.json"
+    image_npz_dir = cfg["data"].get("image_npz_dir")
+    shards = cfg["data"].get("shards", ["00"])
+    max_workers = cfg["phase0"].get("max_workers", 4)
 
-    if sem_json.exists():
-        # Primary path: enricher (action style, swap + global)
-        from partcraft.phase1_planning.enricher import enrich_semantic_labels
+    if force and labels_path.exists():
+        backup = labels_path.with_suffix(".jsonl.bak")
+        labels_path.rename(backup)
+        logger.info(f"--force: backed up old labels to {backup}")
 
-        image_npz_dir = cfg["data"].get("image_npz_dir")
-        shards = cfg["data"].get("shards", ["00"])
-        max_workers = cfg["phase0"].get("max_workers", 4)
-
-        if force and labels_path.exists():
-            backup = labels_path.with_suffix(".jsonl.bak")
-            labels_path.rename(backup)
-            logger.info(f"--force: backed up old labels to {backup}")
-
-        enrich_semantic_labels(
-            cfg,
-            semantic_json_path=str(sem_json),
-            output_path=str(labels_path),
-            image_npz_dir=image_npz_dir,
-            shard=shards[0] if shards else "00",
-            limit=limit or 0,
-            max_workers=max_workers,
-            visual_grounding=cfg.get("phase0", {}).get("visual_grounding", True),
-            dataset=dataset,
-        )
-        logger.info(f"Enrichment complete → {labels_path}")
-    else:
-        # Fallback: Phase 0 labeler (42-view / 150-view)
-        logger.info("semantic.json not found, falling back to Phase 0 labeler")
-        from partcraft.phase0_semantic.labeler import run_phase0
-        labels_path = run_phase0(cfg, dataset, limit=limit, force=force)
+    enrich_semantic_labels(
+        cfg,
+        semantic_json_path=None,
+        output_path=str(labels_path),
+        image_npz_dir=image_npz_dir,
+        shard=shards[0] if shards else "00",
+        limit=limit or 0,
+        max_workers=max_workers,
+        visual_grounding=cfg.get("phase0", {}).get("visual_grounding", True),
+        dataset=dataset,
+        debug=debug,
+    )
 
     logger.info(f"Labels: {labels_path}")
     return labels_path
@@ -406,7 +343,7 @@ def run_step_2d_edit(cfg, specs_path, dataset, logger,
 def run_step_3d_edit(cfg, specs_path, dataset, logger,
                      tag=None, seed=1, limit=None, use_2d=True,
                      edit_types=None, edit_ids=None, combinations=None,
-                     edit_dir=None):
+                     edit_dir=None, debug=False):
     """Step 4: TRELLIS 3D editing for all edit types.
 
     This is the primary editing step. Handles:
@@ -428,17 +365,6 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
         TrellisRefiner, build_prompts_from_spec)
 
     # ---- Paths ----
-    data_dir = Path(cfg["data"].get("data_dir", "data/partobjaverse_tiny"))
-    mesh_zip = data_dir / "source" / "mesh.zip"
-    if not mesh_zip.exists():
-        img_dir = Path(cfg["data"]["image_npz_dir"])
-        data_dir = img_dir.parent
-        mesh_zip = data_dir / "source" / "mesh.zip"
-
-    if not mesh_zip.exists():
-        logger.error(f"source/mesh.zip not found at {mesh_zip}")
-        return None
-
     output_dir = Path(cfg["data"]["output_dir"])
     cache_dir = Path(p25_cfg["cache_dir"])
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -507,6 +433,7 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
         image_edit_model=p25_cfg.get("image_edit_model", "gemini-2.5-flash-image"),
         image_edit_backend=image_edit_backend,
         image_edit_base_url=p25_cfg.get("image_edit_base_url", "http://localhost:8001"),
+        debug=debug,
     )
     refiner.load_models()
 
@@ -561,10 +488,9 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
             if not run_specs:
                 continue
 
-            # ---- Prepare object ----
+            # ---- Prepare object (pre-encoded SLAT, no mesh.zip) ----
             try:
-                glb_path = refiner.extract_glb(str(mesh_zip), obj_id, glb_tmp_dir)
-                ori_slat = refiner.encode_object(glb_path, obj_id)
+                ori_slat = refiner.encode_object(None, obj_id)
                 ori_gaussian = refiner.decode_to_gaussian(ori_slat)
                 shard = run_specs[0].shard
                 obj_record = dataset.load_object(shard, obj_id)
@@ -891,8 +817,7 @@ def _resolve_api_key(cfg: dict) -> str:
     api_key = p0.get("vlm_api_key", "")
 
     if not api_key:
-        default_path = (Path(__file__).resolve().parents[1]
-                        / "configs" / "default.yaml")
+        default_path = PROJECT_ROOT / "configs" / "default.yaml"
         if default_path.exists():
             with open(default_path) as f:
                 dcfg = yaml.safe_load(f)
@@ -938,7 +863,7 @@ def run_streaming(cfg, dataset, logger, args):
     p25 = cfg.get("phase2_5", {})
 
     # ---- Paths (resolve relative paths against project root) ----
-    project_root = Path(__file__).resolve().parents[1]
+    project_root = PROJECT_ROOT
 
     def _resolve(p: str | Path) -> Path:
         pp = Path(p)
@@ -955,30 +880,35 @@ def run_streaming(cfg, dataset, logger, args):
     specs_path.parent.mkdir(parents=True, exist_ok=True)
     results_path = _resolve(p25["cache_dir"]) / f"edit_results{tag_suffix}{worker_suffix}.jsonl"
     results_path.parent.mkdir(parents=True, exist_ok=True)
+    # 2D edit cache directory (shared across workers for same tag)
+    edit_2d_subdir = f"2d_edits{tag_suffix}"
+    edit_2d_dir = _resolve(p25["cache_dir"]) / edit_2d_subdir
+    edit_2d_dir.mkdir(parents=True, exist_ok=True)
     output_dir = _resolve(cfg["data"]["output_dir"])
     mesh_pairs_dir = output_dir / f"mesh_pairs{tag_suffix}"
 
-    # ---- Resolve semantic.json ----
-    data_dir = Path(cfg["data"].get("data_dir", "data/partobjaverse_tiny"))
-    if not data_dir.is_absolute():
-        data_dir = project_root / data_dir
-    if not data_dir.exists():
-        data_dir = Path(cfg["data"]["image_npz_dir"])
-        if not data_dir.is_absolute():
-            data_dir = project_root / data_dir
-        data_dir = data_dir.parent
-    sem_json_path = data_dir / "source" / "semantic.json"
-    if not sem_json_path.exists():
-        logger.error(f"semantic.json not found at {sem_json_path}")
-        return
-
-    with open(sem_json_path) as f:
-        semantic_json = json.load(f)
-
-    uid_info: dict[str, tuple[str, list[str]]] = {}
-    for category, objects in semantic_json.items():
-        for uid, labels in objects.items():
-            uid_info[uid] = (category, labels)
+    # ---- Resolve object list from dataset (NPZ files) ----
+    # No dependency on source/semantic.json — labels come from NPZ split_mesh.
+    uid_info: dict[str, tuple[str, list[str], list[int]]] = {}
+    if dataset._index is None:
+        dataset._build_index()
+    for shard_id, obj_id in dataset._index:
+        obj_rec = dataset.load_object(shard_id, obj_id)
+        # Extract part labels from mesh_node_names (e.g. "Body_0" → "Body")
+        labels = []
+        actual_pids = []
+        for p in obj_rec.parts:
+            if p.mesh_node_names:
+                raw = p.mesh_node_names[0]  # e.g. "Monkey Body_6"
+                # Strip trailing "_N" suffix
+                label = raw.rsplit("_", 1)[0] if "_" in raw else raw
+            else:
+                label = p.cluster_name
+            labels.append(label)
+            actual_pids.append(p.part_id)
+        uid_info[obj_id] = ("object", labels, actual_pids)
+        obj_rec.close()
+    logger.info(f"Discovered {len(uid_info)} objects from dataset")
 
     all_uids = sorted(uid_info.keys())
     if args.limit:
@@ -1016,12 +946,6 @@ def run_streaming(cfg, dataset, logger, args):
     from partcraft.phase2_assembly.trellis_refine import (
         TrellisRefiner, build_prompts_from_spec)
 
-    data_dir_mesh = _resolve(cfg["data"].get("data_dir", "data/partobjaverse_tiny"))
-    mesh_zip = data_dir_mesh / "source" / "mesh.zip"
-    if not mesh_zip.exists():
-        data_dir_mesh = _resolve(cfg["data"]["image_npz_dir"]).parent
-        mesh_zip = data_dir_mesh / "source" / "mesh.zip"
-
     refiner = TrellisRefiner(
         vinedresser_path=vinedresser_path,
         cache_dir=str(_resolve(p25["cache_dir"])),
@@ -1029,6 +953,7 @@ def run_streaming(cfg, dataset, logger, args):
         image_edit_model=p25.get("image_edit_model", "gemini-2.5-flash-image"),
         image_edit_backend=image_edit_backend,
         image_edit_base_url=p25.get("image_edit_base_url", "http://localhost:8001"),
+        debug=args.debug,
     )
     refiner.load_models()
 
@@ -1053,13 +978,8 @@ def run_streaming(cfg, dataset, logger, args):
                 except (json.JSONDecodeError, KeyError):
                     pass
 
-    pending = [uid for uid in all_uids if uid not in done_labels]
-    if not pending:
-        logger.info(f"All {len(all_uids)} objects already enriched")
-        pending = []  # still process edits for already-enriched objects
-
-    logger.info(f"Streaming: {len(pending)} objects to enrich, "
-                f"{len(done_labels)} already done")
+    logger.info(f"Streaming: {len(all_uids)} total objects, "
+                f"{len(done_labels)} already enriched (resume)")
 
     # ---- Image source ----
     npz_dir = _resolve(cfg["data"]["image_npz_dir"])
@@ -1076,79 +996,103 @@ def run_streaming(cfg, dataset, logger, args):
     total_success = 0
     total_fail = 0
 
-    # If some objects are already enriched, count their spec IDs to avoid
-    # counter collisions
-    if done_labels:
-        existing_specs = []
-        if specs_path.exists():
-            with open(specs_path) as f:
-                for line in f:
-                    if line.strip():
-                        d = json.loads(line)
-                        existing_specs.append(d)
-        # Update counters to continue from existing
-        for s in existing_specs:
-            eid = s["edit_id"]
-            if eid.startswith("del_") or eid.startswith("gdel_"):
-                counters["del"] = max(counters["del"],
-                                      int(eid.split("_")[-1]) + 1)
-            elif eid.startswith("add_") or eid.startswith("gadd_"):
-                counters["add"] = max(counters["add"],
-                                      int(eid.split("_")[-1]) + 1)
-            elif eid.startswith("mod_"):
-                counters["mod"] = max(counters["mod"],
-                                      int(eid.split("_")[-1]) + 1)
-            elif eid.startswith("glb_"):
-                counters["glb"] = max(counters["glb"],
-                                      int(eid.split("_")[-1]) + 1)
+    # Load existing specs for resume: reuse them instead of re-planning
+    existing_specs_by_obj: dict[str, list] = {}
+    if specs_path.exists():
+        with open(specs_path) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                d = json.loads(line)
+                existing_specs_by_obj.setdefault(d["obj_id"], []).append(d)
+                # Update counters to continue from existing
+                eid = d["edit_id"]
+                if eid.startswith("del_") or eid.startswith("gdel_"):
+                    counters["del"] = max(counters["del"],
+                                          int(eid.split("_")[-1]) + 1)
+                elif eid.startswith("add_") or eid.startswith("gadd_"):
+                    counters["add"] = max(counters["add"],
+                                          int(eid.split("_")[-1]) + 1)
+                elif eid.startswith("mod_"):
+                    counters["mod"] = max(counters["mod"],
+                                          int(eid.split("_")[-1]) + 1)
+                elif eid.startswith("glb_"):
+                    counters["glb"] = max(counters["glb"],
+                                          int(eid.split("_")[-1]) + 1)
 
     with open(labels_path, "a") as lbl_fp, \
          open(specs_path, "a") as spec_fp, \
          open(results_path, "a") as res_fp:
 
-        for obj_idx, uid in enumerate(pending):
-            category, labels = uid_info[uid]
+        for obj_idx, uid in enumerate(all_uids):
+            category, labels, actual_pids = uid_info[uid]
             logger.info(f"\n{'='*60}")
-            logger.info(f"[{obj_idx+1}/{len(pending)}] Object: {uid}")
+            logger.info(f"[{obj_idx+1}/{len(all_uids)}] Object: {uid}")
             logger.info(f"  Category: {category}, Parts: {len(labels)}")
 
             # ---- Step 1: Enrich ----
             record = None
-            try:
-                obj = dataset.load_object(shard, uid)
-                result = _enrich_one_object_visual(
-                    vlm_client, vlm_model, obj, category, labels)
-                obj.close()
-            except Exception as e:
-                logger.warning(f"  Visual enrichment failed: {e}")
-                result = None
+            if uid in done_labels:
+                # Resume: already enriched in this tag's run, load record
+                logger.info("  Resuming (already enriched), loading...")
+                with open(labels_path) as _lf:
+                    for _line in _lf:
+                        if not _line.strip():
+                            continue
+                        try:
+                            _rec = json.loads(_line)
+                            if _rec["obj_id"] == uid:
+                                record = _rec
+                                break
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+            else:
+                # Fresh VLM enrichment
+                try:
+                    obj = dataset.load_object(shard, uid)
+                    result = _enrich_one_object_visual(
+                        vlm_client, vlm_model, obj, category, labels)
+                    obj.close()
+                except Exception as e:
+                    logger.warning(f"  Visual enrichment failed: {e}")
+                    result = None
 
-            if result is None:
-                # Fallback to thumbnail-based single call
-                npz_path = npz_dir / shard / f"{uid}.npz"
-                thumb = None
-                if npz_path.exists():
-                    thumb = load_thumbnail_from_npz(str(npz_path), view_id=0)
-                result = _call_vlm(vlm_client, vlm_model, category, labels, thumb)
+                if result is None:
+                    npz_path = npz_dir / shard / f"{uid}.npz"
+                    thumb = None
+                    if npz_path.exists():
+                        thumb = load_thumbnail_from_npz(str(npz_path), view_id=0)
+                    result = _call_vlm(vlm_client, vlm_model, category, labels, thumb)
 
-            if result is None:
-                result = _fallback_enrichment(category, labels)
-                logger.warning(f"  Using fallback enrichment for {uid}")
+                if result is None:
+                    result = _fallback_enrichment(category, labels)
+                    logger.warning(f"  Using fallback enrichment for {uid}")
 
-            record = _result_to_phase0_record(result, uid, category, shard)
-            lbl_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
-            lbl_fp.flush()
+                record = _result_to_phase0_record(
+                    result, uid, category, shard,
+                    actual_part_ids=actual_pids)
+                lbl_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+                lbl_fp.flush()
+
+            if record is None:
+                logger.warning(f"  No record for {uid}, skipping")
+                continue
 
             n_grp = len(record.get("group_edits", []))
             n_glb = len(record.get("global_edits", []))
             logger.info(f"  Enriched: {n_grp} groups, {n_glb} global edits")
 
             # ---- Step 2: Plan edits for this object ----
-            obj_specs = plan_edits_for_record(record, cfg, counters)
-            for spec in obj_specs:
-                spec_fp.write(json.dumps(spec.to_dict(), ensure_ascii=False)
-                              + "\n")
-            spec_fp.flush()
+            # Reuse existing specs on resume (same IDs → correct done_edits match)
+            if uid in existing_specs_by_obj:
+                obj_specs = [EditSpec(**d) for d in existing_specs_by_obj[uid]]
+                logger.info(f"  Reusing {len(obj_specs)} existing specs (resume)")
+            else:
+                obj_specs = plan_edits_for_record(record, cfg, counters)
+                for spec in obj_specs:
+                    spec_fp.write(json.dumps(spec.to_dict(), ensure_ascii=False)
+                                  + "\n")
+                spec_fp.flush()
 
             n_del = sum(1 for s in obj_specs if s.edit_type == "deletion")
             n_add = sum(1 for s in obj_specs if s.edit_type == "addition")
@@ -1172,10 +1116,9 @@ def run_streaming(cfg, dataset, logger, args):
                 logger.info("  All edits already done, skipping")
                 continue
 
-            # Prepare object for TRELLIS
+            # Prepare object for TRELLIS (pre-encoded SLAT, no mesh.zip)
             try:
-                glb_path = refiner.extract_glb(str(mesh_zip), uid, glb_tmp_dir)
-                ori_slat = refiner.encode_object(glb_path, uid)
+                ori_slat = refiner.encode_object(None, uid)
                 ori_gaussian = refiner.decode_to_gaussian(ori_slat)
                 obj_record = dataset.load_object(shard, uid)
             except Exception as e:
@@ -1232,14 +1175,40 @@ def run_streaming(cfg, dataset, logger, args):
                     if prompts["edit_type"] != edit_type:
                         prompts["edit_type"] = edit_type
 
-                    # Inline 2D edit
+                    # Inline 2D edit (with cache read/write)
                     img_cond = None
                     if args.use_2d:
                         num_edit_views = p25.get("num_edit_views", 4)
                         edit_strength = p25.get("edit_strength", 1.0)
                         prerender_img = None
 
-                        if hasattr(spec, 'best_view') and spec.best_view >= 0:
+                        # Check 2D edit cache first
+                        cached_2d_path = edit_2d_dir / f"{spec.edit_id}_edited.png"
+                        if cached_2d_path.exists():
+                            try:
+                                cached_edited = Image.open(
+                                    str(cached_2d_path)).convert("RGB")
+                                cached_edited = cached_edited.resize(
+                                    (518, 518))
+                                img_bytes, pil_img = prepare_input_image(
+                                    obj_record, spec.best_view
+                                    if hasattr(spec, 'best_view')
+                                    and spec.best_view >= 0 else 0)
+                                prerender_img = (
+                                    pil_img.resize((518, 518)),
+                                    cached_edited)
+                                logger.info(
+                                    f"    2D edit loaded from cache: "
+                                    f"{cached_2d_path.name}")
+                            except Exception as e:
+                                logger.warning(
+                                    f"    Failed to load cached 2D "
+                                    f"edit: {e}")
+                                prerender_img = None
+
+                        if (prerender_img is None
+                                and hasattr(spec, 'best_view')
+                                and spec.best_view >= 0):
                             try:
                                 img_bytes, pil_img = prepare_input_image(
                                     obj_record, spec.best_view)
@@ -1281,12 +1250,15 @@ def run_streaming(cfg, dataset, logger, args):
                                     edited = None
                                 if edited is not None:
                                     edited = edited.resize((518, 518))
+                                    # Save to cache
+                                    edited.save(str(cached_2d_path))
                                     prerender_img = (
                                         pil_img.resize((518, 518)),
                                         edited)
                                     logger.info(
                                         f"    2D edit from view "
-                                        f"{spec.best_view}")
+                                        f"{spec.best_view} "
+                                        f"(saved to cache)")
                             except Exception as e:
                                 logger.warning(
                                     f"    Prerender 2D edit failed: {e}")
@@ -1440,6 +1412,9 @@ Examples:
                         help="Cost estimation only, no actual processing")
     parser.add_argument("--suffix", type=str, default="",
                         help="Suffix for spec files (e.g. '_action')")
+    parser.add_argument("--debug", action="store_true",
+                        help="Save debug output files (masks, views, enricher "
+                             "ortho images). Off by default.")
     parser.add_argument("--force", action="store_true",
                         help="Force re-run (delete and regenerate cached results)")
     parser.add_argument("--streaming", action="store_true",
@@ -1458,6 +1433,20 @@ Examples:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+
+    # ---- Normalize cache_dir paths ----
+    # Ensure all cache_dir values resolve under output_dir so that
+    # streaming, step-by-step, and multi-worker modes share the same
+    # cache location.  Relative paths like "cache/phase0" are rewritten
+    # to "{output_dir}/cache/phase0".  Absolute paths are kept as-is.
+    _out = cfg["data"].get("output_dir", "outputs")
+    for _phase_key in ("phase0", "phase1", "phase2", "phase2_5", "phase3", "phase4"):
+        _pcfg = cfg.get(_phase_key, {})
+        _cd = _pcfg.get("cache_dir", "")
+        if _cd and not os.path.isabs(_cd) and not _cd.startswith(_out):
+            # Relative cache_dir not under output_dir — rewrite it
+            # "cache/phase0" → "outputs/partobjaverse_tiny/cache/phase0"
+            _pcfg["cache_dir"] = os.path.join(_out, _cd)
 
     # Set ATTN_BACKEND from config (unless already set via env)
     attn_backend = cfg.get("pipeline", {}).get("attn_backend", "")
@@ -1487,26 +1476,11 @@ Examples:
     labels_path = Path(cfg["phase0"]["cache_dir"]) / f"semantic_labels{tag_suffix}.jsonl"
     specs_path = Path(cfg["phase1"]["cache_dir"]) / f"edit_specs{suffix}{tag_suffix}.jsonl"
 
-    # ---- Dry run: cost estimation ----
-    if args.dry_run:
-        n_objects = len(dataset)
-        n_edits = 0
-        if specs_path.exists():
-            with open(specs_path) as f:
-                n_edits = sum(1 for line in f if line.strip())
-        else:
-            # Estimate: ~27 edits per object (from PartObjaverse-Tiny stats)
-            n_edits = n_objects * 27
-
-        cost = estimate_cost(n_objects, n_edits, steps)
-        print_cost_report(cost, n_objects, n_edits)
-        return
-
     # ---- Step 1: Semantic ----
     if 1 in steps:
         labels_path = run_step_semantic(
             cfg, dataset, logger, limit=args.limit,
-            force=args.force, tag=args.tag)
+            force=args.force, tag=args.tag, debug=args.debug)
 
     if not labels_path.exists():
         logger.error(f"Labels not found: {labels_path}")
@@ -1545,7 +1519,7 @@ Examples:
             cfg, specs_path, dataset, logger,
             tag=args.tag, seed=args.seed, limit=args.limit,
             use_2d=args.use_2d, edit_ids=args.edit_ids,
-            edit_dir=edit_subdir)
+            edit_dir=edit_subdir, debug=args.debug)
 
     if results_path is None:
         p25_cfg = cfg.get("phase2_5", {})

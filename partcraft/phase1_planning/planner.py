@@ -90,21 +90,32 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
     glb_specs = []
     del_counter = add_counter = mod_counter = glb_counter = 0
 
-    # Objects with group_edits are handled separately below — skip per-part generation
-    group_edit_obj_ids = set(catalog.object_group_edits.keys())
+    # Build set of part IDs covered by group_edits (per object),
+    # so per-part generation skips only those parts — not the whole object.
+    group_edit_part_ids: dict[str, set[int]] = {}
+    for obj_id, group_edits in catalog.object_group_edits.items():
+        pids = set()
+        for grp in group_edits:
+            pids.update(grp.get("part_ids", []))
+        group_edit_part_ids[obj_id] = pids
 
     for obj_id, indices in catalog.by_object.items():
-        if obj_id in group_edit_obj_ids:
-            continue  # will be handled by group edits section
-
         entries = [catalog.entries[i] for i in indices]
         all_pids = [e.part_id for e in entries]
         obj_desc = catalog.object_descs.get(obj_id, "")
+        skip_pids = group_edit_part_ids.get(obj_id, set())
+        # Default best_view for per-part edits: front orthogonal view
+        _ortho = catalog.object_ortho_views.get(obj_id, [])
+        obj_best_view = _ortho[0] if _ortho else 0
 
         if len(entries) < min_parts:
             continue
 
         for entry in entries:
+            # Skip parts already covered by group edits
+            if entry.part_id in skip_pids:
+                continue
+
             # Skip core parts and tiny parts
             if entry.core or entry.category in core_cats:
                 pass  # core parts can still have modifications
@@ -133,6 +144,7 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                     keep_part_ids=keep_pids,
                     edit_prompt=del_edit.get("prompt", "") if del_edit else "",
                     after_desc=del_edit.get("after_desc", "") if del_edit else "",
+                    best_view=obj_best_view,
                 ))
                 del_counter += 1
 
@@ -152,6 +164,7 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                     source_del_id=del_id,
                     edit_prompt=add_edit.get("prompt", "") if add_edit else "",
                     after_desc=obj_desc,  # after adding back = original
+                    best_view=obj_best_view,
                 ))
                 add_counter += 1
 
@@ -184,10 +197,15 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                     before_part_desc=mod_edit.get("before_part_desc", entry.desc),
                     after_part_desc=mod_edit.get("after_part_desc", ""),
                     mod_type=mod_edit.get("mod_type", "style"),
+                    best_view=obj_best_view,
                 ))
                 mod_counter += 1
 
         # --- Group deletion/addition: same-category parts ---
+        # Skip auto-grouping for objects that already have enriched group_edits
+        # (those groups are handled in the dedicated section below).
+        if obj_id in group_edit_part_ids:
+            continue
         by_cat: dict[str, list[CatalogEntry]] = {}
         for e in entries:
             if (not e.core and e.category not in core_cats
@@ -245,22 +263,24 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
         all_pids = [e.part_id for e in entries]
         shard = entries[0].shard if entries else "00"
 
+        pid_to_entry = {e.part_id: e for e in entries}
         for grp in group_edits:
             grp_pids = grp.get("part_ids", [])
             grp_best_view = grp.get("best_view", -1)
             grp_desc = grp.get("desc", "")
-            grp_labels = [entries[p].label if p < len(entries) else f"part_{p}"
-                          for p in grp_pids]
+            grp_labels = [pid_to_entry[p].label if p in pid_to_entry
+                          else f"part_{p}" for p in grp_pids]
             keep_pids = [p for p in all_pids if p not in grp_pids]
             if not keep_pids:
                 continue
 
+            grp_del_id = None  # Track this group's deletion ID
             for edit in grp.get("edits", []):
                 etype = edit.get("type")
                 if etype == "deletion":
-                    del_id = f"del_{del_counter:06d}"
+                    grp_del_id = f"del_{del_counter:06d}"
                     del_specs.append(EditSpec(
-                        edit_id=del_id,
+                        edit_id=grp_del_id,
                         edit_type="deletion",
                         obj_id=obj_id,
                         shard=shard,
@@ -274,7 +294,7 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                         best_view=grp_best_view,
                     ))
                     del_counter += 1
-                elif etype == "addition":
+                elif etype == "addition" and grp_del_id is not None:
                     add_specs.append(EditSpec(
                         edit_id=f"add_{add_counter:06d}",
                         edit_type="addition",
@@ -285,7 +305,7 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                         add_part_ids=grp_pids,
                         add_labels=grp_labels,
                         base_part_ids=keep_pids,
-                        source_del_id=f"del_{del_counter - 1:06d}",
+                        source_del_id=grp_del_id,
                         edit_prompt=edit.get("prompt", ""),
                         after_desc=obj_desc,
                         best_view=grp_best_view,
@@ -321,6 +341,10 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
         obj_desc = catalog.object_descs.get(obj_id, "")
         shard = entries[0].shard
 
+        # Use front orthogonal view as best_view for global edits
+        ortho_views = catalog.object_ortho_views.get(obj_id, [])
+        global_best_view = ortho_views[0] if ortho_views else 0
+
         for ge in catalog.object_global_edits.get(obj_id, [])[:max_global]:
             prompt = ge.get("prompt", "")
             if not prompt:
@@ -334,6 +358,7 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                 before_desc=obj_desc,
                 edit_prompt=prompt,
                 after_desc=ge.get("after_desc", ""),
+                best_view=global_best_view,
             ))
             glb_counter += 1
 
@@ -373,12 +398,22 @@ def plan_edits_for_record(record: dict, cfg: dict,
     if len(parts) < min_parts:
         return []
 
+    core_cats = set(cfg["phase1"].get("core_categories", []))
+
+    # Default best_view for per-part edits: front orthogonal view
+    ortho_views = record.get("orthogonal_views", [])
+    obj_best_view = ortho_views[0] if ortho_views else 0
+
     all_pids = [p["part_id"] for p in parts]
     specs: list[EditSpec] = []
 
-    # --- Group edits ---
+    has_group_edits = bool(record.get("group_edits"))
+
+    # --- Group edits (if present, skip per-part for those parts) ---
+    group_part_ids: set[int] = set()
     for grp in record.get("group_edits", []):
         grp_pids = grp.get("part_ids", [])
+        group_part_ids.update(grp_pids)
         grp_best_view = grp.get("best_view", -1)
         grp_desc = grp.get("desc", "")
         grp_labels = []
@@ -396,12 +431,13 @@ def plan_edits_for_record(record: dict, cfg: dict,
         if not keep_pids:
             continue
 
+        grp_del_id = None  # Track this group's deletion ID
         for edit in grp.get("edits", []):
             etype = edit.get("type")
             if etype == "deletion":
-                del_id = f"del_{counters['del']:06d}"
+                grp_del_id = f"del_{counters['del']:06d}"
                 specs.append(EditSpec(
-                    edit_id=del_id,
+                    edit_id=grp_del_id,
                     edit_type="deletion",
                     obj_id=obj_id, shard=shard,
                     object_desc=obj_desc, before_desc=obj_desc,
@@ -412,7 +448,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
                     best_view=grp_best_view,
                 ))
                 counters["del"] += 1
-            elif etype == "addition":
+            elif etype == "addition" and grp_del_id is not None:
                 specs.append(EditSpec(
                     edit_id=f"add_{counters['add']:06d}",
                     edit_type="addition",
@@ -421,8 +457,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
                     before_desc=edit.get("after_desc", obj_desc),
                     add_part_ids=grp_pids, add_labels=grp_labels,
                     base_part_ids=keep_pids,
-                    source_del_id=del_id if counters["del"] > 0
-                        else f"del_{counters['del']:06d}",
+                    source_del_id=grp_del_id,
                     edit_prompt=edit.get("prompt", ""),
                     after_desc=obj_desc,
                     best_view=grp_best_view,
@@ -446,6 +481,79 @@ def plan_edits_for_record(record: dict, cfg: dict,
                 ))
                 counters["mod"] += 1
 
+    # --- Per-part edits (deletion / addition / modification) ---
+    for part in parts:
+        pid = part["part_id"]
+        label = part.get("label", f"part_{pid}")
+        is_core = part.get("core", False) or label in core_cats
+        desc = part.get("desc", "")
+        desc_without = part.get("desc_without", "")
+        part_edits = part.get("edits", [])
+
+        # Skip parts already handled by group edits
+        if pid in group_part_ids:
+            continue
+
+        keep_pids = [p for p in all_pids if p != pid]
+        if not keep_pids:
+            continue
+
+        # Non-core parts: deletion + addition
+        if not is_core:
+            del_edit = _find_edit_by_type(part_edits, "deletion")
+            add_edit = _find_edit_by_type(part_edits, "addition")
+
+            del_id = f"del_{counters['del']:06d}"
+            specs.append(EditSpec(
+                edit_id=del_id,
+                edit_type="deletion",
+                obj_id=obj_id, shard=shard,
+                object_desc=obj_desc, before_desc=obj_desc,
+                remove_part_ids=[pid], remove_labels=[label],
+                keep_part_ids=keep_pids,
+                edit_prompt=del_edit.get("prompt", "") if del_edit else "",
+                after_desc=del_edit.get("after_desc", "") if del_edit else "",
+                best_view=obj_best_view,
+            ))
+            counters["del"] += 1
+
+            specs.append(EditSpec(
+                edit_id=f"add_{counters['add']:06d}",
+                edit_type="addition",
+                obj_id=obj_id, shard=shard,
+                object_desc=obj_desc,
+                before_desc=desc_without or obj_desc,
+                add_part_ids=[pid], add_labels=[label],
+                base_part_ids=keep_pids,
+                source_del_id=del_id,
+                edit_prompt=add_edit.get("prompt", "") if add_edit else "",
+                after_desc=obj_desc,
+                best_view=obj_best_view,
+            ))
+            counters["add"] += 1
+
+        # All parts (including core): swap modifications
+        mod_edits = [e for e in part_edits
+                     if e.get("type") == "modification"
+                     and e.get("mod_type") == "swap"
+                     and e.get("prompt")]
+        for mod_edit in mod_edits:
+            specs.append(EditSpec(
+                edit_id=f"mod_{counters['mod']:06d}",
+                edit_type="modification",
+                obj_id=obj_id, shard=shard,
+                object_desc=obj_desc, before_desc=obj_desc,
+                old_part_id=pid, old_label=label,
+                keep_part_ids=keep_pids,
+                edit_prompt=mod_edit.get("prompt", ""),
+                after_desc=mod_edit.get("after_desc", ""),
+                before_part_desc=mod_edit.get("before_part_desc", desc),
+                after_part_desc=mod_edit.get("after_part_desc", ""),
+                mod_type=mod_edit.get("mod_type", "swap"),
+                best_view=obj_best_view,
+            ))
+            counters["mod"] += 1
+
     # --- Global edits ---
     for ge in record.get("global_edits", [])[:max_global]:
         prompt = ge.get("prompt", "")
@@ -458,6 +566,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
             object_desc=obj_desc, before_desc=obj_desc,
             edit_prompt=prompt,
             after_desc=ge.get("after_desc", ""),
+            best_view=obj_best_view,
         ))
         counters["glb"] += 1
 

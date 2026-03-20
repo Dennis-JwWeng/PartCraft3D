@@ -30,7 +30,14 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import os as _os
+def _get_project_root() -> Path:
+    script = Path(__file__)
+    if not script.is_absolute():
+        script = Path(_os.environ.get('PWD', _os.getcwd())) / script
+    return script.parents[1]
+_PROJECT_ROOT = _get_project_root()
+sys.path.insert(0, str(_PROJECT_ROOT))
 
 from partcraft.utils.config import load_config
 from partcraft.utils.logging import setup_logging
@@ -402,7 +409,7 @@ def main():
         api_key = p0.get("vlm_api_key", "")
         if not api_key:
             import yaml
-            default_cfg_path = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
+            default_cfg_path = _PROJECT_ROOT / "configs" / "default.yaml"
             if default_cfg_path.exists():
                 with open(default_cfg_path) as f:
                     default_cfg = yaml.safe_load(f)

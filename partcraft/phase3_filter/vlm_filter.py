@@ -401,7 +401,7 @@ def run_vlm_filter(
     api_key = p0.get("vlm_api_key", "")
     if not api_key:
         import yaml
-        default_cfg = Path(__file__).resolve().parents[2] / "configs" / "default.yaml"
+        default_cfg = Path(__file__).parents[2] / "configs" / "default.yaml"
         if default_cfg.exists():
             with open(default_cfg) as f:
                 dcfg = yaml.safe_load(f)
@@ -428,7 +428,7 @@ def run_vlm_filter(
 
     # Resolve checkpoint path: try project-local first, then vinedresser
     ckpt_rel = p25.get("trellis_image_ckpt", "checkpoints/TRELLIS-image-large")
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = Path(__file__).parents[2]
     candidates = [
         project_root / ckpt_rel,
         Path(vinedresser_path) / ckpt_rel,
