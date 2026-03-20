@@ -41,6 +41,11 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
+# Ensure project root is on sys.path before any project imports
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _SCRIPT_DIR.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
+
 from PIL import Image
 
 from scripts.pipeline_common import (

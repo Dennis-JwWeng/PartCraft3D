@@ -414,7 +414,7 @@ def run_vlm_filter(
         base_url=p0.get("vlm_base_url", ""),
         api_key=api_key,
     )
-    vlm_model = p0.get("vlm_model", "gemini-2.5-flash")
+    vlm_model = p0.get("vlm_model", "gemini-3.1-flash-lite-preview")
 
     # Load TRELLIS decoder
     logger.info("Loading TRELLIS decoder for rendering...")

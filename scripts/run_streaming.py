@@ -38,6 +38,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Ensure project root is on sys.path before any project imports
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _SCRIPT_DIR.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
+
 from PIL import Image
 
 from scripts.pipeline_common import (
@@ -128,7 +133,7 @@ def run_streaming(cfg, dataset, logger, args):
     if not api_key:
         logger.error("No API key for VLM enrichment")
         return
-    vlm_model = p0.get("vlm_model", "gemini-2.5-flash")
+    vlm_model = p0.get("vlm_model", "gemini-3.1-flash-lite-preview")
     vlm_base_url = p0.get("vlm_base_url", "")
     vlm_client = OpenAI(base_url=vlm_base_url, api_key=api_key)
 
@@ -190,13 +195,15 @@ def run_streaming(cfg, dataset, logger, args):
         prepare_input_image, call_local_edit, call_vlm_edit)
 
     # ---- Main loop ----
-    counters = {"del": 0, "add": 0, "mod": 0, "glb": 0}
+    # Edit IDs are now per-object unique (obj_id hash embedded), no global
+    # counters needed. Same object always produces identical edit IDs, making
+    # resume deterministic and multi-worker safe.
     glb_tmp_dir = tempfile.mkdtemp(prefix="partcraft_stream_")
     total_specs = 0
     total_success = 0
     total_fail = 0
 
-    # Load existing specs for resume
+    # Load existing specs for resume (reuse instead of re-planning)
     existing_specs_by_obj: dict[str, list] = {}
     if specs_path.exists():
         with open(specs_path) as f:
@@ -205,20 +212,6 @@ def run_streaming(cfg, dataset, logger, args):
                     continue
                 d = json.loads(line)
                 existing_specs_by_obj.setdefault(d["obj_id"], []).append(d)
-                # Update counters to continue from existing
-                eid = d["edit_id"]
-                if eid.startswith("del_") or eid.startswith("gdel_"):
-                    counters["del"] = max(counters["del"],
-                                          int(eid.split("_")[-1]) + 1)
-                elif eid.startswith("add_") or eid.startswith("gadd_"):
-                    counters["add"] = max(counters["add"],
-                                          int(eid.split("_")[-1]) + 1)
-                elif eid.startswith("mod_"):
-                    counters["mod"] = max(counters["mod"],
-                                          int(eid.split("_")[-1]) + 1)
-                elif eid.startswith("glb_"):
-                    counters["glb"] = max(counters["glb"],
-                                          int(eid.split("_")[-1]) + 1)
 
     with open(labels_path, "a") as lbl_fp, \
          open(specs_path, "a") as spec_fp, \
@@ -290,7 +283,7 @@ def run_streaming(cfg, dataset, logger, args):
                 logger.info(f"  Reusing {len(obj_specs)} existing specs "
                             f"(resume)")
             else:
-                obj_specs = plan_edits_for_record(record, cfg, counters)
+                obj_specs = plan_edits_for_record(record, cfg)
                 for spec in obj_specs:
                     spec_fp.write(json.dumps(spec.to_dict(),
                                              ensure_ascii=False) + "\n")
@@ -388,9 +381,10 @@ def run_streaming(cfg, dataset, logger, args):
                         if cached_2d_path.exists():
                             try:
                                 cached_edited = Image.open(
-                                    str(cached_2d_path)).convert("RGB")
-                                cached_edited = cached_edited.resize(
-                                    (518, 518))
+                                    str(cached_2d_path))
+                                cached_edited.load()  # force full decode
+                                cached_edited = cached_edited.convert(
+                                    "RGB").resize((518, 518))
                                 img_bytes, pil_img = prepare_input_image(
                                     obj_record, spec.best_view
                                     if hasattr(spec, 'best_view')
@@ -403,8 +397,9 @@ def run_streaming(cfg, dataset, logger, args):
                                     f"{cached_2d_path.name}")
                             except Exception as e:
                                 logger.warning(
-                                    f"    Failed to load cached 2D "
-                                    f"edit: {e}")
+                                    f"    Corrupt cached 2D edit "
+                                    f"(deleting): {e}")
+                                cached_2d_path.unlink(missing_ok=True)
                                 prerender_img = None
 
                         if (prerender_img is None
@@ -452,8 +447,11 @@ def run_streaming(cfg, dataset, logger, args):
                                     edited = None
                                 if edited is not None:
                                     edited = edited.resize((518, 518))
-                                    # Save to cache
-                                    edited.save(str(cached_2d_path))
+                                    # Atomic save: write to temp then rename
+                                    tmp_path = cached_2d_path.with_suffix(
+                                        ".tmp.png")
+                                    edited.save(str(tmp_path))
+                                    tmp_path.rename(cached_2d_path)
                                     prerender_img = (
                                         pil_img.resize((518, 518)),
                                         edited)
@@ -527,6 +525,9 @@ def run_streaming(cfg, dataset, logger, args):
                 del_pair = mesh_pairs_dir / spec.source_del_id
                 add_pair = mesh_pairs_dir / spec.edit_id
                 if (del_pair / "before_slat").exists():
+                    # Clean up any partial previous copy
+                    if add_pair.exists():
+                        shutil.rmtree(str(add_pair))
                     add_pair.mkdir(parents=True, exist_ok=True)
                     for src, dst in [
                         (del_pair / "before_slat", add_pair / "after_slat"),
@@ -534,7 +535,7 @@ def run_streaming(cfg, dataset, logger, args):
                         (del_pair / "before.ply", add_pair / "after.ply"),
                         (del_pair / "after.ply", add_pair / "before.ply"),
                     ]:
-                        if src.exists() and not dst.exists():
+                        if src.exists():
                             if src.is_dir():
                                 shutil.copytree(str(src), str(dst))
                             else:
@@ -545,6 +546,7 @@ def run_streaming(cfg, dataset, logger, args):
                         "source_del_id": spec.source_del_id,
                     }, ensure_ascii=False) + "\n")
                     res_fp.flush()
+                    done_edits.add(spec.edit_id)
                     total_success += 1
                 else:
                     res_fp.write(json.dumps({

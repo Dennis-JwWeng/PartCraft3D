@@ -13,12 +13,12 @@ Usage:
     ATTN_BACKEND=xformers python scripts/vis/render_gs_pairs.py \
         --config configs/partobjaverse.yaml --tag multiview
 
-    # Render specific edit IDs
+    # Render specific edit IDs (new format: {type}_{obj_id}_{seq})
     ATTN_BACKEND=xformers python scripts/vis/render_gs_pairs.py \
-        --config configs/partobjaverse.yaml --edit-ids mod_000001 del_000002
+        --config configs/partobjaverse.yaml --edit-ids del_my-chair-001_000
 
     # Also save individual views (16 per model)
-    ATTN_BACKEND=xformers pytho--n scripts/vis/render_gs_pairs.py \
+    ATTN_BACKEND=xformers python scripts/vis/render_gs_pairs.py \
         --config configs/partobjaverse.yaml --save-views --num-views 16
 
     # Skip comparison video, only render individual before/after videos
@@ -27,7 +27,9 @@ Usage:
 """
 
 import argparse
+import glob as _glob
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -38,7 +40,8 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_PROJECT_ROOT))
 
 from partcraft.utils.config import load_config
 from partcraft.utils.logging import setup_logging
@@ -49,10 +52,11 @@ from partcraft.utils.logging import setup_logging
 # ---------------------------------------------------------------------------
 
 def load_slat(slat_dir: Path, device: str = "cuda"):
-    """Load SLAT from feats.pt + coords.pt."""
+    """Load SLAT from feats.pt + coords.pt (follows symlinks)."""
     from trellis.modules import sparse as sp
-    feats = torch.load(slat_dir / "feats.pt", weights_only=True)
-    coords = torch.load(slat_dir / "coords.pt", weights_only=True)
+    resolved = slat_dir.resolve()
+    feats = torch.load(resolved / "feats.pt", weights_only=True)
+    coords = torch.load(resolved / "coords.pt", weights_only=True)
     return sp.SparseTensor(feats=feats.to(device), coords=coords.to(device))
 
 
@@ -176,17 +180,36 @@ def build_comparison_video(before_frames: list[np.ndarray],
 # Prompt loading
 # ---------------------------------------------------------------------------
 
+def _resolve_path(p: str | Path) -> Path:
+    """Resolve a path: absolute stays, relative resolved against project root."""
+    pp = Path(p)
+    return pp if pp.is_absolute() else _PROJECT_ROOT / pp
+
+
 def load_edit_prompts(cache_dir: Path, tag: str = "") -> dict[str, dict]:
-    """Load edit prompts from edit_results jsonl."""
+    """Load edit prompts from edit_results jsonl.
+
+    Handles both single-worker (edit_results_{tag}.jsonl) and multi-worker
+    (edit_results_{tag}_w0.jsonl, _w1.jsonl, ...) output files.
+    """
     tag_suffix = f"_{tag}" if tag else ""
-    results_path = cache_dir / f"edit_results{tag_suffix}.jsonl"
     prompts = {}
 
-    if not results_path.exists():
-        # Fallback: try without tag
-        results_path = cache_dir / "edit_results.jsonl"
+    # Collect all matching results files (base + per-worker)
+    candidates = []
+    base = cache_dir / f"edit_results{tag_suffix}.jsonl"
+    if base.exists():
+        candidates.append(base)
+    # Multi-worker files: edit_results_{tag}_w0.jsonl, _w1.jsonl, ...
+    worker_pattern = str(cache_dir / f"edit_results{tag_suffix}_w*.jsonl")
+    candidates.extend(Path(p) for p in sorted(_glob.glob(worker_pattern)))
+    # Fallback: try without tag
+    if not candidates:
+        fallback = cache_dir / "edit_results.jsonl"
+        if fallback.exists():
+            candidates.append(fallback)
 
-    if results_path.exists():
+    for results_path in candidates:
         with open(results_path) as f:
             for line in f:
                 if not line.strip():
@@ -196,9 +219,12 @@ def load_edit_prompts(cache_dir: Path, tag: str = "") -> dict[str, dict]:
                     if rec.get("status") == "success":
                         prompts[rec["edit_id"]] = {
                             "edit_prompt": rec.get("edit_prompt", ""),
-                            "edit_type": rec.get("edit_type", ""),
+                            "edit_type": rec.get("edit_type",
+                                                 rec.get("effective_edit_type",
+                                                         "")),
                             "object_desc": rec.get("object_desc", ""),
                             "after_desc": rec.get("after_desc", ""),
+                            "obj_id": rec.get("obj_id", ""),
                         }
                 except (json.JSONDecodeError, KeyError):
                     pass
@@ -269,20 +295,24 @@ def main():
 
     valid_pairs = []
     for d in pair_dirs:
-        has_before = (d / "before_slat" / "feats.pt").exists()
-        has_after = (d / "after_slat" / "feats.pt").exists()
+        before_slat = d / "before_slat"
+        after_slat = d / "after_slat"
+        # Resolve symlinks (before_slat may be a relative symlink to shared dir)
+        has_before = (before_slat.resolve() / "feats.pt").exists()
+        has_after = (after_slat.resolve() / "feats.pt").exists()
         if has_before and has_after:
             valid_pairs.append(d)
         else:
-            logger.warning(f"Skipping {d.name}: missing SLAT files")
+            logger.warning(f"Skipping {d.name}: missing SLAT files"
+                           f" (before={has_before}, after={has_after})")
 
     if not valid_pairs:
         logger.error("No valid pairs found with SLAT files")
         sys.exit(1)
 
-    # Load edit prompts
-    # NOTE: load_config() already resolves relative cache_dir against output_dir
-    cache_dir = Path(cfg.get("phase2_5", {}).get("cache_dir", "cache/phase2_5"))
+    # Load edit prompts — resolve cache_dir relative to project root
+    raw_cache = cfg.get("phase2_5", {}).get("cache_dir", "cache/phase2_5")
+    cache_dir = _resolve_path(raw_cache)
     edit_prompts = load_edit_prompts(cache_dir, args.tag or "")
 
     logger.info(f"Rendering {len(valid_pairs)} pairs -> {vis_dir}")
@@ -317,8 +347,10 @@ def main():
         info = edit_prompts.get(edit_id, {})
         prompt = info.get("edit_prompt", edit_id)
         edit_type = info.get("edit_type", "")
+        obj_id = info.get("obj_id", "")
 
-        logger.info(f"  {edit_id} [{edit_type}]: {prompt[:80]}")
+        logger.info(f"  {edit_id} [{edit_type}]: {prompt[:80]}"
+                     + (f"  (obj: {obj_id})" if obj_id else ""))
 
         # Decode both SLATs to Gaussian
         gaussians = {}

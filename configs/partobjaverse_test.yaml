@@ -10,7 +10,7 @@ data:
 
 phase0:
   vlm_backend: "api"
-  vlm_model: "gemini-2.5-flash"
+  vlm_model: "gemini-3.1-flash-lite-preview"
   vlm_base_url: "https://llm-api.mmchat.xyz/v1"
   vlm_api_key: ""
   views_for_labeling: [0, 10, 20, 30]

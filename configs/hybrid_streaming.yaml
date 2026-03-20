@@ -21,7 +21,7 @@ data:
 # ── Phase 0: Semantic labeling (API) ─────────────────────────────────────
 phase0:
   vlm_backend: "api"
-  vlm_model: "gemini-2.5-flash"
+  vlm_model: "gemini-3.1-flash-lite-preview"
   vlm_base_url: "https://llm-api.mmchat.xyz/v1"
   vlm_api_key: "sk-live-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJNZXRhQ2hhdCIsInN1YiI6IjY5YWViNjBjMTk2MzA4YzNlNDJiZTlhYyIsImNsaWVudF9pZCI6IjdmZGFkZDY1MDM5MGU0ZDZiZTg3OGQ0NzFiNGFkMjY5IiwiaWF0IjoxNzczMDYwODE1fQ.gohorU2KohC_lBq2DzGG9S4oGnIVbhB9R-g4nIVlwKA"
   views_for_labeling: [0, 10, 20, 30]
