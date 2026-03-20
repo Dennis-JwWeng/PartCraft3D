@@ -343,7 +343,30 @@ def run_streaming(cfg, dataset, logger, args):
                     edit_type = spec.edit_type.capitalize()
 
                     if edit_type == "Deletion":
-                        edit_part_ids = spec.remove_part_ids
+                        # Direct GT mesh deletion — no SLAT/generation needed
+                        from partcraft.phase2_assembly.trellis_refine import TrellisRefiner
+                        pair_dir = mesh_pairs_dir / spec.edit_id
+                        export_paths = TrellisRefiner.direct_delete_mesh(
+                            obj_record, spec.remove_part_ids, pair_dir)
+                        rec = {
+                            "edit_id": spec.edit_id,
+                            "edit_type": spec.edit_type,
+                            "effective_edit_type": "DirectDeletion",
+                            "obj_id": uid,
+                            "edit_prompt": spec.edit_prompt,
+                            **export_paths,
+                            "status": "success",
+                        }
+                        res_fp.write(json.dumps(rec,
+                                                ensure_ascii=False) + "\n")
+                        res_fp.flush()
+                        total_success += 1
+                        done_edits.add(spec.edit_id)
+                        if first_pair_dir is None:
+                            first_pair_dir = pair_dir
+                        logger.info(f"    OK (direct deletion, GT mesh) "
+                                    f"→ {pair_dir}")
+                        continue
                     elif edit_type == "Modification":
                         if spec.remove_part_ids:
                             edit_part_ids = spec.remove_part_ids
@@ -524,7 +547,9 @@ def run_streaming(cfg, dataset, logger, args):
                     continue
                 del_pair = mesh_pairs_dir / spec.source_del_id
                 add_pair = mesh_pairs_dir / spec.edit_id
-                if (del_pair / "before_slat").exists():
+                del_has_output = ((del_pair / "before_slat").exists()
+                                  or (del_pair / "before.ply").exists())
+                if del_has_output:
                     # Clean up any partial previous copy
                     if add_pair.exists():
                         shutil.rmtree(str(add_pair))
@@ -552,7 +577,7 @@ def run_streaming(cfg, dataset, logger, args):
                     res_fp.write(json.dumps({
                         "edit_id": spec.edit_id, "status": "failed",
                         "reason": f"Source deletion {spec.source_del_id} "
-                                  f"not found",
+                                  f"output not found",
                     }) + "\n")
                     res_fp.flush()
                     total_fail += 1

@@ -31,10 +31,10 @@ Step 3: 2D Image Editing (VLM / local diffusers)
     Plain input view + constrained prompt → edited reference image
     → cache/phase2_5/2d_edits_{tag}/{edit_id}_edited.png
 
-Step 4: 3D Editing — TRELLIS (GPU, main workload)
-    ├─ Deletion:     via Modification, S1 fills hole (dynamic mask/cfg)
-    ├─ Modification:  Flow Inversion + Repaint, contact-aware soft mask
-    ├─ Global:        TextureOnly — S1 skipped, S2 repaint changes texture
+Step 4: 3D Editing (GPU, main workload)
+    ├─ Deletion:     Direct GT mesh removal (no generation, trimesh PLY)
+    ├─ Modification:  TRELLIS Flow Inversion + Repaint (Gaussian Splatting PLY)
+    ├─ Global:        TextureOnly — S1 skipped, S2 repaint (Gaussian Splatting PLY)
     └─ Addition:      swap before/after from deletion pair (no inference)
     → mesh_pairs_{tag}/{edit_id}/before.ply, after.ply
 
@@ -117,29 +117,89 @@ Each `--tag` produces independent outputs with fresh VLM enrichment. Resume is a
 
 Partition objects across workers, each on a different GPU. Workers share VLM/image-edit servers but write to separate output files (`_w0.jsonl`, `_w1.jsonl`) to avoid conflicts.
 
+**Architecture overview**:
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Shared Services (start once, all workers connect via HTTP) │
+│                                                             │
+│  GPU 5: VLM Server (SGLang, port 8002)                     │
+│  GPU 2: Image Edit Server (FLUX.2-klein, port 8001)        │
+└────────────────────┬────────────────────────────────────────┘
+                     │ HTTP API (stateless)
+     ┌───────────────┼───────────────┐
+     ▼               ▼               ▼
+┌─────────┐   ┌─────────┐   ┌─────────┐
+│Worker 0 │   │Worker 1 │   │Worker 2 │  ...
+│ GPU 0   │   │ GPU 1   │   │ GPU 3   │
+│ _w0.jsonl│   │ _w1.jsonl│   │ _w2.jsonl│
+└─────────┘   └─────────┘   └─────────┘
+  obj 0,4,8..   obj 1,5,9..   obj 2,6,10..  (modulo partition)
+```
+
+**Step 1: Start shared services** (one-time, separate terminals):
 ```bash
+# Terminal 1: VLM server
+conda activate qwen_test
+CUDA_VISIBLE_DEVICES=5 VLM_PORT=8002 bash scripts/tools/launch_local_vlm.sh
+
+# Terminal 2: Image edit server
+conda activate qwen_test
+CUDA_VISIBLE_DEVICES=2 python scripts/tools/image_edit_server.py  # port 8001
+```
+
+**Step 2: Launch workers** (one per GPU):
+```bash
+conda activate vinedresser3d
+
 # Worker 0 on GPU 0
 CUDA_VISIBLE_DEVICES=0 ATTN_BACKEND=xformers python scripts/run_streaming.py \
-    --config configs/local_sglang.yaml --tag v1 \
+    --config configs/hybrid_streaming.yaml --tag v1 \
     --num-workers 4 --worker-id 0 &
 
 # Worker 1 on GPU 1
 CUDA_VISIBLE_DEVICES=1 ATTN_BACKEND=xformers python scripts/run_streaming.py \
-    --config configs/local_sglang.yaml --tag v1 \
+    --config configs/hybrid_streaming.yaml --tag v1 \
     --num-workers 4 --worker-id 1 &
 
 # Worker 2 on GPU 3
 CUDA_VISIBLE_DEVICES=3 ATTN_BACKEND=xformers python scripts/run_streaming.py \
-    --config configs/local_sglang.yaml --tag v1 \
+    --config configs/hybrid_streaming.yaml --tag v1 \
     --num-workers 4 --worker-id 2 &
 
 # Worker 3 on GPU 4
 CUDA_VISIBLE_DEVICES=4 ATTN_BACKEND=xformers python scripts/run_streaming.py \
-    --config configs/local_sglang.yaml --tag v1 \
+    --config configs/hybrid_streaming.yaml --tag v1 \
     --num-workers 4 --worker-id 3 &
 ```
 
-> GPU 2 is reserved for the image edit server in this example.
+> GPU 2 and 5 are reserved for shared services in this example.
+
+**Step 3: Merge worker outputs** (after all workers finish):
+
+Multi-GPU streaming produces per-worker fragments (`_w0.jsonl`, `_w1.jsonl`, ...). Merge them before running quality scoring:
+
+```bash
+TAG=v1
+OUT=outputs/partobjaverse_tiny
+
+# Merge semantic labels, edit specs, and edit results
+cat $OUT/cache/phase0/semantic_labels_${TAG}_w*.jsonl > $OUT/cache/phase0/semantic_labels_${TAG}.jsonl
+cat $OUT/cache/phase1/edit_specs_${TAG}_w*.jsonl     > $OUT/cache/phase1/edit_specs_${TAG}.jsonl
+cat $OUT/cache/phase2_5/edit_results_${TAG}_w*.jsonl > $OUT/cache/phase2_5/edit_results_${TAG}.jsonl
+```
+
+**Step 4: Quality scoring + export**:
+```bash
+python scripts/run_pipeline.py \
+    --config configs/hybrid_streaming.yaml --steps 5 6 --tag v1
+```
+
+**Data safety guarantees** (no locks needed):
+- **No data races**: Objects are deterministically partitioned by `index % num_workers == worker_id`. Each object is processed by exactly one worker.
+- **Per-worker output files**: Each worker writes to its own `_w{id}.jsonl` files (labels, specs, results). No shared writes.
+- **Shared 2D cache is safe**: `2d_edits_{tag}/` directory is shared, but edit IDs are unique per object (embedded obj_id hash), so workers write different files. Writes use atomic temp-file + rename.
+- **Resume-safe**: Re-running with the same `--tag` and `--worker-id` skips completed objects. Safe to kill and restart any worker.
+- **VLM/Image Edit servers**: Accessed via stateless HTTP API, naturally thread-safe. May become bottlenecks with >4 workers — consider deploying multiple server replicas if needed.
 
 ### Batch Mode — `run_pipeline.py` (step-by-step)
 
@@ -280,8 +340,8 @@ outputs/{dataset}/
 │       └── phase3_{tag}/                    # Step 5: quality scores
 ├── mesh_pairs_{tag}/
 │   └── {edit_id}/
-│       ├── before.ply, after.ply            # Gaussian Splatting PLY
-│       └── before_slat/, after_slat/        # SLAT (feats.pt + coords.pt)
+│       ├── before.ply, after.ply            # Trimesh PLY (del/add) or GS PLY (mod/glb)
+│       └── before_slat/, after_slat/        # SLAT features (mod/glb only, absent for del/add)
 ├── vis_masks/{tag}/                         # Mask debug visualizations
 └── edit_pairs_{tag}.jsonl                   # Step 6: final dataset
 ```
@@ -290,16 +350,18 @@ outputs/{dataset}/
 
 ## Edit Types
 
-| Edit Type | S1 (Structure) | S2 (Texture) | Mask | cfg |
-|-----------|---------------|-------------|------|-----|
-| **Deletion** | Modification (fills hole) | Full repaint | Dynamic (radius 2-4) | 3.0-7.0 |
-| **Modification** | Flow Inversion + Repaint | Full repaint | Tight + 1-voxel dilation | 7.5 |
-| **Global** | Skipped (shape preserved) | S2 repaint only | Full 64^3 | 5.0 |
-| **Addition** | N/A (swap from deletion) | N/A | N/A | N/A |
+| Edit Type | Method | Output Format | Mask | Notes |
+|-----------|--------|---------------|------|-------|
+| **Deletion** | Direct GT mesh removal (`direct_delete_mesh`) | Trimesh PLY (vertices + faces + vertex colors), no SLAT | N/A | Assembles remaining parts from ground-truth NPZ mesh |
+| **Modification** | TRELLIS Flow Inversion + Repaint | Gaussian Splatting PLY + SLAT (feats.pt + coords.pt) | Tight + 1-voxel dilation, cfg=7.5 | 2D edit image as conditioning |
+| **Global** | TextureOnly (S1 skipped, S2 repaint) | Gaussian Splatting PLY + SLAT | Full 64^3, cfg=5.0 | Shape preserved, only texture changes |
+| **Addition** | Swap before/after from deletion pair | Inherits deletion format (trimesh PLY, no SLAT) | N/A | No inference, copy + swap |
 
-**Large Part Auto-Promotion**: When the edit part covers >40% of SLAT voxels, Deletion/Modification is automatically promoted to Global (TextureOnly).
+**Large Part Auto-Promotion**: When the edit part covers >40% of SLAT voxels, Modification is automatically promoted to Global (TextureOnly).
 
 **Contact-Aware Soft Mask**: Dynamic Gaussian blur sigma based on contact ratio between edited and preserved geometry.
+
+**Output format note**: Deletion/Addition pairs produce standard trimesh PLY (mesh with vertex colors). Modification/Global pairs produce Gaussian Splatting PLY (point cloud with SH coefficients + covariances) plus SLAT features. Downstream consumers should check for the presence of `before_slat/` to distinguish formats.
 
 ---
 
@@ -363,9 +425,8 @@ scripts/                            # Pipeline scripts
 │   ├── image_edit_server.py        # FLUX.2-klein-9B / Qwen image edit HTTP server
 │   └── launch_local_vlm.sh        # SGLang VLM launcher
 ├── vis/
-│   ├── visualize_masks.py          # Per-spec mask diagnostic (2D + 3D voxel)
-│   ├── visualize_partobjaverse.py  # Part-level mesh visualization
-│   ├── render_gs_pairs.py          # Side-by-side comparison video
+│   ├── render_gs_pairs.py          # Gaussian Splatting side-by-side comparison
+│   ├── render_ply_pairs.py         # Trimesh PLY pair rendering (deletion/addition)
 │   └── visualize_edit_pair.py      # Before/after edit comparison
 └── standalone/                     # Standalone per-phase scripts (for debugging)
 
@@ -379,21 +440,18 @@ configs/
 
 ## Visualization & Debugging
 
-### Mask Diagnostics
-
-Visualize the full mask chain (VLM labels → edit spec → voxel mask) for all specs:
+### Rendering Edit Pairs
 
 ```bash
-python scripts/vis/visualize_masks.py --config configs/local_sglang.yaml
+# Render Gaussian Splatting pairs (modification/global edits)
+python scripts/vis/render_gs_pairs.py --config configs/local_sglang.yaml --tag v1
 
-# Single edit
-python scripts/vis/visualize_masks.py --config configs/local_sglang.yaml --edit-id del_000000
+# Render trimesh PLY pairs (deletion/addition edits)
+python scripts/vis/render_ply_pairs.py --config configs/local_sglang.yaml --tag v1
 
-# Limit specs
-python scripts/vis/visualize_masks.py --config configs/local_sglang.yaml --limit 10
+# Before/after comparison for specific edit
+python scripts/vis/visualize_edit_pair.py --edit-id mod_abc12345_001 --tag v1
 ```
-
-Output: per-spec diagnostic image with rendered views (edit parts in red), 3-axis voxel projections (color-coded), and text info. HTML index at `outputs/.../vis_masks/{tag}/index.html`.
 
 ### Debug Mode
 

@@ -338,7 +338,30 @@ def main():
                     edit_type = spec.edit_type.capitalize()
 
                     if edit_type == "Deletion":
-                        edit_part_ids = spec.remove_part_ids
+                        # Direct GT mesh deletion — no SLAT/generation needed
+                        from partcraft.phase2_assembly.trellis_refine import TrellisRefiner
+                        pair_dir = mesh_pairs_dir / spec.edit_id
+                        export_paths = TrellisRefiner.direct_delete_mesh(
+                            obj_record, spec.remove_part_ids, pair_dir)
+                        record = {
+                            "edit_id": spec.edit_id,
+                            "edit_type": spec.edit_type,
+                            "effective_edit_type": "DirectDeletion",
+                            "obj_id": obj_id,
+                            "shard": spec.shard,
+                            "object_desc": spec.object_desc,
+                            "edit_prompt": spec.edit_prompt,
+                            "after_desc": spec.after_desc,
+                            **export_paths,
+                            "status": "success",
+                        }
+                        out_fp.write(json.dumps(record,
+                                                ensure_ascii=False) + "\n")
+                        out_fp.flush()
+                        success += 1
+                        logger.info(f"  → direct deletion (GT mesh) "
+                                    f"saved {pair_dir}")
+                        continue
                     elif edit_type == "Modification":
                         edit_part_ids = [spec.old_part_id]
                     elif edit_type == "Global":
@@ -348,7 +371,9 @@ def main():
                         del_id = spec.source_del_id
                         del_pair_dir = mesh_pairs_dir / del_id
                         add_pair_dir = mesh_pairs_dir / spec.edit_id
-                        if (del_pair_dir / "before_slat").exists():
+                        del_has_output = ((del_pair_dir / "before_slat").exists()
+                                          or (del_pair_dir / "before.ply").exists())
+                        if del_has_output:
                             add_pair_dir.mkdir(parents=True, exist_ok=True)
                             import shutil
                             for src, dst in [
@@ -429,13 +454,9 @@ def main():
                         prompts["edit_type"] = edit_type
 
                     # 2D image conditioning
-                    # - Modification: always if enabled
-                    # - Deletion: all deletions now use guided Modification
-                    #   path, so image conditioning helps show the closed
-                    #   surface after part removal
                     img_cond = None
                     use_img_cond = (
-                        edit_type in ("Modification", "Deletion", "Global")
+                        edit_type in ("Modification", "Global")
                         and args.use_2d)
                     if use_img_cond:
                         num_edit_views = p25_cfg.get("num_edit_views", 4)
