@@ -88,23 +88,27 @@ This ensures source mesh face ordering (matching `instance_gt`) is preserved whi
 
 ## Running Modes
 
-### Streaming Mode (recommended)
+### Streaming Mode — `run_streaming.py` (recommended)
 
-Each object is processed through the full chain (enrich → plan → 2D edit → 3D edit) before moving to the next. Supports resume on interruption.
+Each object is processed through the full chain (enrich → plan → 2D edit → 3D edit) before moving to the next. Supports resume on interruption. After streaming completes, run quality scoring + export via the batch script.
 
 ```bash
 # Terminal 1: Start VLM server (SGLang, port 8002)
 conda activate qwen_test
 VLM_PORT=8002 bash scripts/tools/launch_local_vlm.sh
 
-# Terminal 2: Start image edit server (diffusers, port 8001)
+# Terminal 2: Start image edit server (FLUX.2-klein-9B, port 8001)
 conda activate qwen_test
-python scripts/tools/image_edit_server.py --gpu 2
+CUDA_VISIBLE_DEVICES=2 python scripts/tools/image_edit_server.py
 
-# Terminal 3: Run pipeline (streaming mode)
+# Terminal 3: Run streaming pipeline
 conda activate vinedresser3d
-ATTN_BACKEND=xformers python scripts/run_pipeline.py \
-    --config configs/local_sglang.yaml --streaming --tag v1
+ATTN_BACKEND=xformers python scripts/run_streaming.py \
+    --config configs/local_sglang.yaml --tag v1
+
+# Terminal 3 (after streaming completes): Quality scoring + export
+python scripts/run_pipeline.py \
+    --config configs/local_sglang.yaml --steps 5 6 --tag v1
 ```
 
 Each `--tag` produces independent outputs with fresh VLM enrichment. Resume is automatic — re-running with the same tag skips already-completed objects.
@@ -115,31 +119,31 @@ Partition objects across workers, each on a different GPU. Workers share VLM/ima
 
 ```bash
 # Worker 0 on GPU 0
-CUDA_VISIBLE_DEVICES=0 ATTN_BACKEND=xformers python scripts/run_pipeline.py \
-    --config configs/local_sglang.yaml --streaming --tag v1 \
+CUDA_VISIBLE_DEVICES=0 ATTN_BACKEND=xformers python scripts/run_streaming.py \
+    --config configs/local_sglang.yaml --tag v1 \
     --num-workers 4 --worker-id 0 &
 
 # Worker 1 on GPU 1
-CUDA_VISIBLE_DEVICES=1 ATTN_BACKEND=xformers python scripts/run_pipeline.py \
-    --config configs/local_sglang.yaml --streaming --tag v1 \
+CUDA_VISIBLE_DEVICES=1 ATTN_BACKEND=xformers python scripts/run_streaming.py \
+    --config configs/local_sglang.yaml --tag v1 \
     --num-workers 4 --worker-id 1 &
 
 # Worker 2 on GPU 3
-CUDA_VISIBLE_DEVICES=3 ATTN_BACKEND=xformers python scripts/run_pipeline.py \
-    --config configs/local_sglang.yaml --streaming --tag v1 \
+CUDA_VISIBLE_DEVICES=3 ATTN_BACKEND=xformers python scripts/run_streaming.py \
+    --config configs/local_sglang.yaml --tag v1 \
     --num-workers 4 --worker-id 2 &
 
 # Worker 3 on GPU 4
-CUDA_VISIBLE_DEVICES=4 ATTN_BACKEND=xformers python scripts/run_pipeline.py \
-    --config configs/local_sglang.yaml --streaming --tag v1 \
+CUDA_VISIBLE_DEVICES=4 ATTN_BACKEND=xformers python scripts/run_streaming.py \
+    --config configs/local_sglang.yaml --tag v1 \
     --num-workers 4 --worker-id 3 &
 ```
 
 > GPU 2 is reserved for the image edit server in this example.
 
-### Batch Mode (step-by-step)
+### Batch Mode — `run_pipeline.py` (step-by-step)
 
-Traditional per-step batch processing. Useful for debugging or running steps separately:
+Traditional per-step batch processing. All objects go through each step before moving to the next. Supports cross-object swap modifications (addition from other objects) and selective step execution.
 
 ```bash
 # Full pipeline (all 6 steps sequentially)
@@ -154,22 +158,18 @@ ATTN_BACKEND=xformers python scripts/run_pipeline.py \
 python scripts/run_pipeline.py --config configs/default.yaml --dry-run
 ```
 
-### API Deployment (Gemini)
-
-Uses Gemini 2.5 Flash via API for both VLM and image editing. Requires API key in config.
-
-```bash
-python scripts/run_pipeline.py \
-    --config configs/default.yaml --streaming --tag v1
-```
-
 ### Hybrid Mode (local GPU + remote API)
 
-Local image editing (Qwen-Image-Edit) + remote VLM (Gemini API):
+Local image editing (FLUX.2-klein-9B) + remote VLM (Gemini API):
 
 ```bash
-python scripts/run_pipeline.py \
-    --config configs/hybrid_streaming.yaml --streaming --tag v1
+# Streaming
+ATTN_BACKEND=xformers python scripts/run_streaming.py \
+    --config configs/hybrid_streaming.yaml --tag v1
+
+# Batch
+ATTN_BACKEND=xformers python scripts/run_pipeline.py \
+    --config configs/hybrid_streaming.yaml --tag v1
 ```
 
 ---
@@ -224,19 +224,34 @@ phase2_5:
 
 ## CLI Reference
 
+### `run_streaming.py` (streaming mode)
+
 | Argument | Description |
 |---|---|
 | `--config PATH` | Config YAML file |
-| `--streaming` | Streaming mode (per-object full chain) |
 | `--tag NAME` | Experiment tag for output isolation |
 | `--limit N` | Process first N objects only |
 | `--num-workers N` | Multi-GPU parallel worker count |
 | `--worker-id K` | This worker's ID (0-indexed) |
-| `--steps 3 4 5` | Run specific steps only (batch mode) |
 | `--seed N` | Random seed for TRELLIS (default: 1) |
+| `--no-2d-edit` | Skip 2D image editing (text-only TRELLIS) |
+| `--debug` | Save debug files (masks, views, enricher ortho images) |
+
+### `run_pipeline.py` (batch mode)
+
+| Argument | Description |
+|---|---|
+| `--config PATH` | Config YAML file |
+| `--tag NAME` | Experiment tag for output isolation |
+| `--steps 3 4 5` | Run specific steps only (default: all) |
+| `--limit N` | Process first N objects only |
+| `--seed N` | Random seed for TRELLIS (default: 1) |
+| `--workers N` | Parallel workers for 2D editing (default: 4) |
 | `--force` | Force re-run, overwrite cached results |
 | `--edit-ids id1 id2` | Process specific edit IDs only |
 | `--no-2d-edit` | Skip 2D image editing (text-only TRELLIS) |
+| `--edit-dir DIR` | Pre-generated 2D edits subdir |
+| `--suffix STR` | Suffix for spec files (e.g. `_action`) |
 | `--debug` | Save debug files (masks, views, enricher ortho images) |
 | `--dry-run` | Cost estimation only |
 
@@ -338,12 +353,14 @@ partcraft/                          # Core library
     └── logging.py                  # Logging setup
 
 scripts/                            # Pipeline scripts
-├── run_pipeline.py                 # Main unified pipeline (batch + streaming)
+├── run_pipeline.py                 # Batch pipeline (step-by-step, all 6 steps)
+├── run_streaming.py                # Streaming pipeline (per-object full chain)
+├── pipeline_common.py              # Shared utilities (config, paths, constants)
 ├── run_2d_edit.py                  # Standalone parallel 2D editing
 ├── pack_prerender_npz.py           # Pack source mesh + VD prerender → NPZ
 ├── prerender.py                    # Blender rendering + SLAT encoding (one-time)
 ├── tools/
-│   ├── image_edit_server.py        # Qwen-Image-Edit HTTP server
+│   ├── image_edit_server.py        # FLUX.2-klein-9B / Qwen image edit HTTP server
 │   └── launch_local_vlm.sh        # SGLang VLM launcher
 ├── vis/
 │   ├── visualize_masks.py          # Per-spec mask diagnostic (2D + 3D voxel)
@@ -382,8 +399,8 @@ Output: per-spec diagnostic image with rendered views (edit parts in red), 3-axi
 
 ```bash
 # Save mask projections, 2D edit views, enricher ortho images
-python scripts/run_pipeline.py \
-    --config configs/local_sglang.yaml --streaming --tag debug --limit 1 --debug
+python scripts/run_streaming.py \
+    --config configs/local_sglang.yaml --tag debug --limit 1 --debug
 ```
 
 ---

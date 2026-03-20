@@ -9,8 +9,8 @@
 #        CUDA_VISIBLE_DEVICES=2 python scripts/tools/image_edit_server.py  # port 8001
 #   2. Pipeline (streaming mode):
 #        conda activate vinedresser3d
-#        ATTN_BACKEND=xformers python scripts/run_pipeline.py \
-#            --config configs/hybrid_streaming.yaml --streaming --tag v1
+#        ATTN_BACKEND=xformers python scripts/run_streaming.py \
+#            --config configs/hybrid_streaming.yaml --tag v1
 
 data:
   image_npz_dir: "data/partobjaverse_tiny/images"
