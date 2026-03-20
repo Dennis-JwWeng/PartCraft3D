@@ -145,14 +145,10 @@ def run_streaming(cfg, dataset, logger, args):
         edit_vlm_client = OpenAI(base_url=image_edit_url, api_key=api_key)
 
     # ---- TRELLIS setup ----
-    vinedresser_path = p25.get(
-        "vinedresser_path", "/Node11_nvme/wjw/3D_Editing/Vinedresser3D-main")
-    sys.path.insert(0, vinedresser_path)
     from partcraft.phase2_assembly.trellis_refine import (
         TrellisRefiner, build_prompts_from_spec)
 
     refiner = TrellisRefiner(
-        vinedresser_path=vinedresser_path,
         cache_dir=str(_resolve(p25["cache_dir"])),
         device="cuda",
         image_edit_model=p25.get("image_edit_model", "gemini-2.5-flash-image"),

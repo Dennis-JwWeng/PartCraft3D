@@ -283,9 +283,6 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
     logger.info("=" * 60)
 
     p25_cfg = cfg.get("phase2_5", {})
-    vinedresser_path = p25_cfg.get(
-        "vinedresser_path", "/Node11_nvme/wjw/3D_Editing/Vinedresser3D-main")
-    sys.path.insert(0, vinedresser_path)
 
     from partcraft.phase2_assembly.trellis_refine import (
         TrellisRefiner, build_prompts_from_spec)
@@ -354,7 +351,6 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
 
     # ---- Init refiner ----
     refiner = TrellisRefiner(
-        vinedresser_path=vinedresser_path,
         cache_dir=str(cache_dir),
         device="cuda",
         image_edit_model=p25_cfg.get("image_edit_model", "gemini-2.5-flash-image"),

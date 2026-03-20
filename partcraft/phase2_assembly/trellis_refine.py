@@ -176,7 +176,6 @@ class TrellisRefiner:
 
     def __init__(
         self,
-        vinedresser_path: str,
         cache_dir: str | Path,
         device: str = "cuda",
         image_edit_model: str = "gemini-2.5-flash-image",
@@ -184,8 +183,10 @@ class TrellisRefiner:
         image_edit_backend: str = "api",
         image_edit_base_url: str | None = None,
         debug: bool = False,
+        # Legacy: ignored, kept for config compat
+        vinedresser_path: str | None = None,
     ):
-        self.vinedresser_path = vinedresser_path
+        self._project_root = Path(__file__).parents[2]
         self.cache_dir = Path(cache_dir)
         self.device = torch.device(device)
         self.image_edit_model = image_edit_model
@@ -196,17 +197,22 @@ class TrellisRefiner:
 
         # Checkpoint directory: default to PartCraft3D/checkpoints
         if ckpt_dir is None:
-            ckpt_dir = str(Path(__file__).parents[2] / "checkpoints")
+            ckpt_dir = str(self._project_root / "checkpoints")
         self.ckpt_dir = Path(ckpt_dir)
+
+        # Data directories (SLAT, img_Enc)
+        self.slat_dir = self._project_root / "data" / "slat"
+        self.img_enc_dir = self._project_root / "data" / "img_Enc"
 
         self.debug = debug or os.environ.get("PARTCRAFT_DEBUG", "").lower() in ("1", "true")
 
         self.trellis_text = None
         self.trellis_img = None
 
-        # Ensure Vinedresser3D is on sys.path
-        if vinedresser_path not in sys.path:
-            sys.path.insert(0, vinedresser_path)
+        # Ensure third_party/ is on sys.path for trellis, interweave, encode_asset
+        third_party = str(self._project_root / "third_party")
+        if third_party not in sys.path:
+            sys.path.insert(0, third_party)
 
     # ---- Model loading ----
 
@@ -243,14 +249,12 @@ class TrellisRefiner:
         Requires prerender.py to have been run first (Blender 150 views +
         Open3D voxelization + DINOv2 + SLAT encoding).
 
-        SLAT files are stored in Vinedresser3D's outputs/slat/ directory.
+        SLAT files are stored in data/slat/ directory.
         """
         from trellis.modules import sparse as sp
 
-        feats_path = os.path.join(
-            self.vinedresser_path, f"outputs/slat/{obj_id}_feats.pt")
-        coords_path = os.path.join(
-            self.vinedresser_path, f"outputs/slat/{obj_id}_coords.pt")
+        feats_path = str(self.slat_dir / f"{obj_id}_feats.pt")
+        coords_path = str(self.slat_dir / f"{obj_id}_coords.pt")
 
         if not os.path.exists(feats_path) or not os.path.exists(coords_path):
             raise FileNotFoundError(
@@ -307,8 +311,7 @@ class TrellisRefiner:
         import open3d as o3d
 
         # Load VD's normalized mesh.ply for reference frame
-        vd_mesh_path = os.path.join(
-            self.vinedresser_path, f"outputs/img_Enc/{obj_id}/mesh.ply")
+        vd_mesh_path = str(self.img_enc_dir / obj_id / "mesh.ply")
         if not os.path.exists(vd_mesh_path):
             raise FileNotFoundError(
                 f"VD mesh.ply not found at {vd_mesh_path}. "

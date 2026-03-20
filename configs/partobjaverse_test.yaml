@@ -38,7 +38,6 @@ phase2:
 
 phase2_5:
   enabled: false
-  vinedresser_path: "/Node11_nvme/wjw/3D_Editing/Vinedresser3D-main"
   trellis_text_ckpt: "checkpoints/TRELLIS-text-xlarge"
   trellis_image_ckpt: "checkpoints/TRELLIS-image-large"
   num_combinations: 2

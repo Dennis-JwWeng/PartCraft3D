@@ -4,13 +4,13 @@
 This decouples rendering from editing, so Phase 0 can use high-quality views
 and Phase 2.5 can skip inline rendering entirely.
 
-Outputs per object (in Vinedresser3D's outputs/):
-  outputs/img_Enc/{obj_id}/
+Outputs per object (in data/):
+  data/img_Enc/{obj_id}/
     ├── 000.png .. 149.png   # 150 Blender-rendered views (512x512)
     ├── mesh.ply             # Normalized mesh in [-0.5, 0.5]^3
     ├── voxels.ply           # Open3D voxelized mesh (64^3)
     └── transforms.json      # Camera parameters per view
-  outputs/slat/
+  data/slat/
     ├── {obj_id}_feats.pt    # SLAT features
     └── {obj_id}_coords.pt   # SLAT coordinates
 
@@ -45,7 +45,12 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_THIRD_PARTY = _PROJECT_ROOT / "third_party"
+_DATA_DIR = _PROJECT_ROOT / "data"
+
+sys.path.insert(0, str(_PROJECT_ROOT))
+sys.path.insert(0, str(_THIRD_PARTY))
 
 from partcraft.utils.config import load_config
 from partcraft.utils.logging import setup_logging
@@ -227,7 +232,7 @@ def launch_render_workers(args, obj_ids: list[str], gpus: list[int],
         logger.info(f"All {num_workers} render workers completed successfully.")
 
 
-def run_render(obj_ids: list[str], mesh_zip: str, vinedresser_path: str,
+def run_render(obj_ids: list[str], mesh_zip: str,
                force: bool, render_workers: int, logger, args=None):
     """Phase A: Blender 150 views + Open3D voxelize.
 
@@ -239,8 +244,7 @@ def run_render(obj_ids: list[str], mesh_zip: str, vinedresser_path: str,
     mesh_zip = os.path.abspath(mesh_zip)
     render_pending = []
     for oid in obj_ids:
-        voxels_path = os.path.join(vinedresser_path,
-                                   f"outputs/img_Enc/{oid}/voxels.ply")
+        voxels_path = str(_DATA_DIR / "img_Enc" / oid / "voxels.ply")
         if not force and os.path.exists(voxels_path):
             logger.info(f"[render] Skipping {oid} (cached)")
         else:
@@ -267,9 +271,9 @@ def run_render(obj_ids: list[str], mesh_zip: str, vinedresser_path: str,
         logger.info(f"No GPUs detected, Blender will use CPU rendering")
 
     original_cwd = os.getcwd()
-    os.chdir(vinedresser_path)
-    if vinedresser_path not in sys.path:
-        sys.path.insert(0, vinedresser_path)
+    # encode_asset scripts use relative paths like outputs/img_Enc/
+    # third_party/outputs/ symlinks to data/ for compatibility
+    os.chdir(str(_THIRD_PARTY))
     os.makedirs("outputs/img_Enc", exist_ok=True)
 
     from encode_asset.render_img_for_enc import renderImg_voxelize
@@ -294,16 +298,13 @@ def run_render(obj_ids: list[str], mesh_zip: str, vinedresser_path: str,
     os.chdir(original_cwd)
 
 
-def run_encode(obj_ids: list[str], vinedresser_path: str, force: bool, logger):
+def run_encode(obj_ids: list[str], force: bool, logger):
     """Phase B: DINOv2 + SLAT encoding (requires GPU)."""
     encode_pending = []
     for oid in obj_ids:
-        feats_path = os.path.join(vinedresser_path,
-                                  f"outputs/slat/{oid}_feats.pt")
-        coords_path = os.path.join(vinedresser_path,
-                                   f"outputs/slat/{oid}_coords.pt")
-        voxels_path = os.path.join(vinedresser_path,
-                                   f"outputs/img_Enc/{oid}/voxels.ply")
+        feats_path = str(_DATA_DIR / "slat" / f"{oid}_feats.pt")
+        coords_path = str(_DATA_DIR / "slat" / f"{oid}_coords.pt")
+        voxels_path = str(_DATA_DIR / "img_Enc" / oid / "voxels.ply")
         if not force and os.path.exists(feats_path) and os.path.exists(coords_path):
             logger.info(f"[encode] Skipping {oid} (cached)")
         elif not os.path.exists(voxels_path):
@@ -318,9 +319,8 @@ def run_encode(obj_ids: list[str], vinedresser_path: str, force: bool, logger):
         return
 
     original_cwd = os.getcwd()
-    os.chdir(vinedresser_path)
-    if vinedresser_path not in sys.path:
-        sys.path.insert(0, vinedresser_path)
+    # encode_asset scripts use relative paths like outputs/slat/
+    os.chdir(str(_THIRD_PARTY))
     os.makedirs("outputs/slat", exist_ok=True)
 
     from encode_asset.encode_into_SLAT import encode_into_SLAT
@@ -378,9 +378,6 @@ def main():
         logger.error(f"source/mesh.zip not found at {mesh_zip}")
         sys.exit(1)
 
-    vinedresser_path = p25_cfg.get(
-        "vinedresser_path", "/Node11_nvme/wjw/3D_Editing/Vinedresser3D-main")
-
     # Determine object IDs
     if args.obj_ids:
         obj_ids = args.obj_ids
@@ -398,8 +395,8 @@ def main():
         # Filter to pending objects first
         pending = []
         for oid in obj_ids:
-            feats = os.path.join(vinedresser_path, f"outputs/slat/{oid}_feats.pt")
-            voxels = os.path.join(vinedresser_path, f"outputs/img_Enc/{oid}/voxels.ply")
+            feats = str(_DATA_DIR / "slat" / f"{oid}_feats.pt")
+            voxels = str(_DATA_DIR / "img_Enc" / oid / "voxels.ply")
             if args.render_only:
                 if args.force or not os.path.exists(voxels):
                     pending.append(oid)
@@ -425,20 +422,18 @@ def main():
     # --- Single process mode ---
     # Phase A: Render
     if not args.encode_only:
-        run_render(obj_ids, str(mesh_zip), vinedresser_path,
+        run_render(obj_ids, str(mesh_zip),
                    args.force, args.render_workers, logger, args=args)
 
     # Phase B: Encode
     if not args.render_only:
-        run_encode(obj_ids, vinedresser_path, args.force, logger)
+        run_encode(obj_ids, args.force, logger)
 
     # Summary
     rendered = sum(1 for oid in obj_ids
-                   if os.path.exists(os.path.join(
-                       vinedresser_path, f"outputs/img_Enc/{oid}/voxels.ply")))
+                   if (_DATA_DIR / "img_Enc" / oid / "voxels.ply").exists())
     encoded = sum(1 for oid in obj_ids
-                  if os.path.exists(os.path.join(
-                      vinedresser_path, f"outputs/slat/{oid}_feats.pt")))
+                  if (_DATA_DIR / "slat" / f"{oid}_feats.pt").exists())
     logger.info(f"\nSummary: {rendered}/{len(obj_ids)} rendered, "
                 f"{encoded}/{len(obj_ids)} SLAT encoded")
 

@@ -319,12 +319,12 @@ def main():
 
     # Load TRELLIS decoder
     p25_cfg = cfg.get("phase2_5", {})
-    vinedresser_path = p25_cfg.get(
-        "vinedresser_path", "/Node11_nvme/wjw/3D_Editing/Vinedresser3D-main")
-    sys.path.insert(0, vinedresser_path)
+    project_root = Path(__file__).resolve().parents[2]
+    third_party = str(project_root / "third_party")
+    if third_party not in sys.path:
+        sys.path.insert(0, third_party)
 
-    ckpt_dir = Path(p25_cfg.get("ckpt_dir",
-                                str(Path(__file__).resolve().parents[2] / "checkpoints")))
+    ckpt_dir = Path(p25_cfg.get("ckpt_dir", str(project_root / "checkpoints")))
     text_ckpt = str(ckpt_dir / "TRELLIS-text-xlarge")
 
     from trellis.pipelines import TrellisTextTo3DPipeline

@@ -49,11 +49,6 @@ def main():
     logger = setup_logging(cfg, "reconstruct")
     p25_cfg = cfg.get("phase2_5", {})
 
-    # Add Vinedresser3D to path
-    vinedresser_path = p25_cfg.get(
-        "vinedresser_path", "/Node11_nvme/wjw/3D_Editing/Vinedresser3D-main")
-    sys.path.insert(0, vinedresser_path)
-
     from partcraft.phase2_assembly.trellis_refine import TrellisRefiner
 
     # ---- Load dataset ----
@@ -115,9 +110,6 @@ def main():
     refiner = TrellisRefiner(
         device="cuda",
         cache_dir=str(cache_dir),
-        vinedresser_path=vinedresser_path,
-        trellis_text_ckpt=p25_cfg.get("trellis_text_ckpt"),
-        trellis_image_ckpt=p25_cfg.get("trellis_image_ckpt"),
     )
     refiner.load_models()
 

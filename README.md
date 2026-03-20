@@ -56,10 +56,10 @@ Step 6: Export (CPU, 0 tokens)
 ### Prerequisites
 
 1. **Data**: `data/{dataset}/images/` + `data/{dataset}/mesh/` (prerendered NPZ files)
-2. **SLAT**: Pre-encoded in `{vinedresser_path}/outputs/slat/` (via `prerender.py`)
+2. **SLAT**: Pre-encoded in `data/slat/` (via `prerender.py`)
 3. **Checkpoints**: `checkpoints/TRELLIS-text-xlarge/` + `checkpoints/TRELLIS-image-large/`
-4. **Vinedresser3D**: Path configured in config yaml (`phase2_5.vinedresser_path`)
-5. **Conda env**: `vinedresser3d` (pipeline + TRELLIS), `qwen_test` (VLM + image editing servers)
+4. **Third-party**: `third_party/trellis/`, `third_party/encode_asset/`, `third_party/interweave_Trellis.py` (bundled)
+5. **Conda env**: `partcraft3d` (pipeline + TRELLIS), `qwen_test` (VLM + image editing servers)
 
 ```bash
 pip install numpy trimesh tqdm pyyaml scipy pillow openai plyfile open3d scikit-learn imageio
@@ -102,7 +102,7 @@ conda activate qwen_test
 CUDA_VISIBLE_DEVICES=2 python scripts/tools/image_edit_server.py
 
 # Terminal 3: Run streaming pipeline
-conda activate vinedresser3d
+conda activate partcraft3d
 ATTN_BACKEND=xformers python scripts/run_streaming.py \
     --config configs/local_sglang.yaml --tag v1
 
@@ -149,7 +149,7 @@ CUDA_VISIBLE_DEVICES=2 python scripts/tools/image_edit_server.py  # port 8001
 
 **Step 2: Launch workers** (one per GPU):
 ```bash
-conda activate vinedresser3d
+conda activate partcraft3d
 
 # Worker 0 on GPU 0
 CUDA_VISIBLE_DEVICES=0 ATTN_BACKEND=xformers python scripts/run_streaming.py \
@@ -252,7 +252,6 @@ phase0:
   vlm_api_key: "dummy"
 
 phase2_5:
-  vinedresser_path: "/path/to/Vinedresser3D"
   image_edit_backend: "local_diffusers"
   image_edit_base_url: "http://localhost:8001"
   image_edit_workers: 2          # concurrent requests to edit server

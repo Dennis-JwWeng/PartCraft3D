@@ -7,13 +7,13 @@
 #
 # Quick start:
 #   Terminal 1 (VLM):
-#     conda activate vinedresser3d
+#     conda activate partcraft3d
 #     bash scripts/tools/launch_local_vlm.sh            # port 8000
 #   Terminal 2 (image edit):
 #     conda activate qwen_test
 #     python scripts/tools/image_edit_server.py --gpu 2  # port 8001
 #   Terminal 3 (pipeline):
-#     conda activate vinedresser3d
+#     conda activate partcraft3d
 #     ATTN_BACKEND=xformers python scripts/run_pipeline.py \
 #         --config configs/local_sglang.yaml --tag v1
 
@@ -62,7 +62,6 @@ pipeline:
 
 phase2_5:
   enabled: true
-  vinedresser_path: "/Node11_nvme/wjw/3D_Editing/Vinedresser3D-main"
   trellis_text_ckpt: "checkpoints/TRELLIS-text-xlarge"
   trellis_image_ckpt: "checkpoints/TRELLIS-image-large"
   num_combinations: 2
