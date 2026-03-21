@@ -144,6 +144,10 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                 del_edit = _find_edit_by_type(entry.edits, "deletion")
                 add_edit = _find_edit_by_type(entry.edits, "addition")
 
+                # Skip ungrouped parts with no edits (no prompt)
+                if del_edit is None and add_edit is None:
+                    continue
+
                 # --- Deletion ---
                 del_id = _make_edit_id("del", obj_id, obj_del)
                 del_specs.append(EditSpec(

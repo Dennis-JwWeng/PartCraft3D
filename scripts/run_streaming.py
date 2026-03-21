@@ -564,6 +564,7 @@ def run_streaming(cfg, dataset, logger, args):
                     res_fp.write(json.dumps({
                         "edit_id": spec.edit_id, "edit_type": "addition",
                         "obj_id": uid, "status": "success",
+                        "edit_prompt": spec.edit_prompt,
                         "source_del_id": spec.source_del_id,
                     }, ensure_ascii=False) + "\n")
                     res_fp.flush()

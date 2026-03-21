@@ -1223,23 +1223,36 @@ class TrellisRefiner:
         # ---- Before: reuse or export ----
         if shared_before_dir and Path(shared_before_dir).exists():
             src = Path(shared_before_dir)
-            # Symlink before.ply (relative path so it works across machines)
-            before_ply = output_dir / "before.ply"
-            if not before_ply.exists():
-                src_ply = src / "before.ply"
-                if src_ply.exists():
-                    rel = os.path.relpath(src_ply, output_dir)
-                    before_ply.symlink_to(rel)
-            paths['before_ply'] = str(before_ply)
+            src_has_slat = (src / "before_slat").exists()
 
-            # Symlink before_slat directory (relative path)
-            before_slat = output_dir / "before_slat"
-            if not before_slat.exists():
-                src_slat = src / "before_slat"
-                if src_slat.exists():
-                    rel = os.path.relpath(src_slat, output_dir)
+            if src_has_slat:
+                # Source has GS before — symlink both PLY and SLAT
+                before_ply = output_dir / "before.ply"
+                if not before_ply.exists():
+                    src_ply = src / "before.ply"
+                    if src_ply.exists():
+                        rel = os.path.relpath(src_ply, output_dir)
+                        before_ply.symlink_to(rel)
+                paths['before_ply'] = str(before_ply)
+
+                before_slat = output_dir / "before_slat"
+                if not before_slat.exists():
+                    rel = os.path.relpath(src / "before_slat", output_dir)
                     before_slat.symlink_to(rel)
-            paths['before_slat'] = str(before_slat)
+                paths['before_slat'] = str(before_slat)
+            else:
+                # Source has no SLAT (e.g. deletion used direct mesh
+                # removal).  Export GS before PLY + SLAT from scratch.
+                gaussian = self.decode_to_gaussian(slat_before)
+                ply_path = output_dir / "before.ply"
+                gaussian.save_ply(str(ply_path))
+                paths['before_ply'] = str(ply_path)
+
+                before_slat = output_dir / "before_slat"
+                before_slat.mkdir(parents=True, exist_ok=True)
+                torch.save(slat_before.feats, before_slat / "feats.pt")
+                torch.save(slat_before.coords, before_slat / "coords.pt")
+                paths['before_slat'] = str(before_slat)
         else:
             # First edit for this object: export before
             gaussian = self.decode_to_gaussian(slat_before)
