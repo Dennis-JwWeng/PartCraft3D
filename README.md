@@ -59,11 +59,32 @@ Step 6: Export (CPU, 0 tokens)
 2. **SLAT**: Pre-encoded in `data/slat/` (via `prerender.py`)
 3. **Checkpoints**: `checkpoints/TRELLIS-text-xlarge/` + `checkpoints/TRELLIS-image-large/`
 4. **Third-party**: `third_party/trellis/`, `third_party/encode_asset/`, `third_party/interweave_Trellis.py` (bundled)
-5. **Conda env**: `partcraft3d` (pipeline + TRELLIS), `qwen_test` (VLM + image editing servers)
+
+### Installation
 
 ```bash
-pip install numpy trimesh tqdm pyyaml scipy pillow openai plyfile open3d scikit-learn imageio
-pip install torch torchvision xformers
+conda create -n partcraft3d python=3.10
+conda activate partcraft3d
+
+# 1. PyTorch + xFormers (must match your CUDA version, example for CUDA 12.1)
+pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+pip install xformers
+
+# 2. spconv (must match CUDA version)
+pip install spconv-cu121>=2.3
+
+# 3. All other dependencies
+pip install -r requirements.txt
+
+# Or install as editable package with all deps:
+# pip install -e ".[trellis]"
+```
+
+For VLM / image editing servers (separate env):
+```bash
+conda create -n qwen_test python=3.10
+conda activate qwen_test
+pip install sglang[all] diffusers transformers accelerate
 ```
 
 ### Data Preparation
@@ -418,6 +439,7 @@ scripts/                            # Pipeline scripts
 ├── run_streaming.py                # Streaming pipeline (per-object full chain)
 ├── pipeline_common.py              # Shared utilities (config, paths, constants)
 ├── run_2d_edit.py                  # Standalone parallel 2D editing
+├── build_dataset.py                # Build training dataset JSON from pipeline outputs
 ├── pack_prerender_npz.py           # Pack source mesh + VD prerender → NPZ
 ├── prerender.py                    # Blender rendering + SLAT encoding (one-time)
 ├── tools/
@@ -429,10 +451,56 @@ scripts/                            # Pipeline scripts
 │   └── visualize_edit_pair.py      # Before/after edit comparison
 └── standalone/                     # Standalone per-phase scripts (for debugging)
 
+third_party/                        # Bundled external dependencies
+├── trellis/                        # TRELLIS 3D generation/editing pipeline
+├── interweave_Trellis.py           # Flow Inversion core algorithm
+└── encode_asset/                   # Asset encoding utilities
+
+data/                               # Input data (symlinks or actual files)
+├── slat/                           # Pre-encoded SLAT ({obj_id}_feats.pt + coords.pt)
+├── img_Enc/                        # Pre-rendered views + reference meshes
+└── {dataset}/                      # NPZ dataset (images/ + mesh/)
+
+checkpoints/                        # TRELLIS model weights
+├── TRELLIS-text-xlarge/            # Text-conditioned 3D generation
+└── TRELLIS-image-large/            # Image-conditioned 3D generation
+
 configs/
 ├── default.yaml                    # API backend (Gemini)
 ├── local_sglang.yaml              # Full local backend (SGLang + diffusers)
 └── hybrid_streaming.yaml          # Hybrid (local image edit + remote VLM)
+```
+
+---
+
+## Building Training Dataset
+
+After the pipeline completes, build a structured training dataset JSON:
+
+```bash
+# Build dataset (groups edits by object, pairs del/add as reverse operations)
+python scripts/build_dataset.py --tag v2
+
+# Also fix missing before_slat for mod/glb pairs (copies from data/slat/)
+python scripts/build_dataset.py --tag v2 --fix-slat
+```
+
+Output: `outputs/{dataset}/dataset_{tag}.json` with structure:
+```json
+{
+  "meta": {"total_objects": 200, "total_edits": 2131, "type_counts": {...}},
+  "objects": {
+    "obj_id": {
+      "slat_feats": "data/slat/obj_id_feats.pt",
+      "slat_coords": "data/slat/obj_id_coords.pt",
+      "edits": [
+        {"edit_id": "del_obj_id_000", "edit_type": "deletion", "prompt": "Remove the armrest", "reverse_id": "add_obj_id_000", ...},
+        {"edit_id": "add_obj_id_000", "edit_type": "addition", "prompt": "Add the armrest", "reverse_id": "del_obj_id_000", ...},
+        {"edit_id": "mod_obj_id_000", "edit_type": "modification", "prompt": "...", "has_slat_pair": true, ...}
+      ]
+    }
+  }
+}
 ```
 
 ---
@@ -474,3 +542,27 @@ python scripts/run_streaming.py \
 | Mask misaligned with geometry | Re-run `pack_prerender_npz.py --force` to re-align |
 | Port conflict on VLM server | Use `VLM_PORT=8002 bash scripts/tools/launch_local_vlm.sh` |
 | Multi-GPU worker collision | Each worker writes `_wN.jsonl`; no lock needed |
+| `ModuleNotFoundError: spconv` | `pip install spconv-cu121` (match your CUDA version) |
+| `ModuleNotFoundError: utils3d` | `pip install utils3d>=0.6` |
+
+---
+
+## Migration to a New Machine
+
+The project has three external symlinks that must be resolved if migrating to a machine without the original paths:
+
+| Symlink | Target | Size |
+|---------|--------|------|
+| `data/slat` | Vinedresser3D outputs | 191MB |
+| `data/img_Enc` | Vinedresser3D outputs | 6.2GB |
+| `checkpoints/*/ckpts/*.safetensors` | 3DEditFormer checkpoints | 7GB |
+
+To make the project fully self-contained:
+```bash
+# Replace symlinks with actual files
+cp -rL data/slat data/slat_real && rm data/slat && mv data/slat_real data/slat
+cp -rL data/img_Enc data/img_Enc_real && rm data/img_Enc && mv data/img_Enc_real data/img_Enc
+
+# For checkpoints, resolve all symlinks under checkpoints/
+find checkpoints/ -type l -exec bash -c 'cp --remove-destination "$(readlink -f "$0")" "$0"' {} \;
+```

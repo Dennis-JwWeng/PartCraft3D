@@ -1,0 +1,59 @@
+# PartCraft3D — full dependency list
+# Install: pip install -r requirements.txt
+#
+# Prerequisites (install separately, version must match your CUDA):
+#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+#   pip install spconv-cu121>=2.3
+
+# ============================================================
+# Core scientific
+# ============================================================
+numpy>=1.24
+scipy>=1.11
+Pillow>=10.0
+tqdm>=4.65
+pyyaml>=6.0
+
+# ============================================================
+# 3D geometry (partcraft pipeline)
+# ============================================================
+trimesh>=4.0
+plyfile>=1.0
+open3d>=0.17
+scikit-learn>=1.3
+
+# ============================================================
+# VLM / API client
+# ============================================================
+openai>=1.0
+
+# ============================================================
+# Visualization & video
+# ============================================================
+opencv-python>=4.8
+imageio>=2.31
+imageio-ffmpeg>=0.4
+matplotlib>=3.7
+
+# ============================================================
+# TRELLIS 3D editing engine (third_party/trellis)
+# ============================================================
+# torch>=2.1              # see Prerequisites above
+# torchvision>=0.16       # see Prerequisites above
+transformers>=4.36
+easydict>=1.10
+rembg>=2.0
+utils3d>=0.6
+# spconv-cu121>=2.3       # see Prerequisites above
+igraph>=0.11
+xatlas>=0.0.7
+pymeshfix>=0.16
+
+# ============================================================
+# TRELLIS optional (training / mesh export, not needed for pipeline)
+# ============================================================
+# nvdiffrast              # requires custom build: https://github.com/NVlabs/nvdiffrast
+# kaolin                  # requires custom build: https://github.com/NVIDIAGameWorks/kaolin
+# lpips>=0.1              # only for TRELLIS training
+# torch_scatter           # only for FlexiCubes examples
+# pyvista                 # only for visualization notebooks
