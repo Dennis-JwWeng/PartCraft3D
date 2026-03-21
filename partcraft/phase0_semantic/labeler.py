@@ -509,10 +509,8 @@ def _load_semantic_json(cfg: dict) -> dict[str, list[str]]:
 
 def _get_prerender_dir(cfg: dict, obj_id: str) -> str | None:
     """Get pre-rendered views directory for an object (if exists)."""
-    p25_cfg = cfg.get("phase2_5", {})
-    vd_path = p25_cfg.get("vinedresser_path",
-                          "/Node11_nvme/wjw/3D_Editing/Vinedresser3D-main")
-    render_dir = os.path.join(vd_path, "outputs", "img_Enc", obj_id)
+    project_root = Path(__file__).parents[2]
+    render_dir = str(project_root / "data" / "partobjaverse_tiny" / "img_Enc" / obj_id)
     # Check that renders actually exist
     if os.path.isdir(render_dir) and os.path.exists(os.path.join(render_dir, "000.png")):
         return render_dir

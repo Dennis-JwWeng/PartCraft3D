@@ -104,7 +104,7 @@ def main():
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--check-only", action="store_true")
-    parser.add_argument("--save-mapping", default="data/tiny_to_objaverse_mapping.json")
+    parser.add_argument("--save-mapping", default="data/partobjaverse_tiny/tiny_to_objaverse_mapping.json")
     args = parser.parse_args()
 
     # Step 1: Load mappings

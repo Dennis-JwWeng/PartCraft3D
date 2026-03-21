@@ -52,7 +52,6 @@ phase2:
 
 phase2_5:
   enabled: false
-  vinedresser_path: "/Node11_nvme/wjw/3D_Editing/Vinedresser3D-main"
   num_combinations: 1
   seed: 42
   cache_dir: "cache/phase2_5"

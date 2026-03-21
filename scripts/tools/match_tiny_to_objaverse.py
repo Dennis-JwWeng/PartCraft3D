@@ -158,7 +158,7 @@ def main():
                         help="Verify downloaded GLBs have textures")
     parser.add_argument("--limit", type=int, default=0,
                         help="Limit to first N objects (0=all)")
-    parser.add_argument("--save-mapping", default="data/tiny_to_objaverse_mapping.json",
+    parser.add_argument("--save-mapping", default="data/partobjaverse_tiny/tiny_to_objaverse_mapping.json",
                         help="Save UID mapping to JSON")
     args = parser.parse_args()
 

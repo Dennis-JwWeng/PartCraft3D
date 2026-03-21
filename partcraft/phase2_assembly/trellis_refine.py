@@ -176,7 +176,6 @@ class TrellisRefiner:
 
     def __init__(
         self,
-        vinedresser_path: str,
         cache_dir: str | Path,
         device: str = "cuda",
         image_edit_model: str = "gemini-2.5-flash-image",
@@ -184,8 +183,10 @@ class TrellisRefiner:
         image_edit_backend: str = "api",
         image_edit_base_url: str | None = None,
         debug: bool = False,
+        # Legacy: ignored, kept for config compat
+        vinedresser_path: str | None = None,
     ):
-        self.vinedresser_path = vinedresser_path
+        self._project_root = Path(__file__).parents[2]
         self.cache_dir = Path(cache_dir)
         self.device = torch.device(device)
         self.image_edit_model = image_edit_model
@@ -196,17 +197,22 @@ class TrellisRefiner:
 
         # Checkpoint directory: default to PartCraft3D/checkpoints
         if ckpt_dir is None:
-            ckpt_dir = str(Path(__file__).parents[2] / "checkpoints")
+            ckpt_dir = str(self._project_root / "checkpoints")
         self.ckpt_dir = Path(ckpt_dir)
+
+        # Data directories (SLAT, img_Enc)
+        self.slat_dir = self._project_root / "data" / "partobjaverse_tiny" / "slat"
+        self.img_enc_dir = self._project_root / "data" / "partobjaverse_tiny" / "img_Enc"
 
         self.debug = debug or os.environ.get("PARTCRAFT_DEBUG", "").lower() in ("1", "true")
 
         self.trellis_text = None
         self.trellis_img = None
 
-        # Ensure Vinedresser3D is on sys.path
-        if vinedresser_path not in sys.path:
-            sys.path.insert(0, vinedresser_path)
+        # Ensure third_party/ is on sys.path for trellis, interweave, encode_asset
+        third_party = str(self._project_root / "third_party")
+        if third_party not in sys.path:
+            sys.path.insert(0, third_party)
 
     # ---- Model loading ----
 
@@ -243,14 +249,12 @@ class TrellisRefiner:
         Requires prerender.py to have been run first (Blender 150 views +
         Open3D voxelization + DINOv2 + SLAT encoding).
 
-        SLAT files are stored in Vinedresser3D's outputs/slat/ directory.
+        SLAT files are stored in data/slat/ directory.
         """
         from trellis.modules import sparse as sp
 
-        feats_path = os.path.join(
-            self.vinedresser_path, f"outputs/slat/{obj_id}_feats.pt")
-        coords_path = os.path.join(
-            self.vinedresser_path, f"outputs/slat/{obj_id}_coords.pt")
+        feats_path = str(self.slat_dir / f"{obj_id}_feats.pt")
+        coords_path = str(self.slat_dir / f"{obj_id}_coords.pt")
 
         if not os.path.exists(feats_path) or not os.path.exists(coords_path):
             raise FileNotFoundError(
@@ -307,8 +311,7 @@ class TrellisRefiner:
         import open3d as o3d
 
         # Load VD's normalized mesh.ply for reference frame
-        vd_mesh_path = os.path.join(
-            self.vinedresser_path, f"outputs/img_Enc/{obj_id}/mesh.ply")
+        vd_mesh_path = str(self.img_enc_dir / obj_id / "mesh.ply")
         if not os.path.exists(vd_mesh_path):
             raise FileNotFoundError(
                 f"VD mesh.ply not found at {vd_mesh_path}. "
@@ -419,7 +422,7 @@ class TrellisRefiner:
         # Promote to Global: full mask + Inverse Flow preserves structure,
         # TRELLIS regenerates the whole object guided by the edit prompt.
         n_slat_total = slat.coords.shape[0]
-        if n_slat_total > 0 and edit_type in ("Modification", "Deletion"):
+        if n_slat_total > 0 and edit_type == "Modification":
             part_ratio = n_edit_slat / n_slat_total
             if part_ratio > large_part_threshold:
                 logger.warning(
@@ -442,15 +445,12 @@ class TrellisRefiner:
             mask = self._compute_editing_region(
                 slat, edit_parts, preserved_parts, pad=3)
         elif edit_type == "Deletion":
-            # Deletion: mask covers the ENTIRE edit part + small dilation
-            # into preserved for boundary smoothing.
-            # interweave_Trellis_TI "Deletion" path directly removes all
-            # voxels inside the mask (no S1 repaint), then S2 blends
-            # texture at the contact boundary for a smooth seam.
+            # Direct deletion: mask = exact edit part, no dilation needed.
+            # Voxels in mask are directly removed from SLAT; remaining
+            # voxels keep original features (including texture) unchanged.
             mask = edit_parts.clone()
-            mask = self._dilate_mask(mask, preserved_parts, slat, radius=1)
-            logger.info(f"Deletion mask: edit={int(edit_parts.sum())} voxels, "
-                        f"mask(+dilation)={int(mask.sum())} voxels")
+            logger.info(f"Deletion mask: {int(mask.sum())} voxels "
+                        f"(direct removal, no generation)")
         elif edit_type == "Addition":
             # Addition needs room for new geometry in empty space.
             mask = self._compute_editing_region(
@@ -1015,11 +1015,58 @@ class TrellisRefiner:
 
     # ---- Step 5: TRELLIS editing ----
 
-    def _deletion_part_ratio(self, slat, mask: torch.Tensor) -> float:
-        """Compute what fraction of SLAT voxels fall inside the mask."""
-        sc = slat.coords[:, 1:]
-        in_mask = mask[sc[:, 0], sc[:, 1], sc[:, 2]].sum().item()
-        return in_mask / max(sc.shape[0], 1)
+    @staticmethod
+    def direct_delete_mesh(
+        obj_record,
+        remove_part_ids: list[int],
+        output_dir: str | Path,
+    ) -> dict:
+        """Delete parts by assembling remaining GT meshes directly.
+
+        No SLAT encoding, no generation — just removes the target parts
+        from the ground-truth mesh and exports before/after PLY with
+        original vertex colors preserved.
+
+        Returns dict of exported file paths.
+        """
+        import trimesh as _trimesh
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        paths = {}
+
+        all_part_ids = [p.part_id for p in obj_record.parts]
+        keep_ids = [pid for pid in all_part_ids
+                    if pid not in set(remove_part_ids)]
+
+        n_all = len(all_part_ids)
+        n_remove = len(remove_part_ids)
+        n_keep = len(keep_ids)
+        logger.info(f"DirectDeletion (GT mesh): removing parts "
+                    f"{remove_part_ids} ({n_remove}/{n_all}), "
+                    f"keeping {n_keep} parts")
+
+        # Before: full mesh with all parts
+        before_mesh = obj_record.get_assembled_mesh(
+            all_part_ids, colored=True)
+        before_path = output_dir / "before.ply"
+        before_mesh.export(str(before_path))
+        paths['before_ply'] = str(before_path)
+
+        # After: remaining parts only
+        if keep_ids:
+            after_mesh = obj_record.get_assembled_mesh(
+                keep_ids, colored=True)
+        else:
+            logger.warning("DirectDeletion: all parts removed!")
+            after_mesh = _trimesh.Trimesh()
+        after_path = output_dir / "after.ply"
+        after_mesh.export(str(after_path))
+        paths['after_ply'] = str(after_path)
+
+        logger.info(f"Exported GT mesh pair: before={before_path}, "
+                    f"after={after_path}")
+        return paths
 
     def edit(
         self,
@@ -1042,11 +1089,10 @@ class TrellisRefiner:
             img_new: Single PIL image (legacy fallback, used if img_cond is None).
 
         For Modification/Addition: alternates text/image conditioning.
-        For Deletion: routed through "Deletion" path — S1 is skipped,
-            mask voxels are directly removed, S2 blends texture at the
-            contact boundary for a smooth seam.
         For Global: routed through TextureOnly — S1 is skipped entirely
             (original shape preserved), only S2 repaint changes texture.
+        Note: Deletion is handled by direct_delete_mesh() using GT meshes,
+            not by this method.
         """
         from interweave_Trellis import interweave_Trellis_TI
         from trellis.modules import sparse as sp
@@ -1054,19 +1100,10 @@ class TrellisRefiner:
         edit_type = prompts.get('edit_type', 'Modification')
 
         # --- Route edit types ---
-        is_deletion = (edit_type == "Deletion")
         is_global = (edit_type == "Global")
 
         if combinations is None:
-            if is_deletion:
-                # Deletion: skip S1, directly remove voxels, S2 blends at seam.
-                # cfg controls how much S2 departs from original at boundary.
-                combinations = [
-                    {"s1_pos_cond": "new_s1_cpl", "s1_neg_cond": "ori_s1_cpl",
-                     "s2_pos_cond": "new_s2_cpl", "s2_neg_cond": "ori_s2_cpl",
-                     "cnt": 1, "cfg_strength": 3.0},
-                ]
-            elif is_global:
+            if is_global:
                 combinations = [
                     {"s1_pos_cond": "ori_s1_cpl", "s1_neg_cond": "ori_s1_cpl",
                      "s2_pos_cond": "new_s2_cpl", "s2_neg_cond": "ori_s2_cpl",
@@ -1080,12 +1117,8 @@ class TrellisRefiner:
                      "cnt": 1, "cfg_strength": 7.5},
                 ]
 
-        # Deletion → "Deletion": skip S1 repaint, directly remove mask voxels,
-        #   S2 blends texture at the contact boundary.
         # Global → "TextureOnly": skip S1, keep original coords, S2 only.
-        if is_deletion:
-            effective_edit_type = "Deletion"
-        elif is_global:
+        if is_global:
             effective_edit_type = "TextureOnly"
         else:
             effective_edit_type = edit_type
@@ -1110,14 +1143,6 @@ class TrellisRefiner:
             # blank white image produces neutral features.
             logger.info("No reference image — using blank white image")
             effective_img = Image.new("RGB", (518, 518), (255, 255, 255))
-
-        if is_deletion:
-            sc = slat.coords[:, 1:]
-            in_mask = mask[sc[:, 0], sc[:, 1], sc[:, 2]]
-            n_total = sc.shape[0]
-            n_in_mask = int(in_mask.sum())
-            logger.info(f"Deletion: removing {n_in_mask}/{n_total} SLAT voxels "
-                        f"({n_in_mask/n_total*100:.1f}%)")
 
         try:
             slats_edited = []
@@ -1198,23 +1223,36 @@ class TrellisRefiner:
         # ---- Before: reuse or export ----
         if shared_before_dir and Path(shared_before_dir).exists():
             src = Path(shared_before_dir)
-            # Symlink before.ply (relative path so it works across machines)
-            before_ply = output_dir / "before.ply"
-            if not before_ply.exists():
-                src_ply = src / "before.ply"
-                if src_ply.exists():
-                    rel = os.path.relpath(src_ply, output_dir)
-                    before_ply.symlink_to(rel)
-            paths['before_ply'] = str(before_ply)
+            src_has_slat = (src / "before_slat").exists()
 
-            # Symlink before_slat directory (relative path)
-            before_slat = output_dir / "before_slat"
-            if not before_slat.exists():
-                src_slat = src / "before_slat"
-                if src_slat.exists():
-                    rel = os.path.relpath(src_slat, output_dir)
+            if src_has_slat:
+                # Source has GS before — symlink both PLY and SLAT
+                before_ply = output_dir / "before.ply"
+                if not before_ply.exists():
+                    src_ply = src / "before.ply"
+                    if src_ply.exists():
+                        rel = os.path.relpath(src_ply, output_dir)
+                        before_ply.symlink_to(rel)
+                paths['before_ply'] = str(before_ply)
+
+                before_slat = output_dir / "before_slat"
+                if not before_slat.exists():
+                    rel = os.path.relpath(src / "before_slat", output_dir)
                     before_slat.symlink_to(rel)
-            paths['before_slat'] = str(before_slat)
+                paths['before_slat'] = str(before_slat)
+            else:
+                # Source has no SLAT (e.g. deletion used direct mesh
+                # removal).  Export GS before PLY + SLAT from scratch.
+                gaussian = self.decode_to_gaussian(slat_before)
+                ply_path = output_dir / "before.ply"
+                gaussian.save_ply(str(ply_path))
+                paths['before_ply'] = str(ply_path)
+
+                before_slat = output_dir / "before_slat"
+                before_slat.mkdir(parents=True, exist_ok=True)
+                torch.save(slat_before.feats, before_slat / "feats.pt")
+                torch.save(slat_before.coords, before_slat / "coords.pt")
+                paths['before_slat'] = str(before_slat)
         else:
             # First edit for this object: export before
             gaussian = self.decode_to_gaussian(slat_before)

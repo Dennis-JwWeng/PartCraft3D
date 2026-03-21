@@ -414,33 +414,26 @@ def run_vlm_filter(
         base_url=p0.get("vlm_base_url", ""),
         api_key=api_key,
     )
-    vlm_model = p0.get("vlm_model", "gemini-2.5-flash")
+    vlm_model = p0.get("vlm_model", "gemini-3.1-flash-lite-preview")
 
     # Load TRELLIS decoder
     logger.info("Loading TRELLIS decoder for rendering...")
     p25 = cfg.get("phase2_5", {})
-    vinedresser_path = p25.get(
-        "vinedresser_path", "/Node11_nvme/wjw/3D_Editing/Vinedresser3D-main")
 
     import sys
-    sys.path.insert(0, vinedresser_path)
+    project_root = Path(__file__).parents[2]
+    third_party = str(project_root / "third_party")
+    if third_party not in sys.path:
+        sys.path.insert(0, third_party)
     from trellis.pipelines import TrellisImageTo3DPipeline
 
-    # Resolve checkpoint path: try project-local first, then vinedresser
+    # Resolve checkpoint path
     ckpt_rel = p25.get("trellis_image_ckpt", "checkpoints/TRELLIS-image-large")
-    project_root = Path(__file__).parents[2]
-    candidates = [
-        project_root / ckpt_rel,
-        Path(vinedresser_path) / ckpt_rel,
-    ]
-    ckpt = None
-    for c in candidates:
-        if (c / "pipeline.json").exists():
-            ckpt = str(c)
-            break
-    if ckpt is None:
+    ckpt_path = project_root / ckpt_rel
+    if not (ckpt_path / "pipeline.json").exists():
         raise FileNotFoundError(
-            f"TRELLIS checkpoint not found. Tried: {[str(c) for c in candidates]}")
+            f"TRELLIS checkpoint not found at {ckpt_path}")
+    ckpt = str(ckpt_path)
 
     logger.info(f"TRELLIS checkpoint: {ckpt}")
     pipeline = TrellisImageTo3DPipeline.from_pretrained(ckpt)

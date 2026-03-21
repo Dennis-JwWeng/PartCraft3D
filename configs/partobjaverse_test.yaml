@@ -6,11 +6,11 @@ data:
   image_npz_dir: "data/partobjaverse_test/images"
   mesh_npz_dir: "data/partobjaverse_test/mesh"
   shards: ["00"]
-  output_dir: "outputs/partobjaverse_test"
+  output_dir: "outputs/partobjaverse_tiny"
 
 phase0:
   vlm_backend: "api"
-  vlm_model: "gemini-2.5-flash"
+  vlm_model: "gemini-3.1-flash-lite-preview"
   vlm_base_url: "https://llm-api.mmchat.xyz/v1"
   vlm_api_key: ""
   views_for_labeling: [0, 10, 20, 30]
@@ -38,7 +38,6 @@ phase2:
 
 phase2_5:
   enabled: false
-  vinedresser_path: "/Node11_nvme/wjw/3D_Editing/Vinedresser3D-main"
   trellis_text_ckpt: "checkpoints/TRELLIS-text-xlarge"
   trellis_image_ckpt: "checkpoints/TRELLIS-image-large"
   num_combinations: 2

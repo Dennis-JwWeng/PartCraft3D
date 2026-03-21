@@ -878,7 +878,7 @@ def enrich_semantic_labels(
 
     # Setup VLM client
     p0 = cfg.get("phase0", {})
-    model = p0.get("vlm_model", "gemini-2.5-flash")
+    model = p0.get("vlm_model", "gemini-3.1-flash-lite-preview")
     base_url = p0.get("vlm_base_url", "")
     api_key = p0.get("vlm_api_key", "")
     if not api_key:

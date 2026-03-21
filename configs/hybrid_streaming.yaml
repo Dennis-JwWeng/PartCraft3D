@@ -8,9 +8,9 @@
 #        conda activate qwen_test
 #        CUDA_VISIBLE_DEVICES=2 python scripts/tools/image_edit_server.py  # port 8001
 #   2. Pipeline (streaming mode):
-#        conda activate vinedresser3d
-#        ATTN_BACKEND=xformers python scripts/run_pipeline.py \
-#            --config configs/hybrid_streaming.yaml --streaming --tag v1
+#        conda activate partcraft3d
+#        ATTN_BACKEND=xformers python scripts/run_streaming.py \
+#            --config configs/hybrid_streaming.yaml --tag v1
 
 data:
   image_npz_dir: "data/partobjaverse_tiny/images"
@@ -21,7 +21,7 @@ data:
 # ── Phase 0: Semantic labeling (API) ─────────────────────────────────────
 phase0:
   vlm_backend: "api"
-  vlm_model: "gemini-2.5-flash"
+  vlm_model: "gemini-3.1-flash-lite-preview"
   vlm_base_url: "https://llm-api.mmchat.xyz/v1"
   vlm_api_key: "sk-live-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJNZXRhQ2hhdCIsInN1YiI6IjY5YWViNjBjMTk2MzA4YzNlNDJiZTlhYyIsImNsaWVudF9pZCI6IjdmZGFkZDY1MDM5MGU0ZDZiZTg3OGQ0NzFiNGFkMjY5IiwiaWF0IjoxNzczMDYwODE1fQ.gohorU2KohC_lBq2DzGG9S4oGnIVbhB9R-g4nIVlwKA"
   views_for_labeling: [0, 10, 20, 30]
@@ -55,7 +55,6 @@ pipeline:
 # ── Phase 2.5: TRELLIS editing (local image edit, inline in streaming) ───
 phase2_5:
   enabled: true
-  vinedresser_path: "/Node11_nvme/wjw/3D_Editing/Vinedresser3D-main"
   trellis_text_ckpt: "checkpoints/TRELLIS-text-xlarge"
   trellis_image_ckpt: "checkpoints/TRELLIS-image-large"
   num_combinations: 2

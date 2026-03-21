@@ -36,10 +36,6 @@ def run_phase2_5(cfg, dataset, logger):
         logger.info("Phase 2.5 disabled in config (set phase2_5.enabled: true to enable)")
         return
 
-    vinedresser_path = p25_cfg.get(
-        "vinedresser_path", "/Node11_nvme/wjw/3D_Editing/Vinedresser3D-main")
-    sys.path.insert(0, vinedresser_path)
-
     from partcraft.phase2_assembly.trellis_refine import TrellisRefiner
     from partcraft.phase1_planning.planner import EditSpec
 
@@ -95,9 +91,6 @@ def run_phase2_5(cfg, dataset, logger):
     refiner = TrellisRefiner(
         device="cuda",
         cache_dir=str(cache_dir),
-        vinedresser_path=vinedresser_path,
-        trellis_text_ckpt=p25_cfg.get("trellis_text_ckpt"),
-        trellis_image_ckpt=p25_cfg.get("trellis_image_ckpt"),
     )
     refiner.load_models()
 

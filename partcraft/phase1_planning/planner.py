@@ -67,6 +67,18 @@ def _find_edit_by_type(edits: list[dict], edit_type: str) -> dict | None:
     return None
 
 
+def _make_edit_id(prefix: str, obj_id: str, seq: int) -> str:
+    """Create a globally-unique, human-readable edit ID.
+
+    Format: {prefix}_{obj_id}_{seq:03d}
+    Examples: del_abc12345_000, add_abc12345_001, glb_abc12345_000
+
+    Full obj_id is embedded so you can directly trace any edit back to its
+    source object without a lookup table.
+    """
+    return f"{prefix}_{obj_id}_{seq:03d}"
+
+
 def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
     """Generate all edit specs: deletion → addition → modification → global.
 
@@ -88,7 +100,6 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
     add_specs = []
     mod_specs = []
     glb_specs = []
-    del_counter = add_counter = mod_counter = glb_counter = 0
 
     # Build set of part IDs covered by group_edits (per object),
     # so per-part generation skips only those parts — not the whole object.
@@ -111,6 +122,9 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
         if len(entries) < min_parts:
             continue
 
+        # Per-object counters for unique edit IDs
+        obj_del = obj_add = obj_mod = 0
+
         for entry in entries:
             # Skip parts already covered by group edits
             if entry.part_id in skip_pids:
@@ -130,8 +144,12 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                 del_edit = _find_edit_by_type(entry.edits, "deletion")
                 add_edit = _find_edit_by_type(entry.edits, "addition")
 
+                # Skip ungrouped parts with no edits (no prompt)
+                if del_edit is None and add_edit is None:
+                    continue
+
                 # --- Deletion ---
-                del_id = f"del_{del_counter:06d}"
+                del_id = _make_edit_id("del", obj_id, obj_del)
                 del_specs.append(EditSpec(
                     edit_id=del_id,
                     edit_type="deletion",
@@ -146,13 +164,11 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                     after_desc=del_edit.get("after_desc", "") if del_edit else "",
                     best_view=obj_best_view,
                 ))
-                del_counter += 1
+                obj_del += 1
 
                 # --- Addition (reverse of deletion) ---
-                # Uses deletion's output SLAT as starting point,
-                # original rendering as 2D condition to add the part back.
                 add_specs.append(EditSpec(
-                    edit_id=f"add_{add_counter:06d}",
+                    edit_id=_make_edit_id("add", obj_id, obj_add),
                     edit_type="addition",
                     obj_id=obj_id,
                     shard=entry.shard,
@@ -163,10 +179,10 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                     base_part_ids=keep_pids,
                     source_del_id=del_id,
                     edit_prompt=add_edit.get("prompt", "") if add_edit else "",
-                    after_desc=obj_desc,  # after adding back = original
+                    after_desc=obj_desc,
                     best_view=obj_best_view,
                 ))
-                add_counter += 1
+                obj_add += 1
 
             # --- Modifications (all parts, including core) ---
             if entry.cluster_size > 0 and entry.cluster_size < min_cluster:
@@ -183,7 +199,7 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
             keep_pids_mod = [p for p in all_pids if p != entry.part_id]
             for mod_edit in mod_edits:
                 mod_specs.append(EditSpec(
-                    edit_id=f"mod_{mod_counter:06d}",
+                    edit_id=_make_edit_id("mod", obj_id, obj_mod),
                     edit_type="modification",
                     obj_id=obj_id,
                     shard=entry.shard,
@@ -199,7 +215,7 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                     mod_type=mod_edit.get("mod_type", "style"),
                     best_view=obj_best_view,
                 ))
-                mod_counter += 1
+                obj_mod += 1
 
         # --- Group deletion/addition: same-category parts ---
         # Skip auto-grouping for objects that already have enriched group_edits
@@ -221,7 +237,7 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                 continue
 
             cat_label = cat.replace("_", " ")
-            gdel_id = f"gdel_{del_counter:06d}"
+            gdel_id = _make_edit_id("gdel", obj_id, obj_del)
             del_specs.append(EditSpec(
                 edit_id=gdel_id,
                 edit_type="deletion",
@@ -234,10 +250,10 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                 keep_part_ids=keep_ids,
                 edit_prompt=f"Remove all {cat_label}s",
             ))
-            del_counter += 1
+            obj_del += 1
 
             add_specs.append(EditSpec(
-                edit_id=f"gadd_{add_counter:06d}",
+                edit_id=_make_edit_id("gadd", obj_id, obj_add),
                 edit_type="addition",
                 obj_id=obj_id,
                 shard=entries[0].shard,
@@ -250,7 +266,7 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                 edit_prompt=f"Add {cat_label}s",
                 after_desc=obj_desc,
             ))
-            add_counter += 1
+            obj_add += 1
 
     # --- Group edits (from orthogonal 4-view enrichment) ---
     for obj_id, group_edits in catalog.object_group_edits.items():
@@ -262,6 +278,11 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
         obj_desc = catalog.object_descs.get(obj_id, "")
         all_pids = [e.part_id for e in entries]
         shard = entries[0].shard if entries else "00"
+
+        # Count existing specs for this object to continue numbering
+        obj_del = sum(1 for s in del_specs if s.obj_id == obj_id)
+        obj_add = sum(1 for s in add_specs if s.obj_id == obj_id)
+        obj_mod = sum(1 for s in mod_specs if s.obj_id == obj_id)
 
         pid_to_entry = {e.part_id: e for e in entries}
         for grp in group_edits:
@@ -278,7 +299,7 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
             for edit in grp.get("edits", []):
                 etype = edit.get("type")
                 if etype == "deletion":
-                    grp_del_id = f"del_{del_counter:06d}"
+                    grp_del_id = _make_edit_id("del", obj_id, obj_del)
                     del_specs.append(EditSpec(
                         edit_id=grp_del_id,
                         edit_type="deletion",
@@ -293,10 +314,10 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                         after_desc=edit.get("after_desc", ""),
                         best_view=grp_best_view,
                     ))
-                    del_counter += 1
+                    obj_del += 1
                 elif etype == "addition" and grp_del_id is not None:
                     add_specs.append(EditSpec(
-                        edit_id=f"add_{add_counter:06d}",
+                        edit_id=_make_edit_id("add", obj_id, obj_add),
                         edit_type="addition",
                         obj_id=obj_id,
                         shard=shard,
@@ -310,10 +331,10 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                         after_desc=obj_desc,
                         best_view=grp_best_view,
                     ))
-                    add_counter += 1
+                    obj_add += 1
                 elif etype == "modification":
                     mod_specs.append(EditSpec(
-                        edit_id=f"mod_{mod_counter:06d}",
+                        edit_id=_make_edit_id("mod", obj_id, obj_mod),
                         edit_type="modification",
                         obj_id=obj_id,
                         shard=shard,
@@ -330,7 +351,7 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                         mod_type=edit.get("mod_type", "swap"),
                         best_view=grp_best_view,
                     ))
-                    mod_counter += 1
+                    obj_mod += 1
 
     # --- Global edits (whole-object style/theme changes) ---
     for obj_id, indices in catalog.by_object.items():
@@ -345,12 +366,13 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
         ortho_views = catalog.object_ortho_views.get(obj_id, [])
         global_best_view = ortho_views[0] if ortho_views else 0
 
+        obj_glb = 0
         for ge in catalog.object_global_edits.get(obj_id, [])[:max_global]:
             prompt = ge.get("prompt", "")
             if not prompt:
                 continue
             glb_specs.append(EditSpec(
-                edit_id=f"glb_{glb_counter:06d}",
+                edit_id=_make_edit_id("glb", obj_id, obj_glb),
                 edit_type="global",
                 obj_id=obj_id,
                 shard=shard,
@@ -360,7 +382,7 @@ def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
                 after_desc=ge.get("after_desc", ""),
                 best_view=global_best_view,
             ))
-            glb_counter += 1
+            obj_glb += 1
 
     # Order: deletion → addition → modification → global
     all_specs = del_specs + add_specs + mod_specs + glb_specs
@@ -378,14 +400,14 @@ def plan_edits_for_record(record: dict, cfg: dict,
         record: one line from semantic_labels.jsonl (dict with obj_id, parts,
                 group_edits, global_edits, etc.)
         cfg: pipeline config
-        counters: mutable dict with keys del/add/mod/glb for global ID counters.
-                  If None, starts from 0.
+        counters: DEPRECATED, ignored. Edit IDs are per-object unique via
+                  obj_id hash — no global counter needed.
 
     Returns:
         List of EditSpec for this single object.
     """
-    if counters is None:
-        counters = {"del": 0, "add": 0, "mod": 0, "glb": 0}
+    # Per-object counters (reset per object, namespaced by obj_id hash)
+    _counters = {"del": 0, "add": 0, "mod": 0, "glb": 0}
 
     min_parts = cfg["phase1"].get("min_parts_per_object", 2)
     max_global = cfg["phase1"].get("max_global_edits_per_object", 3)
@@ -435,7 +457,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
         for edit in grp.get("edits", []):
             etype = edit.get("type")
             if etype == "deletion":
-                grp_del_id = f"del_{counters['del']:06d}"
+                grp_del_id = _make_edit_id("del", obj_id, _counters["del"])
                 specs.append(EditSpec(
                     edit_id=grp_del_id,
                     edit_type="deletion",
@@ -447,10 +469,10 @@ def plan_edits_for_record(record: dict, cfg: dict,
                     after_desc=edit.get("after_desc", ""),
                     best_view=grp_best_view,
                 ))
-                counters["del"] += 1
+                _counters["del"] += 1
             elif etype == "addition" and grp_del_id is not None:
                 specs.append(EditSpec(
-                    edit_id=f"add_{counters['add']:06d}",
+                    edit_id=_make_edit_id("add", obj_id, _counters["add"]),
                     edit_type="addition",
                     obj_id=obj_id, shard=shard,
                     object_desc=obj_desc,
@@ -462,10 +484,10 @@ def plan_edits_for_record(record: dict, cfg: dict,
                     after_desc=obj_desc,
                     best_view=grp_best_view,
                 ))
-                counters["add"] += 1
+                _counters["add"] += 1
             elif etype == "modification":
                 specs.append(EditSpec(
-                    edit_id=f"mod_{counters['mod']:06d}",
+                    edit_id=_make_edit_id("mod", obj_id, _counters["mod"]),
                     edit_type="modification",
                     obj_id=obj_id, shard=shard,
                     object_desc=obj_desc, before_desc=obj_desc,
@@ -479,7 +501,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
                     mod_type=edit.get("mod_type", "swap"),
                     best_view=grp_best_view,
                 ))
-                counters["mod"] += 1
+                _counters["mod"] += 1
 
     # --- Per-part edits (deletion / addition / modification) ---
     for part in parts:
@@ -503,7 +525,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
             del_edit = _find_edit_by_type(part_edits, "deletion")
             add_edit = _find_edit_by_type(part_edits, "addition")
 
-            del_id = f"del_{counters['del']:06d}"
+            del_id = _make_edit_id("del", obj_id, _counters["del"])
             specs.append(EditSpec(
                 edit_id=del_id,
                 edit_type="deletion",
@@ -515,10 +537,10 @@ def plan_edits_for_record(record: dict, cfg: dict,
                 after_desc=del_edit.get("after_desc", "") if del_edit else "",
                 best_view=obj_best_view,
             ))
-            counters["del"] += 1
+            _counters["del"] += 1
 
             specs.append(EditSpec(
-                edit_id=f"add_{counters['add']:06d}",
+                edit_id=_make_edit_id("add", obj_id, _counters["add"]),
                 edit_type="addition",
                 obj_id=obj_id, shard=shard,
                 object_desc=obj_desc,
@@ -530,7 +552,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
                 after_desc=obj_desc,
                 best_view=obj_best_view,
             ))
-            counters["add"] += 1
+            _counters["add"] += 1
 
         # All parts (including core): swap modifications
         mod_edits = [e for e in part_edits
@@ -539,7 +561,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
                      and e.get("prompt")]
         for mod_edit in mod_edits:
             specs.append(EditSpec(
-                edit_id=f"mod_{counters['mod']:06d}",
+                edit_id=_make_edit_id("mod", obj_id, _counters["mod"]),
                 edit_type="modification",
                 obj_id=obj_id, shard=shard,
                 object_desc=obj_desc, before_desc=obj_desc,
@@ -552,7 +574,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
                 mod_type=mod_edit.get("mod_type", "swap"),
                 best_view=obj_best_view,
             ))
-            counters["mod"] += 1
+            _counters["mod"] += 1
 
     # --- Global edits ---
     for ge in record.get("global_edits", [])[:max_global]:
@@ -560,7 +582,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
         if not prompt:
             continue
         specs.append(EditSpec(
-            edit_id=f"glb_{counters['glb']:06d}",
+            edit_id=_make_edit_id("glb", obj_id, _counters["glb"]),
             edit_type="global",
             obj_id=obj_id, shard=shard,
             object_desc=obj_desc, before_desc=obj_desc,
@@ -568,7 +590,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
             after_desc=ge.get("after_desc", ""),
             best_view=obj_best_view,
         ))
-        counters["glb"] += 1
+        _counters["glb"] += 1
 
     return specs
 
