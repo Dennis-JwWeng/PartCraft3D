@@ -473,7 +473,7 @@ def build_part_mask_on_slat(
     edit_spec: dict,
     ori_coords: torch.Tensor,
     data_root: str = "data/partobjaverse_tiny",
-    vd_mesh_dir: str = "data/img_Enc",
+    vd_mesh_dir: str = "data/partobjaverse_tiny/img_Enc",
     pad_voxels: int = 2,
 ) -> torch.Tensor:
     """Build a boolean mask on SLAT voxels using GT part meshes.
@@ -829,10 +829,10 @@ def main():
     parser.add_argument("--output-tag", type=str, default=None,
                         help="Separate output tag (default: same as --tag)")
     parser.add_argument("--vd-slat-dir", type=str,
-                        default="data/slat",
+                        default="data/partobjaverse_tiny/slat",
                         help="Dir with pre-encoded SLAT (.pt files)")
     parser.add_argument("--vd-img-dir", type=str,
-                        default="data/img_Enc",
+                        default="data/partobjaverse_tiny/img_Enc",
                         help="Dir with pre-rendered views (150 views per object)")
     args = parser.parse_args()
 

@@ -98,12 +98,13 @@ def main():
 
     logger.info(f"Encoding {len(obj_ids)} objects into SLAT")
 
-    # encode_asset scripts use relative paths like data/img_Enc/, data/slat/
+    # encode_asset scripts use relative paths like outputs/img_Enc/, outputs/slat/
+    # These resolve via third_party/outputs/ symlinks
     project_root = Path(__file__).resolve().parents[2]
     third_party = str(project_root / "third_party")
     if third_party not in sys.path:
         sys.path.insert(0, third_party)
-    os.chdir(str(project_root))
+    os.chdir(third_party)
 
     from encode_asset.render_img_for_enc import renderImg_voxelize
     from encode_asset.encode_into_SLAT import encode_into_SLAT
@@ -128,8 +129,8 @@ def main():
 
                 # 4. Copy SLAT to our cache
                 import shutil
-                src_feats = Path(f"data/slat/{oid}_feats.pt")
-                src_coords = Path(f"data/slat/{oid}_coords.pt")
+                src_feats = Path(f"outputs/slat/{oid}_feats.pt")
+                src_coords = Path(f"outputs/slat/{oid}_coords.pt")
                 if src_feats.exists() and src_coords.exists():
                     shutil.copy2(str(src_feats), str(slat_cache_dir / f"{oid}_feats.pt"))
                     shutil.copy2(str(src_coords), str(slat_cache_dir / f"{oid}_coords.pt"))

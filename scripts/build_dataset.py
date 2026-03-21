@@ -257,7 +257,7 @@ def main():
     output_dir = PROJECT_ROOT / args.output_dir
     tag_suffix = f"_{args.tag}" if args.tag else ""
     mesh_pairs_dir = output_dir / f"mesh_pairs{tag_suffix}"
-    slat_dir = PROJECT_ROOT / "data" / "slat"
+    slat_dir = PROJECT_ROOT / "data" / "partobjaverse_tiny" / "slat"
 
     # Step 1: Fix missing before_slat
     if args.fix_slat:

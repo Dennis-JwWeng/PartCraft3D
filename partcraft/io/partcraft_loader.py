@@ -472,10 +472,10 @@ class PartCraftDataset:
         limit: int = 0,
         force: bool = False,
     ) -> dict:
-        """Pack Vinedresser3D prerender outputs into PartCraft NPZ format.
+        """Pack prerender outputs into PartCraft NPZ format.
 
         Args:
-            img_enc_base: Path to Vinedresser3D outputs/img_Enc/
+            img_enc_base: Path to data/partobjaverse_tiny/img_Enc/
             source_dir:   Path to source/ (semantic.json, instance_gt.zip, mesh.zip)
             render_out_dir: Output dir for render NPZs (e.g., data/.../images)
             mesh_out_dir:   Output dir for mesh NPZs (e.g., data/.../mesh)

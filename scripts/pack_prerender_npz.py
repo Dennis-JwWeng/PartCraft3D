@@ -28,7 +28,7 @@ def main():
 
     cfg = load_config(args.config)
     project_root = Path(__file__).resolve().parents[1]
-    img_enc_base = project_root / "data" / "img_Enc"
+    img_enc_base = project_root / "data" / "partobjaverse_tiny" / "img_Enc"
 
     data_dir = Path(cfg["data"].get("data_dir", "data/partobjaverse_tiny"))
     if not data_dir.exists():

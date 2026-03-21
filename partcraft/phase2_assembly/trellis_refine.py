@@ -201,8 +201,8 @@ class TrellisRefiner:
         self.ckpt_dir = Path(ckpt_dir)
 
         # Data directories (SLAT, img_Enc)
-        self.slat_dir = self._project_root / "data" / "slat"
-        self.img_enc_dir = self._project_root / "data" / "img_Enc"
+        self.slat_dir = self._project_root / "data" / "partobjaverse_tiny" / "slat"
+        self.img_enc_dir = self._project_root / "data" / "partobjaverse_tiny" / "img_Enc"
 
         self.debug = debug or os.environ.get("PARTCRAFT_DEBUG", "").lower() in ("1", "true")
 

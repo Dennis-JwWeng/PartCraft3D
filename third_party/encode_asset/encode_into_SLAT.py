@@ -39,7 +39,7 @@ def encode_into_SLAT(name):
 
     num_views = 150
 
-    indices = load_ply_to_numpy(f"data/img_Enc/{name}/voxels.ply")
+    indices = load_ply_to_numpy(f"outputs/img_Enc/{name}/voxels.ply")
     indices = torch.from_numpy((indices+0.5)*64).long().cuda()
     positions = (indices.to(torch.float32)/64.0 - 0.5)
 
@@ -54,10 +54,10 @@ def encode_into_SLAT(name):
     patchtokens_lst = []
     uv_lst = []
     fov = math.radians(40)
-    views = json.load(open(f"data/img_Enc/{name}/transforms.json"))["frames"]
+    views = json.load(open(f"outputs/img_Enc/{name}/transforms.json"))["frames"]
     for i in range(num_views):
 
-        img = Image.open(f"data/img_Enc/{name}/{i:03d}.png")
+        img = Image.open(f"outputs/img_Enc/{name}/{i:03d}.png")
         img = img.resize((518, 518), Image.Resampling.LANCZOS)
         img = np.array(img).astype(np.float32) / 255
         if img.shape[2] == 4:
@@ -103,8 +103,8 @@ def encode_into_SLAT(name):
     latent = encoder(aggregated_features, sample_posterior=False)
     assert torch.isfinite(latent.feats).all(), "Non-finite latent"
 
-    torch.save(latent.feats, f"data/slat/{name}_feats.pt")
-    torch.save(latent.coords, f"data/slat/{name}_coords.pt")
+    torch.save(latent.feats, f"outputs/slat/{name}_feats.pt")
+    torch.save(latent.coords, f"outputs/slat/{name}_coords.pt")
 
     print(f"finish encoding {name}")
     

@@ -4,13 +4,13 @@
 This decouples rendering from editing, so Phase 0 can use high-quality views
 and Phase 2.5 can skip inline rendering entirely.
 
-Outputs per object (in data/):
-  data/img_Enc/{obj_id}/
+Outputs per object:
+  data/partobjaverse_tiny/img_Enc/{obj_id}/
     ├── 000.png .. 149.png   # 150 Blender-rendered views (512x512)
     ├── mesh.ply             # Normalized mesh in [-0.5, 0.5]^3
     ├── voxels.ply           # Open3D voxelized mesh (64^3)
     └── transforms.json      # Camera parameters per view
-  data/slat/
+  data/partobjaverse_tiny/slat/
     ├── {obj_id}_feats.pt    # SLAT features
     └── {obj_id}_coords.pt   # SLAT coordinates
 
@@ -47,7 +47,7 @@ from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _THIRD_PARTY = _PROJECT_ROOT / "third_party"
-_DATA_DIR = _PROJECT_ROOT / "data"
+_DATA_DIR = _PROJECT_ROOT / "data" / "partobjaverse_tiny"
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_THIRD_PARTY))

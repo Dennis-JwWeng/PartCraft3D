@@ -60,9 +60,9 @@ def voxelize(file, name, output_dir):
 def renderImg_voxelize(input_file):
     install_blender()
     name = os.path.splitext(os.path.basename(input_file))[0]
-    os.makedirs(f"data/img_Enc", exist_ok=True)
-    render(input_file, name, f"data/img_Enc/")
-    voxelize(f"data/img_Enc/{name}/mesh.ply", name, f"data/img_Enc/{name}")
+    os.makedirs(f"outputs/img_Enc", exist_ok=True)
+    render(input_file, name, f"outputs/img_Enc/")
+    voxelize(f"outputs/img_Enc/{name}/mesh.ply", name, f"outputs/img_Enc/{name}")
 
 if __name__ == '__main__':
 
