@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Pack PartVerse prerender outputs into PartCraft NPZ format.
+
+Reads from:
+    data/partverse/normalized_glbs/{uuid}.glb     — source mesh
+    data/partverse/anno_infos/{uuid}/…_face2label.json — per-face part labels
+    data/partverse/img_Enc/{uuid}/                — rendered views + transforms
+    data/partverse/source/text_captions.json      — part label names (optional)
+
+Writes:
+    data/partverse/images/{shard}/{uuid}.npz      — render NPZ (pipeline input)
+    data/partverse/mesh/{shard}/{uuid}.npz        — mesh NPZ (pipeline input)
+
+Shard support mirrors prerender.py: --shard 00 --num-shards 10 processes
+~1203 objects of the 12030 total.
+
+Usage:
+    # Pack shard 00 of 10
+    python scripts/datasets/partverse/pack_npz.py --shard 00 --num-shards 10
+
+    # Pack shard 01, skip already-packed objects
+    python scripts/datasets/partverse/pack_npz.py --shard 01 --num-shards 10
+
+    # Test: first 5 objects only
+    python scripts/datasets/partverse/pack_npz.py --limit 5
+
+    # Re-pack everything (overwrite)
+    python scripts/datasets/partverse/pack_npz.py --force
+"""
+
+import argparse
+import io
+import json
+import logging
+import sys
+from pathlib import Path
+
+import numpy as np
+
+_PROJECT_ROOT  = Path(__file__).resolve().parents[3]
+_PARTVERSE_DIR = _PROJECT_ROOT / "data" / "partverse"
+_ANNO_DIR      = _PARTVERSE_DIR / "source" / "anno_infos"
+_CAPTIONS_PATH = _PARTVERSE_DIR / "source" / "text_captions.json"
+_IMG_ENC_DIR   = _PARTVERSE_DIR / "img_Enc"
+_IMAGES_DIR    = _PARTVERSE_DIR / "images"
+_MESH_DIR      = _PARTVERSE_DIR / "mesh"
+
+sys.path.insert(0, str(_PROJECT_ROOT))
+
+from scripts.datasets.prerender_common import select_shard
+from partcraft.io.partcraft_loader import (
+    _align_source_to_vd,
+    _split_mesh,
+    _to_ply,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _load_face2label(obj_id: str) -> np.ndarray | None:
+    """Load face2label.json and return per-face part-id array."""
+    path = _ANNO_DIR / obj_id / f"{obj_id}_face2label.json"
+    if not path.exists():
+        return None
+    with open(path) as f:
+        d = json.load(f)
+    if not d:
+        return None
+    max_face = max(int(k) for k in d)
+    arr = np.zeros(max_face + 1, dtype=np.int32)
+    for k, v in d.items():
+        arr[int(k)] = int(v)
+    return arr
+
+
+def _load_source_mesh(obj_id: str):
+    """Load segmented GLB from anno_infos/.
+
+    face2label.json indices correspond to the segmented.glb faces (not the
+    normalized_glb, which has a different tesselation). Both share identical
+    bounding boxes, so _align_source_to_vd (using transforms.json offset/scale
+    recorded during rendering of normalized_glb) applies equally well here.
+    """
+    try:
+        import trimesh
+    except ImportError:
+        raise RuntimeError("trimesh is required — pip install trimesh")
+
+    seg_path = _ANNO_DIR / obj_id / f"{obj_id}_segmented.glb"
+    if not seg_path.exists():
+        return None
+    mesh = trimesh.load(str(seg_path), force="mesh")
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.to_geometry()
+    return mesh
+
+
+def _pack_one(obj_id: str, img_enc_dir: Path,
+               render_out: Path, mesh_out: Path,
+               captions: dict) -> dict:
+    """Pack one PartVerse object into render + mesh NPZ."""
+    transforms_path = img_enc_dir / "transforms.json"
+    if not transforms_path.exists():
+        return {"status": "skip", "reason": "no transforms.json"}
+
+    with open(transforms_path) as f:
+        transforms = json.load(f)
+    frames = transforms["frames"]
+
+    # ---- Collect rendered PNGs ----
+    render_data: dict[str, np.ndarray] = {}
+    found = 0
+    for i in range(len(frames)):
+        png = img_enc_dir / f"{i:03d}.png"
+        if not png.exists():
+            continue
+        with open(png, "rb") as f:
+            render_data[f"{i:03d}.png"] = np.frombuffer(f.read(), dtype=np.uint8)
+        found += 1
+
+    if found == 0:
+        return {"status": "skip", "reason": "no PNGs"}
+
+    render_data["transforms.json"] = np.frombuffer(
+        json.dumps(transforms).encode("utf-8"), dtype=np.uint8)
+
+    # ---- Load source mesh and per-face part labels ----
+    instance_gt = _load_face2label(obj_id)
+    if instance_gt is None:
+        return {"status": "skip", "reason": "no face2label.json"}
+
+    source_mesh = _load_source_mesh(obj_id)
+    if source_mesh is None:
+        return {"status": "skip", "reason": "no source GLB"}
+
+    if len(instance_gt) != len(source_mesh.faces):
+        return {"status": "skip",
+                "reason": (f"face2label ({len(instance_gt)}) != "
+                           f"source faces ({len(source_mesh.faces)})")}
+
+    # ---- Align source mesh to VD coordinate space ----
+    source_mesh = _align_source_to_vd(source_mesh, transforms)
+
+    # ---- Part labels from text_captions (first caption, trimmed) ----
+    obj_caps = captions.get(obj_id, {})
+    n_parts = int(instance_gt.max()) + 1
+    labels = []
+    for pid in range(n_parts):
+        cap_list = obj_caps.get(str(pid), [])
+        if cap_list:
+            # Use first 4 words of first caption as a short label
+            label = "_".join(cap_list[0].split()[:4]).lower()
+            label = "".join(c if c.isalnum() or c == "_" else "_" for c in label)
+        else:
+            label = f"part_{pid}"
+        labels.append(label)
+
+    # ---- Split mesh ----
+    parts, split_mesh_json = _split_mesh(source_mesh, instance_gt, labels)
+
+    render_data["split_mesh.json"] = np.frombuffer(
+        json.dumps(split_mesh_json).encode("utf-8"), dtype=np.uint8)
+
+    mesh_data: dict[str, np.ndarray] = {
+        "full.ply": np.frombuffer(_to_ply(source_mesh), dtype=np.uint8),
+    }
+    for pid, label, sub in parts:
+        mesh_data[f"part_{pid}.ply"] = np.frombuffer(_to_ply(sub), dtype=np.uint8)
+
+    np.savez_compressed(str(render_out / f"{obj_id}.npz"), **render_data)
+    np.savez_compressed(str(mesh_out / f"{obj_id}.npz"), **mesh_data)
+
+    return {"status": "ok", "views": found, "parts": len(parts)}
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    logger = logging.getLogger("pack_npz_partverse")
+
+    parser = argparse.ArgumentParser(
+        description="Pack PartVerse prerender into PartCraft NPZ format")
+
+    sel = parser.add_argument_group("object selection")
+    sel.add_argument("--obj-ids", nargs="*", default=None,
+                     help="Explicit object IDs (overrides --shard)")
+    sel.add_argument("--shard", type=str, default=None,
+                     help="Shard to pack, e.g. '00'. Requires --num-shards.")
+    sel.add_argument("--num-shards", type=int, default=10,
+                     help="Total number of shards (default: 10)")
+    sel.add_argument("--limit", type=int, default=0,
+                     help="Cap to first N objects (0 = all)")
+
+    parser.add_argument("--force", action="store_true",
+                        help="Re-pack even if output NPZs already exist")
+    args = parser.parse_args()
+
+    # ---- Determine object list ----
+    if args.obj_ids:
+        obj_ids = list(args.obj_ids)
+        shard = "00"
+        logger.info(f"Explicit --obj-ids: {len(obj_ids)} objects → shard {shard}")
+    else:
+        all_ids = sorted(p.name for p in _ANNO_DIR.iterdir() if p.is_dir())
+        if args.shard is not None:
+            obj_ids = select_shard(all_ids, args.shard, args.num_shards)
+            shard = args.shard
+            logger.info(f"Shard {shard}/{args.num_shards}: "
+                        f"{len(obj_ids)}/{len(all_ids)} objects")
+        else:
+            obj_ids = all_ids
+            shard = "00"
+            logger.info(f"All objects: {len(obj_ids)} → shard {shard}")
+
+    if args.limit > 0:
+        obj_ids = obj_ids[:args.limit]
+        logger.info(f"--limit: capped to {len(obj_ids)} objects")
+
+    # ---- Load part captions (optional) ----
+    captions: dict = {}
+    if _CAPTIONS_PATH.exists():
+        with open(_CAPTIONS_PATH) as f:
+            captions = json.load(f)
+        logger.info(f"Loaded captions for {len(captions)} objects")
+    else:
+        logger.warning(f"text_captions.json not found at {_CAPTIONS_PATH} "
+                       "— using generic part names")
+
+    # ---- Output directories ----
+    render_out = _IMAGES_DIR / shard
+    mesh_out   = _MESH_DIR / shard
+    render_out.mkdir(parents=True, exist_ok=True)
+    mesh_out.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Output → images/{shard}/ and mesh/{shard}/")
+
+    # ---- Pack ----
+    total = len(obj_ids)
+    ok, skip, fail = 0, 0, 0
+
+    for i, obj_id in enumerate(obj_ids):
+        out_r = render_out / f"{obj_id}.npz"
+        out_m = mesh_out   / f"{obj_id}.npz"
+        if out_r.exists() and out_m.exists() and not args.force:
+            skip += 1
+            continue
+
+        img_enc_dir = _IMG_ENC_DIR / obj_id
+        if not img_enc_dir.exists():
+            logger.warning(f"[{i+1}/{total}] {obj_id}: no img_Enc dir, skip")
+            skip += 1
+            continue
+
+        result = _pack_one(obj_id, img_enc_dir, render_out, mesh_out, captions)
+
+        if result["status"] == "ok":
+            ok += 1
+            logger.info(f"[{i+1}/{total}] {obj_id}: "
+                        f"{result['views']} views, {result['parts']} parts")
+        else:
+            fail += 1
+            logger.warning(f"[{i+1}/{total}] {obj_id}: SKIP — {result['reason']}")
+
+    logger.info(f"\nDone: {ok} packed, {skip} skipped, {fail} failed / {total} total")
+
+
+if __name__ == "__main__":
+    main()

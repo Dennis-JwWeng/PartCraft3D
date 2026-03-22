@@ -53,6 +53,7 @@ from scripts.pipeline_common import (
     load_config, setup_logging,
     PartCraftDataset, EditSpec,
     resolve_api_key, normalize_cache_dirs, set_attn_backend, create_dataset,
+    resolve_data_dirs,
 )
 
 
@@ -350,6 +351,7 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
             )
 
     # ---- Init refiner ----
+    slat_dir, img_enc_dir = resolve_data_dirs(cfg)
     refiner = TrellisRefiner(
         cache_dir=str(cache_dir),
         device="cuda",
@@ -357,6 +359,8 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
         image_edit_backend=image_edit_backend,
         image_edit_base_url=p25_cfg.get("image_edit_base_url", "http://localhost:8001"),
         debug=debug,
+        slat_dir=slat_dir,
+        img_enc_dir=img_enc_dir,
     )
     refiner.load_models()
 

@@ -183,6 +183,8 @@ class TrellisRefiner:
         image_edit_backend: str = "api",
         image_edit_base_url: str | None = None,
         debug: bool = False,
+        slat_dir: str | Path | None = None,
+        img_enc_dir: str | Path | None = None,
         # Legacy: ignored, kept for config compat
         vinedresser_path: str | None = None,
     ):
@@ -200,9 +202,10 @@ class TrellisRefiner:
             ckpt_dir = str(self._project_root / "checkpoints")
         self.ckpt_dir = Path(ckpt_dir)
 
-        # Data directories (SLAT, img_Enc)
-        self.slat_dir = self._project_root / "data" / "partobjaverse_tiny" / "slat"
-        self.img_enc_dir = self._project_root / "data" / "partobjaverse_tiny" / "img_Enc"
+        # Data directories (SLAT, img_Enc) — config-driven, fallback to partobjaverse_tiny
+        _default_data = self._project_root / "data" / "partobjaverse_tiny"
+        self.slat_dir = Path(slat_dir) if slat_dir else _default_data / "slat"
+        self.img_enc_dir = Path(img_enc_dir) if img_enc_dir else _default_data / "img_Enc"
 
         self.debug = debug or os.environ.get("PARTCRAFT_DEBUG", "").lower() in ("1", "true")
 

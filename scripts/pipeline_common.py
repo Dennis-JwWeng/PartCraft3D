@@ -99,3 +99,18 @@ def create_dataset(cfg: dict) -> PartCraftDataset:
         cfg["data"]["mesh_npz_dir"],
         cfg["data"]["shards"],
     )
+
+
+def resolve_data_dirs(cfg: dict) -> tuple[str | None, str | None]:
+    """Return (slat_dir, img_enc_dir) from config data section.
+
+    Reads optional fields:
+        data.slat_dir     — pre-encoded SLAT ({obj_id}_feats.pt / _coords.pt)
+        data.img_enc_dir  — Blender render outputs ({obj_id}/000.png .. voxels.ply)
+
+    Both default to None (TrellisRefiner falls back to partobjaverse_tiny paths).
+    """
+    data_cfg = cfg.get("data", {})
+    slat_dir    = data_cfg.get("slat_dir", None)
+    img_enc_dir = data_cfg.get("img_enc_dir", None)
+    return slat_dir, img_enc_dir

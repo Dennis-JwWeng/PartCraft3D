@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Build training dataset JSON from streaming pipeline outputs.
+"""Build training dataset JSON from PartObjaverse-Tiny pipeline outputs.
 
-Structure: per-object grouping, one shared SLAT as before,
-deletion/addition as reverse pairs with auto-generated prompts.
+Groups edits by object, pairs deletion/addition as reverses, and assembles
+SLAT paths. Reads from outputs/partobjaverse_tiny/ produced by run_pipeline
+or run_streaming.
 
 Usage:
-    python scripts/build_dataset.py --tag v2
-    python scripts/build_dataset.py --tag v2 --fix-slat
+    python scripts/datasets/partobjaverse/build_dataset.py --tag v2
+    python scripts/datasets/partobjaverse/build_dataset.py --tag v2 --fix-slat
 """
 
 import argparse
@@ -17,7 +18,8 @@ import shutil
 from collections import defaultdict
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
 
 # ---------------------------------------------------------------------------
 # Reverse prompt generation (rule-based)
@@ -44,7 +46,6 @@ def reverse_deletion_prompt(prompt: str) -> str:
     for pattern, replacement in _REMOVE_PATTERNS:
         if pattern.match(prompt):
             return pattern.sub(replacement, prompt, count=1)
-    # Fallback: prepend "Add back" and lowercase first char
     return "Add back " + prompt[0].lower() + prompt[1:]
 
 
@@ -66,9 +67,9 @@ def fix_missing_before_slat(mesh_pairs_dir: Path, slat_dir: Path):
         if before_slat.exists() and (before_slat / "feats.pt").exists():
             continue
 
-        parts = name.split("_")
+        parts  = name.split("_")
         obj_id = "_".join(parts[1:-1])
-        feats = slat_dir / f"{obj_id}_feats.pt"
+        feats  = slat_dir / f"{obj_id}_feats.pt"
         coords = slat_dir / f"{obj_id}_coords.pt"
 
         if not feats.exists() or not coords.exists():
@@ -77,7 +78,6 @@ def fix_missing_before_slat(mesh_pairs_dir: Path, slat_dir: Path):
 
         if before_slat.is_symlink():
             before_slat.unlink()
-
         before_slat.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(feats), str(before_slat / "feats.pt"))
         shutil.copy2(str(coords), str(before_slat / "coords.pt"))
@@ -91,10 +91,9 @@ def fix_missing_before_slat(mesh_pairs_dir: Path, slat_dir: Path):
 # ---------------------------------------------------------------------------
 
 def relpath(p: Path) -> str:
-    """Return path relative to PROJECT_ROOT (without resolving symlinks)."""
+    """Return path relative to project root (without resolving symlinks)."""
     try:
-        # Use absolute() instead of resolve() to preserve symlinks
-        return str(p.absolute().relative_to(PROJECT_ROOT))
+        return str(p.absolute().relative_to(_PROJECT_ROOT))
     except ValueError:
         return str(p)
 
@@ -102,7 +101,6 @@ def relpath(p: Path) -> str:
 def build_dataset(mesh_pairs_dir: Path, results_files: list[Path],
                   slat_dir: Path, output_path: Path,
                   specs_files: list[Path] | None = None):
-    # Load edit specs (for addition prompts that may be missing from results)
     spec_prompts: dict[str, str] = {}
     if specs_files:
         for sf in specs_files:
@@ -116,7 +114,6 @@ def build_dataset(mesh_pairs_dir: Path, results_files: list[Path],
                     if prompt:
                         spec_prompts[d["edit_id"]] = prompt
 
-    # Load all successful results
     all_results = {}
     for rf in results_files:
         with open(rf) as f:
@@ -128,7 +125,6 @@ def build_dataset(mesh_pairs_dir: Path, results_files: list[Path],
                 if d.get("status") == "success":
                     all_results[d["edit_id"]] = d
 
-    # Group by object
     by_obj: dict[str, list[dict]] = defaultdict(list)
     for eid, rec in all_results.items():
         by_obj[rec["obj_id"]].append(rec)
@@ -141,8 +137,7 @@ def build_dataset(mesh_pairs_dir: Path, results_files: list[Path],
     for obj_id in sorted(by_obj.keys()):
         recs = by_obj[obj_id]
 
-        # Object-level SLAT
-        obj_feats = slat_dir / f"{obj_id}_feats.pt"
+        obj_feats  = slat_dir / f"{obj_id}_feats.pt"
         obj_coords = slat_dir / f"{obj_id}_coords.pt"
         has_obj_slat = obj_feats.exists() and obj_coords.exists()
 
@@ -152,7 +147,6 @@ def build_dataset(mesh_pairs_dir: Path, results_files: list[Path],
             "edits": [],
         }
 
-        # Build deletion lookup for add reverse pairing
         del_by_suffix: dict[str, dict] = {}
         for rec in recs:
             if rec["edit_type"] == "deletion":
@@ -160,15 +154,14 @@ def build_dataset(mesh_pairs_dir: Path, results_files: list[Path],
                 del_by_suffix[suffix] = rec
 
         for rec in sorted(recs, key=lambda r: r["edit_id"]):
-            eid = rec["edit_id"]
+            eid   = rec["edit_id"]
             etype = rec["edit_type"]
             effective = rec.get("effective_edit_type", "")
-            pair_dir = mesh_pairs_dir / eid
+            pair_dir  = mesh_pairs_dir / eid
 
             if not pair_dir.exists():
                 continue
 
-            # Prompt priority: result > spec > empty
             prompt = rec.get("edit_prompt") or spec_prompts.get(eid, "")
 
             edit_entry: dict = {
@@ -178,37 +171,30 @@ def build_dataset(mesh_pairs_dir: Path, results_files: list[Path],
                 "prompt": prompt,
             }
 
-            # --- Deletion ---
             if etype == "deletion":
                 add_id = "add_" + "_".join(eid.split("_")[1:])
                 edit_entry["reverse_id"] = add_id
                 edit_entry["before_ply"] = relpath(pair_dir / "before.ply")
-                edit_entry["after_ply"] = relpath(pair_dir / "after.ply")
+                edit_entry["after_ply"]  = relpath(pair_dir / "after.ply")
 
-            # --- Addition (reverse of deletion) ---
             elif etype == "addition":
-                suffix = "_".join(eid.split("_")[1:])
+                suffix  = "_".join(eid.split("_")[1:])
                 del_rec = del_by_suffix.get(suffix)
-                del_id = "del_" + suffix
+                del_id  = "del_" + suffix
                 edit_entry["reverse_id"] = del_id
-
-                # Prompt: spec (VLM-generated) > rule-based reversal
                 if not prompt:
                     del_prompt = (del_rec.get("edit_prompt") or
                                   spec_prompts.get(del_id, "")) if del_rec else ""
                     edit_entry["prompt"] = reverse_deletion_prompt(del_prompt)
-
                 edit_entry["before_ply"] = relpath(pair_dir / "before.ply")
-                edit_entry["after_ply"] = relpath(pair_dir / "after.ply")
+                edit_entry["after_ply"]  = relpath(pair_dir / "after.ply")
 
-            # --- Modification / Global ---
             else:
                 edit_entry["before_ply"] = relpath(pair_dir / "before.ply")
-                edit_entry["after_ply"] = relpath(pair_dir / "after.ply")
+                edit_entry["after_ply"]  = relpath(pair_dir / "after.ply")
 
-                # SLAT paths
                 before_slat = pair_dir / "before_slat"
-                after_slat = pair_dir / "after_slat"
+                after_slat  = pair_dir / "after_slat"
                 has_bs = before_slat.exists() and (before_slat / "feats.pt").exists()
                 has_as = after_slat.exists() and (after_slat / "feats.pt").exists()
 
@@ -216,7 +202,6 @@ def build_dataset(mesh_pairs_dir: Path, results_files: list[Path],
                     edit_entry["before_slat"] = relpath(before_slat)
                 if has_as:
                     edit_entry["after_slat"] = relpath(after_slat)
-
                 edit_entry["has_slat_pair"] = has_bs and has_as
                 if has_bs and has_as:
                     total_slat_pairs += 1
@@ -247,27 +232,27 @@ def build_dataset(mesh_pairs_dir: Path, results_files: list[Path],
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build training dataset JSON")
+    parser = argparse.ArgumentParser(
+        description="Build training dataset JSON for PartObjaverse-Tiny")
     parser.add_argument("--tag", default="v2")
     parser.add_argument("--output-dir", default="outputs/partobjaverse_tiny")
     parser.add_argument("--fix-slat", action="store_true",
                         help="Fix missing before_slat for mod/glb pairs")
     args = parser.parse_args()
 
-    output_dir = PROJECT_ROOT / args.output_dir
+    output_dir = _PROJECT_ROOT / args.output_dir
     tag_suffix = f"_{args.tag}" if args.tag else ""
     mesh_pairs_dir = output_dir / f"mesh_pairs{tag_suffix}"
-    slat_dir = PROJECT_ROOT / "data" / "partobjaverse_tiny" / "slat"
+    slat_dir = _PROJECT_ROOT / "data" / "partobjaverse_tiny" / "slat"
 
-    # Step 1: Fix missing before_slat
     if args.fix_slat:
-        print(f"Fixing missing before_slat...")
+        print("Fixing missing before_slat...")
         fixed = fix_missing_before_slat(mesh_pairs_dir, slat_dir)
         print(f"Fixed: {fixed}")
 
-    # Step 2: Load result files and spec files
     def _find_jsonl(subdir, prefix):
-        pattern = str(output_dir / "cache" / subdir / f"{prefix}{tag_suffix}_w*.jsonl")
+        pattern = str(output_dir / "cache" / subdir /
+                      f"{prefix}{tag_suffix}_w*.jsonl")
         files = sorted(Path(p) for p in glob.glob(pattern))
         if not files:
             single = output_dir / "cache" / subdir / f"{prefix}{tag_suffix}.jsonl"
@@ -276,16 +261,15 @@ def main():
         return files
 
     results_files = _find_jsonl("phase2_5", "edit_results")
-    specs_files = _find_jsonl("phase1", "edit_specs")
+    specs_files   = _find_jsonl("phase1", "edit_specs")
 
     if not results_files:
-        print(f"No result files found")
+        print("No result files found")
         return
 
     out_path = output_dir / f"dataset{tag_suffix}.json"
-    dataset = build_dataset(mesh_pairs_dir, results_files, slat_dir, out_path,
-                            specs_files=specs_files)
-
+    dataset  = build_dataset(mesh_pairs_dir, results_files, slat_dir, out_path,
+                             specs_files=specs_files)
     meta = dataset["meta"]
     print(f"\nDataset: {out_path}")
     print(f"Objects: {meta['total_objects']}")

@@ -50,6 +50,7 @@ from scripts.pipeline_common import (
     load_config, setup_logging,
     PartCraftDataset, EditSpec,
     resolve_api_key, normalize_cache_dirs, set_attn_backend, create_dataset,
+    resolve_data_dirs,
 )
 
 
@@ -98,7 +99,8 @@ def run_streaming(cfg, dataset, logger, args):
     mesh_pairs_dir = output_dir / f"mesh_pairs{tag_suffix}"
 
     # ---- Resolve object list from dataset (NPZ files) ----
-    uid_info: dict[str, tuple[str, list[str], list[int]]] = {}
+    # uid_info: obj_id -> (category, labels, actual_pids, shard_id)
+    uid_info: dict[str, tuple[str, list[str], list[int], str]] = {}
     if dataset._index is None:
         dataset._build_index()
     for shard_id, obj_id in dataset._index:
@@ -113,7 +115,7 @@ def run_streaming(cfg, dataset, logger, args):
                 label = p.cluster_name
             labels.append(label)
             actual_pids.append(p.part_id)
-        uid_info[obj_id] = ("object", labels, actual_pids)
+        uid_info[obj_id] = ("object", labels, actual_pids, shard_id)
         obj_rec.close()
     logger.info(f"Discovered {len(uid_info)} objects from dataset")
 
@@ -148,6 +150,7 @@ def run_streaming(cfg, dataset, logger, args):
     from partcraft.phase2_assembly.trellis_refine import (
         TrellisRefiner, build_prompts_from_spec)
 
+    slat_dir, img_enc_dir = resolve_data_dirs(cfg)
     refiner = TrellisRefiner(
         cache_dir=str(_resolve(p25["cache_dir"])),
         device="cuda",
@@ -155,6 +158,8 @@ def run_streaming(cfg, dataset, logger, args):
         image_edit_backend=image_edit_backend,
         image_edit_base_url=p25.get("image_edit_base_url", "http://localhost:8001"),
         debug=args.debug,
+        slat_dir=slat_dir,
+        img_enc_dir=img_enc_dir,
     )
     refiner.load_models()
 
@@ -184,7 +189,6 @@ def run_streaming(cfg, dataset, logger, args):
 
     # ---- Image source ----
     npz_dir = _resolve(cfg["data"]["image_npz_dir"])
-    shard = cfg["data"].get("shards", ["00"])[0]
 
     # Import 2D edit helpers
     from scripts.run_2d_edit import (
@@ -214,7 +218,7 @@ def run_streaming(cfg, dataset, logger, args):
          open(results_path, "a") as res_fp:
 
         for obj_idx, uid in enumerate(all_uids):
-            category, labels, actual_pids = uid_info[uid]
+            category, labels, actual_pids, obj_shard = uid_info[uid]
             logger.info(f"\n{'='*60}")
             logger.info(f"[{obj_idx+1}/{len(all_uids)}] Object: {uid}")
             logger.info(f"  Category: {category}, Parts: {len(labels)}")
@@ -237,7 +241,7 @@ def run_streaming(cfg, dataset, logger, args):
             else:
                 # Fresh VLM enrichment
                 try:
-                    obj = dataset.load_object(shard, uid)
+                    obj = dataset.load_object(obj_shard, uid)
                     result = _enrich_one_object_visual(
                         vlm_client, vlm_model, obj, category, labels)
                     obj.close()
@@ -246,7 +250,7 @@ def run_streaming(cfg, dataset, logger, args):
                     result = None
 
                 if result is None:
-                    npz_path = npz_dir / shard / f"{uid}.npz"
+                    npz_path = npz_dir / obj_shard / f"{uid}.npz"
                     thumb = None
                     if npz_path.exists():
                         thumb = load_thumbnail_from_npz(str(npz_path),
@@ -259,7 +263,7 @@ def run_streaming(cfg, dataset, logger, args):
                     logger.warning(f"  Using fallback enrichment for {uid}")
 
                 record = _result_to_phase0_record(
-                    result, uid, category, shard,
+                    result, uid, category, obj_shard,
                     actual_part_ids=actual_pids)
                 lbl_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
                 lbl_fp.flush()
@@ -310,7 +314,7 @@ def run_streaming(cfg, dataset, logger, args):
             try:
                 ori_slat = refiner.encode_object(None, uid)
                 ori_gaussian = refiner.decode_to_gaussian(ori_slat)
-                obj_record = dataset.load_object(shard, uid)
+                obj_record = dataset.load_object(obj_shard, uid)
             except Exception as e:
                 logger.error(f"  Failed to prepare for TRELLIS: {e}")
                 for spec in run_specs:
