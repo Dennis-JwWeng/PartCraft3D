@@ -1,31 +1,28 @@
 #!/usr/bin/env python3
-"""Pre-render PartVerse objects + encode into SLAT.
+"""Pre-render PartVerse objects + pack into NPZ + encode into SLAT.
 
 PartVerse ships pre-normalized GLBs in data/partverse/source/normalized_glbs/.
 This script reads them directly, skipping the mesh.zip format used by
 PartObjaverse-Tiny.
 
 Outputs (under data/partverse/):
-    img_Enc/{obj_id}/
-        000.png .. 149.png
-        transforms.json
-        mesh.ply
-        voxels.ply
-    slat/
-        {obj_id}_feats.pt
-        {obj_id}_coords.pt
+    images/{shard}/{obj_id}.npz   — render NPZ (PNGs + transforms + split_mesh)
+    mesh/{shard}/{obj_id}.npz     — mesh NPZ (full.ply + per-part PLYs)
+    img_Enc/{obj_id}/voxels.ply   — voxel point cloud for SLAT encode
+    slat/{obj_id}_feats.pt        — SLAT features
+    slat/{obj_id}_coords.pt       — SLAT coordinates
 
 Shard support: 12030 objects can be split into N shards (e.g. 10 shards of
 ~1203 objects each) and processed independently — on different machines or
 sequentially. SLAT output is always flat under slat/, regardless of shard.
 
 Usage:
-    # Process shard 00 of 10 on 4 GPUs (render + encode)
+    # Process shard 00 of 10 on 4 GPUs (render + pack + encode)
     CUDA_VISIBLE_DEVICES=0,1,2,3 ATTN_BACKEND=xformers \\
         python scripts/datasets/partverse/prerender.py \\
         --shard 00 --num-shards 10 --render-workers 4
 
-    # Render only, shard 01
+    # Render + pack only, shard 01 (4 parallel Blender workers)
     CUDA_VISIBLE_DEVICES=0,1,2,3 \\
         python scripts/datasets/partverse/prerender.py \\
         --shard 01 --num-shards 10 --render-only --render-workers 4
@@ -35,16 +32,13 @@ Usage:
         python scripts/datasets/partverse/prerender.py \\
         --shard 02 --num-shards 10 --encode-only --num-gpus 4
 
-    # Process all objects (no sharding), single GPU
-    CUDA_VISIBLE_DEVICES=0 ATTN_BACKEND=xformers \\
-        python scripts/datasets/partverse/prerender.py
-
     # Test: first 5 objects
     CUDA_VISIBLE_DEVICES=0 ATTN_BACKEND=xformers \\
         python scripts/datasets/partverse/prerender.py --limit 5
 """
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -53,8 +47,11 @@ _PROJECT_ROOT  = Path(__file__).resolve().parents[3]
 _THIRD_PARTY   = _PROJECT_ROOT / "third_party"
 _PARTVERSE_DIR = _PROJECT_ROOT / "data" / "partverse"
 _GLB_DIR       = _PARTVERSE_DIR / "source" / "normalized_glbs"
+_CAPTIONS_PATH = _PARTVERSE_DIR / "source" / "text_captions.json"
 _IMG_ENC_DIR   = _PARTVERSE_DIR / "img_Enc"
 _SLAT_DIR      = _PARTVERSE_DIR / "slat"
+_IMAGES_DIR    = _PARTVERSE_DIR / "images"
+_MESH_DIR      = _PARTVERSE_DIR / "mesh"
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_THIRD_PARTY))
@@ -86,6 +83,55 @@ def _glb_getter(obj_id: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Pack step: render outputs → images/ + mesh/ NPZ, clean up img_Enc PNGs
+# ---------------------------------------------------------------------------
+
+def _run_pack(obj_ids: list[str], shard: str, captions: dict,
+              force: bool, logger: logging.Logger):
+    """Pack rendered img_Enc outputs into images/{shard}/ + mesh/{shard}/ NPZ.
+
+    After successful packing, PNGs / transforms.json / mesh.ply are removed
+    from img_Enc — only voxels.ply is kept (used as encode cache marker).
+    """
+    from scripts.datasets.partverse.pack_npz import _pack_one
+
+    render_out = _IMAGES_DIR / shard
+    mesh_out   = _MESH_DIR   / shard
+    render_out.mkdir(parents=True, exist_ok=True)
+    mesh_out.mkdir(parents=True, exist_ok=True)
+
+    total = len(obj_ids)
+    ok = skip = fail = 0
+
+    for i, obj_id in enumerate(obj_ids):
+        out_r = render_out / f"{obj_id}.npz"
+        out_m = mesh_out   / f"{obj_id}.npz"
+        if out_r.exists() and out_m.exists() and not force:
+            skip += 1
+            continue
+
+        img_enc_dir = _IMG_ENC_DIR / obj_id
+        if not img_enc_dir.exists():
+            skip += 1
+            continue
+
+        result = _pack_one(obj_id, img_enc_dir, render_out, mesh_out, captions)
+        if result["status"] == "ok":
+            ok += 1
+            logger.info(f"[pack {i+1}/{total}] {obj_id}: "
+                        f"{result['views']} views, {result['parts']} parts")
+            # Remove PNGs and mesh.ply — now stored in NPZ
+            for f in img_enc_dir.iterdir():
+                if f.suffix in (".png", ".jpg") or f.name in ("transforms.json", "mesh.ply"):
+                    f.unlink()
+        else:
+            fail += 1
+            logger.warning(f"[pack {i+1}/{total}] {obj_id}: skip — {result['reason']}")
+
+    logger.info(f"Pack: {ok} packed, {skip} skipped, {fail} failed / {total} total")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -98,7 +144,7 @@ def main():
     logger = logging.getLogger("prerender_partverse")
 
     parser = argparse.ArgumentParser(
-        description="Pre-render PartVerse + encode SLAT")
+        description="Pre-render PartVerse + pack NPZ + encode SLAT")
 
     # Object selection (mutually exclusive priority: --obj-ids > --shard > all)
     sel = parser.add_argument_group("object selection")
@@ -115,8 +161,10 @@ def main():
                           "Useful for quick tests.")
 
     # Mode
-    parser.add_argument("--render-only", action="store_true")
-    parser.add_argument("--encode-only", action="store_true")
+    parser.add_argument("--render-only", action="store_true",
+                        help="Render + pack only, skip SLAT encode")
+    parser.add_argument("--encode-only", action="store_true",
+                        help="SLAT encode only, skip render + pack")
     parser.add_argument("--force", action="store_true",
                         help="Re-run even if outputs already exist")
 
@@ -132,26 +180,39 @@ def main():
     _IMG_ENC_DIR.mkdir(parents=True, exist_ok=True)
     _SLAT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ---- Determine object list ----
+    # ---- Determine object list and shard ----
     if args.obj_ids:
         obj_ids = list(args.obj_ids)
-        logger.info(f"Explicit --obj-ids: {len(obj_ids)} objects")
+        shard = args.shard if args.shard is not None else "00"
+        logger.info(f"Explicit --obj-ids: {len(obj_ids)} objects → shard {shard}")
     else:
         all_ids = get_all_obj_ids()
         if args.shard is not None:
             obj_ids = select_shard(all_ids, args.shard, args.num_shards)
-            logger.info(f"Shard {args.shard}/{args.num_shards}: "
+            shard = args.shard
+            logger.info(f"Shard {shard}/{args.num_shards}: "
                         f"{len(obj_ids)}/{len(all_ids)} objects "
                         f"(idx {all_ids.index(obj_ids[0])}–{all_ids.index(obj_ids[-1])})")
         else:
             obj_ids = all_ids
-            logger.info(f"All objects: {len(obj_ids)}")
+            shard = "00"
+            logger.info(f"All objects: {len(obj_ids)} → shard {shard}")
 
     if args.limit > 0:
         obj_ids = obj_ids[:args.limit]
         logger.info(f"--limit: capped to {len(obj_ids)} objects")
 
     logger.info(f"PartVerse GLB dir: {_GLB_DIR}")
+
+    # ---- Load part captions (for pack step) ----
+    captions: dict = {}
+    if not args.encode_only:
+        if _CAPTIONS_PATH.exists():
+            with open(_CAPTIONS_PATH) as f:
+                captions = json.load(f)
+            logger.info(f"Loaded captions for {len(captions)} objects")
+        else:
+            logger.warning(f"text_captions.json not found — using generic part names")
 
     # ---- Multi-GPU encode mode (launches subprocesses with --obj-ids) ----
     if args.num_gpus > 1 and not args.render_only:
@@ -163,9 +224,15 @@ def main():
 
     # ---- Single-process or parallel-render mode ----
     if not args.encode_only:
+        # Pass --shard to parallel workers so they pack into the correct shard dir
+        extra_worker_args = ["--shard", shard, "--num-shards", str(args.num_shards)]
         run_render(obj_ids, _glb_getter, _IMG_ENC_DIR, _THIRD_PARTY,
                    args.force, args.render_workers,
-                   Path(__file__).resolve(), logger)
+                   Path(__file__).resolve(), logger,
+                   extra_worker_args=extra_worker_args)
+
+        # Pack rendered outputs into images/{shard}/ and mesh/{shard}/ NPZ
+        _run_pack(obj_ids, shard, captions, args.force, logger)
 
     if not args.render_only:
         run_encode(obj_ids, _IMG_ENC_DIR, _SLAT_DIR, _THIRD_PARTY,

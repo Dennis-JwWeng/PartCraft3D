@@ -6,16 +6,10 @@ from .utils import sphere_hammersley_sequence
 import open3d as o3d
 import utils3d
 
-BLENDER_LINK = 'https://download.blender.org/release/Blender3.0/blender-3.0.1-linux-x64.tar.xz'
-BLENDER_INSTALLATION_PATH = '/tmp'
-BLENDER_PATH = f'{BLENDER_INSTALLATION_PATH}/blender-3.0.1-linux-x64/blender'
-
-def install_blender():
-    if not os.path.exists(BLENDER_PATH):
-        os.system('sudo apt-get update')
-        os.system('sudo apt-get install -y libxrender1 libxi6 libxkbcommon-x11-0 libsm6')
-        os.system(f'wget {BLENDER_LINK} -P {BLENDER_INSTALLATION_PATH}')
-        os.system(f'tar -xvf {BLENDER_INSTALLATION_PATH}/blender-3.0.1-linux-x64.tar.xz -C {BLENDER_INSTALLATION_PATH}')
+BLENDER_PATH = os.environ.get(
+    'BLENDER_PATH',
+    '/DATA_EDS2/shenlc2403/blender/blender-3.5.1-linux-x64/blender',
+)
 
 def render(file_path, name, output_dir, num_views=150):
     output_folder = os.path.join(output_dir, name)
@@ -58,7 +52,6 @@ def voxelize(file, name, output_dir):
     utils3d.io.write_ply(os.path.join(output_dir, f'voxels.ply'), vertices)
 
 def renderImg_voxelize(input_file):
-    install_blender()
     name = os.path.splitext(os.path.basename(input_file))[0]
     os.makedirs(f"outputs/img_Enc", exist_ok=True)
     render(input_file, name, f"outputs/img_Enc/")

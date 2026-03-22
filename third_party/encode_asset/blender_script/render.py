@@ -505,8 +505,12 @@ def main(arg):
         triangulate_meshes()
         print('[INFO] Meshes triangulated.')
         
-        # export ply mesh
-        bpy.ops.export_mesh.ply(filepath=os.path.join(arg.output_folder, 'mesh.ply'))
+        # export ply mesh (API changed in Blender 4.x)
+        ply_path = os.path.join(arg.output_folder, 'mesh.ply')
+        if hasattr(bpy.ops, 'wm') and hasattr(bpy.ops.wm, 'ply_export'):
+            bpy.ops.wm.ply_export(filepath=ply_path, export_selected_objects=False)
+        else:
+            bpy.ops.export_mesh.ply(filepath=ply_path)
 
         
 if __name__ == '__main__':

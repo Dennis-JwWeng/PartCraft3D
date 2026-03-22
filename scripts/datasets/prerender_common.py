@@ -79,18 +79,21 @@ def run_render(
     render_workers: int,
     script_path: Path,
     logger: logging.Logger,
+    extra_worker_args: list[str] | None = None,
 ):
     """Render pending objects. Dispatches to parallel or sequential mode.
 
     Args:
-        obj_ids:        All object IDs to process.
-        glb_getter:     Callable(obj_id) -> Path to the source GLB.
-        img_enc_dir:    Output root for rendered views (img_Enc/).
-        third_party_dir: Project's third_party/ directory.
-        force:          Re-render even if cached.
-        render_workers: Number of parallel Blender workers (each on 1 GPU).
-        script_path:    Path to the calling dataset script (used for subprocesses).
-        logger:         Logger instance.
+        obj_ids:          All object IDs to process.
+        glb_getter:       Callable(obj_id) -> Path to the source GLB.
+        img_enc_dir:      Output root for rendered views (img_Enc/).
+        third_party_dir:  Project's third_party/ directory.
+        force:            Re-render even if cached.
+        render_workers:   Number of parallel Blender workers (each on 1 GPU).
+        script_path:      Path to the calling dataset script (used for subprocesses).
+        logger:           Logger instance.
+        extra_worker_args: Extra CLI args forwarded to parallel worker subprocesses
+                          (e.g. ["--shard", "00", "--num-shards", "10"]).
     """
     pending = [
         oid for oid in obj_ids
@@ -102,7 +105,8 @@ def run_render(
         return
 
     if render_workers > 1:
-        _render_parallel(pending, script_path, render_workers, force, logger)
+        _render_parallel(pending, script_path, render_workers, force, logger,
+                         extra_worker_args or [])
     else:
         gpus = get_available_gpus()
         gpu_id = gpus[0] if gpus else None
@@ -146,6 +150,7 @@ def _render_parallel(
     num_workers: int,
     force: bool,
     logger: logging.Logger,
+    extra_worker_args: list[str] | None = None,
 ):
     """Launch num_workers subprocesses, each assigned to a dedicated GPU.
 
@@ -179,6 +184,7 @@ def _render_parallel(
             sys.executable, str(script_path),
             "--render-only", "--render-workers", "1",
             "--obj-ids", *shard,
+            *(extra_worker_args or []),
         ]
         if force:
             cmd.append("--force")
@@ -281,6 +287,12 @@ def run_encode(
             feats = slat_dir / f"{oid}_feats.pt"
             if feats.exists():
                 logger.info(f"  -> SLAT encoded ({feats.stat().st_size // 1024} KB)")
+                # Remove rendered PNGs and transforms.json — they are packed into NPZ
+                # already; only voxels.ply (cache sentinel) is kept.
+                obj_dir = img_enc_dir / oid
+                for f in obj_dir.iterdir():
+                    if f.suffix in (".png", ".jpg") or f.name == "transforms.json":
+                        f.unlink()
             else:
                 logger.error(f"  -> feats.pt not found after encoding")
         except Exception as e:
