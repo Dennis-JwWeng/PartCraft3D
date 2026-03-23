@@ -458,29 +458,35 @@ def main(arg):
     }
     views = json.loads(arg.views)
     for i, view in enumerate(views):
+        # Always set camera position — needed for transform matrix even when skipping
         cam.location = (
             view['radius'] * np.cos(view['yaw']) * np.cos(view['pitch']),
             view['radius'] * np.sin(view['yaw']) * np.cos(view['pitch']),
             view['radius'] * np.sin(view['pitch'])
         )
         cam.data.lens = 16 / np.tan(view['fov'] / 2)
-        
-        if arg.save_depth:
-            spec_nodes['depth_map'].inputs[1].default_value = view['radius'] - 0.5 * np.sqrt(3)
-            spec_nodes['depth_map'].inputs[2].default_value = view['radius'] + 0.5 * np.sqrt(3)
-        
-        bpy.context.scene.render.filepath = os.path.join(arg.output_folder, f'{i:03d}.png')
-        for name, output in outputs.items():
-            output.file_slots[0].path = os.path.join(arg.output_folder, f'{i:03d}_{name}')
-            
-        # Render the scene
-        bpy.ops.render.render(write_still=True)
-        bpy.context.view_layer.update()
-        for name, output in outputs.items():
-            ext = EXT[output.format.file_format]
-            path = glob.glob(f'{output.file_slots[0].path}*.{ext}')[0]
-            os.rename(path, f'{output.file_slots[0].path}.{ext}')
-            
+
+        out_png = os.path.join(arg.output_folder, f'{i:03d}.png')
+        if not os.path.exists(out_png):
+            if arg.save_depth:
+                spec_nodes['depth_map'].inputs[1].default_value = view['radius'] - 0.5 * np.sqrt(3)
+                spec_nodes['depth_map'].inputs[2].default_value = view['radius'] + 0.5 * np.sqrt(3)
+
+            bpy.context.scene.render.filepath = out_png
+            for name, output in outputs.items():
+                output.file_slots[0].path = os.path.join(arg.output_folder, f'{i:03d}_{name}')
+
+            # Render the scene
+            bpy.ops.render.render(write_still=True)
+            bpy.context.view_layer.update()
+            for name, output in outputs.items():
+                ext = EXT[output.format.file_format]
+                path = glob.glob(f'{output.file_slots[0].path}*.{ext}')[0]
+                os.rename(path, f'{output.file_slots[0].path}.{ext}')
+        else:
+            # PNG cached — update view layer so transform matrix is correct
+            bpy.context.view_layer.update()
+
         # Save camera parameters
         metadata = {
             "file_path": f'{i:03d}.png',
