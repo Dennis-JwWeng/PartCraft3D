@@ -6,15 +6,15 @@ This script reads them directly, skipping the mesh.zip format used by
 PartObjaverse-Tiny.
 
 Outputs (under data/partverse/):
-    images/{shard}/{obj_id}.npz   — render NPZ (PNGs + transforms + split_mesh)
-    mesh/{shard}/{obj_id}.npz     — mesh NPZ (full.ply + per-part PLYs)
-    img_Enc/{obj_id}/voxels.ply   — voxel point cloud for SLAT encode
-    slat/{obj_id}_feats.pt        — SLAT features
-    slat/{obj_id}_coords.pt       — SLAT coordinates
+    images/{shard}/{obj_id}.npz        — render NPZ (PNGs + transforms + split_mesh)
+    mesh/{shard}/{obj_id}.npz          — mesh NPZ (full.ply + per-part PLYs)
+    img_Enc/{obj_id}/voxels.ply        — voxel point cloud for SLAT encode
+    slat/{shard}/{obj_id}_feats.pt     — SLAT features
+    slat/{shard}/{obj_id}_coords.pt    — SLAT coordinates
 
 Shard support: 12030 objects can be split into N shards (e.g. 10 shards of
 ~1203 objects each) and processed independently — on different machines or
-sequentially. SLAT output is always flat under slat/, regardless of shard.
+sequentially. SLAT output is organized per-shard under slat/{shard}/.
 
 Usage:
     # Process shard 00 of 10 on 4 GPUs (render + pack + encode)
@@ -97,7 +97,7 @@ def _run_pack(obj_ids: list[str], shard: str, captions: dict,
     After successful packing, PNGs / transforms.json / mesh.ply are removed
     from img_Enc — only voxels.ply is kept (used as encode cache marker).
     """
-    from scripts.datasets.partverse.pack_npz import _pack_one
+    from scripts.datasets.partverse.pack_npz import _pack_one, PACK_VIEWS
 
     render_out = _IMAGES_DIR / shard
     mesh_out   = _MESH_DIR   / shard
@@ -119,15 +119,15 @@ def _run_pack(obj_ids: list[str], shard: str, captions: dict,
             skip += 1
             continue
 
-        result = _pack_one(obj_id, img_enc_dir, render_out, mesh_out, captions)
+        result = _pack_one(obj_id, img_enc_dir, render_out, mesh_out, captions,
+                           keep_views=PACK_VIEWS)
         if result["status"] == "ok":
             ok += 1
             logger.info(f"[pack {i+1}/{total}] {obj_id}: "
                         f"{result['views']} views, {result['parts']} parts")
-            # Remove PNGs and mesh.ply — now stored in NPZ
-            for f in img_enc_dir.iterdir():
-                if f.suffix in (".png", ".jpg") or f.name in ("transforms.json", "mesh.ply"):
-                    f.unlink()
+            # Keep all 150 PNGs in img_Enc — only 16 selected views go into NPZ.
+            # img_Enc serves as the full render archive; images/ NPZ is the slim
+            # pipeline input.
         else:
             fail += 1
             logger.warning(f"[pack {i+1}/{total}] {obj_id}: skip — {result['reason']}")
@@ -209,6 +209,22 @@ def main():
         obj_ids = obj_ids[:args.limit]
         logger.info(f"--limit: capped to {len(obj_ids)} objects")
 
+    # SLAT output goes into a per-shard subdirectory for easy batched compression.
+    slat_shard_dir = _SLAT_DIR / shard
+    slat_shard_dir.mkdir(parents=True, exist_ok=True)
+
+    # Migrate any flat legacy files (slat/{obj_id}_*.pt) into the shard subdir.
+    _migrated = 0
+    for oid in obj_ids:
+        src_f = _SLAT_DIR / f"{oid}_feats.pt"
+        src_c = _SLAT_DIR / f"{oid}_coords.pt"
+        if src_f.exists():
+            src_f.rename(slat_shard_dir / f"{oid}_feats.pt")
+            src_c.rename(slat_shard_dir / f"{oid}_coords.pt")
+            _migrated += 1
+    if _migrated:
+        logger.info(f"Migrated {_migrated} flat SLAT files → slat/{shard}/")
+
     logger.info(f"PartVerse GLB dir: {_GLB_DIR}")
 
     # ---- Load part captions (needed by pack step) ----
@@ -227,18 +243,19 @@ def main():
 
     # ---- Multi-GPU encode shortcut ----
     if args.num_gpus > 1 and do_encode:
+        extra_shard_args = ["--shard", shard, "--num-shards", str(args.num_shards)]
         if do_render:
-            extra_worker_args = ["--shard", shard, "--num-shards", str(args.num_shards)]
             run_render(obj_ids, _glb_getter, _IMG_ENC_DIR, _THIRD_PARTY,
                        args.force, args.render_workers,
                        Path(__file__).resolve(), logger,
-                       extra_worker_args=extra_worker_args)
-        launch_multi_gpu_encode(obj_ids, _SLAT_DIR,
+                       extra_worker_args=extra_shard_args)
+        launch_multi_gpu_encode(obj_ids, slat_shard_dir,
                                 Path(__file__).resolve(),
-                                args.num_gpus, args.force, logger)
+                                args.num_gpus, args.force, logger,
+                                extra_args=extra_shard_args)
         if do_pack:
             _run_pack(obj_ids, shard, captions, args.force, logger)
-        print_summary(obj_ids, _IMG_ENC_DIR, _SLAT_DIR, logger)
+        print_summary(obj_ids, _IMG_ENC_DIR, slat_shard_dir, logger)
         return
 
     # ---- Step 1: Render ----
@@ -251,14 +268,14 @@ def main():
 
     # ---- Step 2: Encode (needs raw PNGs + transforms.json) ----
     if do_encode:
-        run_encode(obj_ids, _IMG_ENC_DIR, _SLAT_DIR, _THIRD_PARTY,
+        run_encode(obj_ids, _IMG_ENC_DIR, slat_shard_dir, _THIRD_PARTY,
                    args.force, logger)
 
     # ---- Step 3: Pack (img_Enc → NPZ; can delete raw files safely now) ----
     if do_pack:
         _run_pack(obj_ids, shard, captions, args.force, logger)
 
-    print_summary(obj_ids, _IMG_ENC_DIR, _SLAT_DIR, logger)
+    print_summary(obj_ids, _IMG_ENC_DIR, slat_shard_dir, logger)
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ phase0:
   vlm_model: "/Node11_nvme/zsn/checkpoints/Qwen3.5-27B"
   vlm_base_url: "http://localhost:8002/v1"
   vlm_api_key: "dummy"
-  views_for_labeling: [0, 10, 20, 30]
+  views_for_labeling: [32, 33, 34, 35]
   max_workers: 2
   batch_size: 50
   cache_dir: "cache/phase0"

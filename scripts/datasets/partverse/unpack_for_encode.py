@@ -39,8 +39,9 @@ def unpack_one(obj_id: str, npz_path: Path, img_enc_dir: Path,
     if (img_enc_dir / "transforms.json").exists():
         return obj_id, "skip_exists"
 
-    if ((_SLAT_DIR / f"{obj_id}_feats.pt").exists() and
-            (_SLAT_DIR / f"{obj_id}_coords.pt").exists()):
+    # Check both flat slat/ and shard subdirs slat/*/{obj_id}_feats.pt
+    if (any(_SLAT_DIR.rglob(f"{obj_id}_feats.pt")) and
+            any(_SLAT_DIR.rglob(f"{obj_id}_coords.pt"))):
         return obj_id, "skip_encoded"
 
     if not (img_enc_dir / "voxels.ply").exists():

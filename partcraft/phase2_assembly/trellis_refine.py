@@ -312,15 +312,25 @@ class TrellisRefiner:
             return mask, "Global"
 
         import open3d as o3d
+        import tempfile
 
-        # Load VD's normalized mesh.ply for reference frame
+        # Load VD's normalized mesh for reference frame.
+        # Prefer img_Enc/mesh.ply; fall back to full.ply packed in mesh NPZ
+        # (mesh.ply is deleted after packing, but full.ply is equivalent).
         vd_mesh_path = str(self.img_enc_dir / obj_id / "mesh.ply")
-        if not os.path.exists(vd_mesh_path):
-            raise FileNotFoundError(
-                f"VD mesh.ply not found at {vd_mesh_path}. "
-                "Run encode_object first.")
-
-        vd_mesh = o3d.io.read_triangle_mesh(vd_mesh_path)
+        if os.path.exists(vd_mesh_path):
+            vd_mesh = o3d.io.read_triangle_mesh(vd_mesh_path)
+        else:
+            npz = np.load(obj_record.mesh_npz_path, allow_pickle=False)
+            if "full.ply" not in npz:
+                raise FileNotFoundError(
+                    f"VD mesh.ply not found at {vd_mesh_path} and "
+                    f"full.ply not found in {obj_record.mesh_npz_path}.")
+            _tmp = tempfile.NamedTemporaryFile(suffix=".ply", delete=False)
+            _tmp.write(npz["full.ply"].tobytes())
+            _tmp.close()
+            vd_mesh = o3d.io.read_triangle_mesh(_tmp.name)
+            os.unlink(_tmp.name)
         vd_verts = np.asarray(vd_mesh.vertices)
         vd_center = (vd_verts.max(0) + vd_verts.min(0)) / 2
         vd_extent = (vd_verts.max(0) - vd_verts.min(0)).max()

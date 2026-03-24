@@ -39,7 +39,7 @@ phase0:
   local_max_model_len: 32768
   local_tensor_parallel: 1
 
-  views_for_labeling: [0, 10, 20, 30]
+  views_for_labeling: [32, 33, 34, 35]
   max_workers: 2          # local GPU: fewer workers to avoid OOM
   batch_size: 50
   cache_dir: "cache/phase0"

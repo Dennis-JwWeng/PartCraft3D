@@ -54,6 +54,15 @@ from partcraft.io.partcraft_loader import (
     _to_ply,
 )
 
+# Views selected from the 150-view Hammersley sequence to pack into images NPZ.
+# Four layers: bottom / low-diagonal / horizontal(VLM) / upper-diagonal.
+# transforms.json is always packed in full (all 150 frames needed for mask rendering).
+PACK_VIEWS: list[int] = [
+    8, 9, 10, 11,          # bottom   (pitch ≈ -52° to -45°)
+    23, 24, 25, 26,        # low      (pitch ≈ -23° to -18°)
+    32, 33, 34, 35,        # horiz    (pitch ≈  -8° to  -4°) ← VLM labeling views
+    89, 90, 91, 100,       # upper    (pitch ≈  27° to  34°)
+]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -99,8 +108,14 @@ def _load_source_mesh(obj_id: str):
 
 def _pack_one(obj_id: str, img_enc_dir: Path,
                render_out: Path, mesh_out: Path,
-               captions: dict) -> dict:
-    """Pack one PartVerse object into render + mesh NPZ."""
+               captions: dict,
+               keep_views: list[int] | None = None) -> dict:
+    """Pack one PartVerse object into render + mesh NPZ.
+
+    Args:
+        keep_views: View indices to include in the render NPZ. None = all views.
+                    transforms.json is always packed in full regardless.
+    """
     transforms_path = img_enc_dir / "transforms.json"
     if not transforms_path.exists():
         return {"status": "skip", "reason": "no transforms.json"}
@@ -109,10 +124,13 @@ def _pack_one(obj_id: str, img_enc_dir: Path,
         transforms = json.load(f)
     frames = transforms["frames"]
 
-    # ---- Collect rendered PNGs ----
+    # ---- Collect rendered PNGs (only selected views) ----
+    view_set = set(keep_views) if keep_views is not None else set(range(len(frames)))
     render_data: dict[str, np.ndarray] = {}
     found = 0
     for i in range(len(frames)):
+        if i not in view_set:
+            continue
         png = img_enc_dir / f"{i:03d}.png"
         if not png.exists():
             continue
@@ -259,7 +277,8 @@ def main():
             skip += 1
             continue
 
-        result = _pack_one(obj_id, img_enc_dir, render_out, mesh_out, captions)
+        result = _pack_one(obj_id, img_enc_dir, render_out, mesh_out, captions,
+                           keep_views=PACK_VIEWS)
 
         if result["status"] == "ok":
             ok += 1

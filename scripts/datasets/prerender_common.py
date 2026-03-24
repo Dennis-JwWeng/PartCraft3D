@@ -277,22 +277,31 @@ def run_encode(
     sys.path.insert(0, str(third_party_dir))
     os.chdir(str(third_party_dir))
     os.makedirs("outputs/slat", exist_ok=True)
+    slat_dir.mkdir(parents=True, exist_ok=True)
 
     from encode_asset.encode_into_SLAT import encode_into_SLAT
+
+    # encode_into_SLAT always saves to outputs/slat/ (flat, via symlink).
+    # Resolve its absolute path so we can move files to slat_dir if different.
+    _flat_slat = Path("outputs/slat").resolve()
 
     for i, oid in enumerate(pending):
         logger.info(f"[encode {i+1}/{len(pending)}] {oid}")
         try:
             encode_into_SLAT(oid)
-            feats = slat_dir / f"{oid}_feats.pt"
-            if feats.exists():
-                logger.info(f"  -> SLAT encoded ({feats.stat().st_size // 1024} KB)")
-                # Remove rendered PNGs and transforms.json — they are packed into NPZ
-                # already; only voxels.ply (cache sentinel) is kept.
-                obj_dir = img_enc_dir / oid
-                for f in obj_dir.iterdir():
-                    if f.suffix in (".png", ".jpg") or f.name == "transforms.json":
-                        f.unlink()
+
+            # Move from flat outputs/slat/ to slat_dir if they differ
+            src_feats  = _flat_slat / f"{oid}_feats.pt"
+            src_coords = _flat_slat / f"{oid}_coords.pt"
+            dst_feats  = slat_dir / f"{oid}_feats.pt"
+            dst_coords = slat_dir / f"{oid}_coords.pt"
+            if src_feats.exists() and src_feats.resolve() != dst_feats.resolve():
+                src_feats.rename(dst_feats)
+                src_coords.rename(dst_coords)
+
+            if dst_feats.exists():
+                logger.info(f"  -> SLAT encoded ({dst_feats.stat().st_size // 1024} KB)")
+                # Keep PNGs and transforms.json in img_Enc (full 150-view archive).
             else:
                 logger.error(f"  -> feats.pt not found after encoding")
         except Exception as e:
@@ -311,8 +320,14 @@ def launch_multi_gpu_encode(
     num_gpus: int,
     force: bool,
     logger: logging.Logger,
+    extra_args: list[str] | None = None,
 ):
-    """Launch one encode subprocess per GPU, each processing a shard."""
+    """Launch one encode subprocess per GPU, each processing a shard.
+
+    Args:
+        extra_args: Additional CLI args forwarded to each worker subprocess
+                    (e.g. ["--shard", "00", "--num-shards", "10"]).
+    """
     pending = [
         oid for oid in obj_ids
         if force or not (slat_dir / f"{oid}_feats.pt").exists()
@@ -339,6 +354,7 @@ def launch_multi_gpu_encode(
             sys.executable, str(script_path),
             "--encode-only",
             "--obj-ids", *shard,
+            *(extra_args or []),
         ]
         if force:
             cmd.append("--force")

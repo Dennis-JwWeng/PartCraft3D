@@ -49,10 +49,14 @@ def load_decoder():
 
 def load_slat(obj_id: str, slat_dir: Path):
     from trellis.modules import sparse as sp
-    feats_path  = slat_dir / f"{obj_id}_feats.pt"
-    coords_path = slat_dir / f"{obj_id}_coords.pt"
-    if not feats_path.exists() or not coords_path.exists():
-        raise FileNotFoundError(f"SLAT not found for {obj_id}")
+    # Search recursively (supports both flat slat/ and shard-based slat/{shard}/)
+    candidates = list(slat_dir.rglob(f"{obj_id}_feats.pt"))
+    if not candidates:
+        raise FileNotFoundError(f"SLAT not found for {obj_id} under {slat_dir}")
+    feats_path  = candidates[0]
+    coords_path = feats_path.parent / f"{obj_id}_coords.pt"
+    if not coords_path.exists():
+        raise FileNotFoundError(f"coords.pt not found for {obj_id}")
     feats  = torch.load(feats_path,  weights_only=True).float().cuda()
     coords = torch.load(coords_path, weights_only=True).cuda()
     return sp.SparseTensor(feats=feats, coords=coords)
@@ -107,10 +111,10 @@ def main():
     out_dir  = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Collect available encoded objects
-    feats_files = sorted(slat_dir.glob("*_feats.pt"))
+    # Collect available encoded objects (search recursively for shard subdirs)
+    feats_files = sorted(slat_dir.rglob("*_feats.pt"))
     available   = [f.stem.removesuffix("_feats") for f in feats_files
-                   if (slat_dir / f"{f.stem.removesuffix('_feats')}_coords.pt").exists()]
+                   if (f.parent / f"{f.stem.removesuffix('_feats')}_coords.pt").exists()]
 
     if not available:
         logger.error(f"No encoded objects found in {slat_dir}")
