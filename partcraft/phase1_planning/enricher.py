@@ -130,7 +130,8 @@ Return JSON only, no fences:
     "desc":"curved metallic knife","desc_without":"warrior with empty hand",
     "best_view_idx":0,
     "deletion":{{"prompt":"Remove the knife from the hand","after_desc":"warrior with empty hand"}},
-    "swaps":[{{"prompt":"Replace the knife with a battle axe","before_desc":"curved knife","after_desc":"heavy battle axe"}}]}},
+    "swaps":[{{"prompt":"Replace the knife with a battle axe","before_desc":"curved knife","after_desc":"heavy battle axe"}}],
+    "materials":[{{"prompt":"Change the knife to rusty iron","after_desc":"rusty iron knife"}}]}},
   {{"group_name":"accessories","part_ids":[1,9,10,11],"is_core":false,"desc":"clothing and straps"}}
 ],
 "global_edits":[{{"prompt":"Make the entire object wooden","after_desc":"wooden carved version","best_view_idx":0}},{{"prompt":"Transform into sci-fi style","after_desc":"metallic sci-fi version","best_view_idx":1}}]}}
@@ -151,6 +152,10 @@ RULES:
   before_desc / after_desc: part appearance before/after (under 8 words each).
   BAD: "Make the blade golden"
   GOOD: "Replace the blade with an axe head"
+- materials: 0-1 MATERIAL/TEXTURE changes for this group (shape stays the same).
+  prompt: "Change the X to Y material" (under 15 words).
+  after_desc: what the part looks like after material change (under 8 words).
+  GOOD: "Change the knife to rusty iron", "Make the legs wooden"
 - global_edits: 2-3 whole-object style/material/theme changes (no add/remove parts). Include best_view_idx (0-3) for the view that best represents the object for this edit.
 - object_desc: 1 sentence, under 15 words."""
 
@@ -641,8 +646,9 @@ def _result_groups_to_record(result: dict, uid: str, category: str,
 
         deletion = group.get("deletion")
         swaps = group.get("swaps", [])
+        materials = group.get("materials", [])
 
-        if not deletion and not swaps:
+        if not deletion and not swaps and not materials:
             continue  # No edits for groups without clear semantics
 
         edits: list[dict] = []
@@ -671,6 +677,16 @@ def _result_groups_to_record(result: dict, uid: str, category: str,
                 "after_desc": swap.get("after_desc", ""),
                 "before_part_desc": swap.get("before_desc", gdesc),
                 "after_part_desc": swap.get("after_desc", ""),
+            })
+
+        for mat in materials:
+            edits.append({
+                "type": "material",
+                "mod_type": "material",
+                "prompt": mat.get("prompt", ""),
+                "after_desc": mat.get("after_desc", ""),
+                "before_part_desc": gdesc,
+                "after_part_desc": mat.get("after_desc", ""),
             })
 
         group_edits_out.append({

@@ -52,6 +52,10 @@ from scripts.pipeline_common import (
     resolve_api_key, normalize_cache_dirs, set_attn_backend, create_dataset,
     resolve_data_dirs,
 )
+from partcraft.edit_types import (
+    DELETION, ADDITION, MODIFICATION, SCALE, MATERIAL, GLOBAL, IDENTITY,
+    MESH_ONLY_TYPES, NO_GEN_TYPES, S1_S2_TYPES, S2_ONLY_TYPES, TYPE_ORDER,
+)
 
 
 def run_streaming(cfg, dataset, logger, args):
@@ -289,12 +293,13 @@ def run_streaming(cfg, dataset, logger, args):
                                              ensure_ascii=False) + "\n")
                 spec_fp.flush()
 
-            n_del = sum(1 for s in obj_specs if s.edit_type == "deletion")
-            n_add = sum(1 for s in obj_specs if s.edit_type == "addition")
-            n_mod = sum(1 for s in obj_specs if s.edit_type == "modification")
-            n_g = sum(1 for s in obj_specs if s.edit_type == "global")
+            from collections import Counter
+            _tcounts = Counter(s.edit_type for s in obj_specs)
+            _tparts = [f"{t}={_tcounts[t]}" for t in
+                       [DELETION, ADDITION, MODIFICATION, SCALE, MATERIAL,
+                        GLOBAL, IDENTITY] if _tcounts.get(t)]
             logger.info(f"  Planned: {len(obj_specs)} specs "
-                        f"(del={n_del} add={n_add} mod={n_mod} glb={n_g})")
+                        f"({' '.join(_tparts)})")
             total_specs += len(obj_specs)
 
             if not obj_specs:
@@ -303,10 +308,13 @@ def run_streaming(cfg, dataset, logger, args):
             # ---- Step 3+4: 3D edit (with inline 2D) ----
             run_specs = [s for s in obj_specs
                          if s.edit_id not in done_edits
-                         and s.edit_type != "addition"]
-            add_specs = [s for s in obj_specs if s.edit_type == "addition"]
+                         and s.edit_type not in (ADDITION, IDENTITY)]
+            add_specs = [s for s in obj_specs if s.edit_type == ADDITION]
+            idt_specs = [s for s in obj_specs
+                         if s.edit_type == IDENTITY
+                         and s.edit_id not in done_edits]
 
-            if not run_specs and not add_specs:
+            if not run_specs and not add_specs and not idt_specs:
                 logger.info("  All edits already done, skipping")
                 continue
 
@@ -326,9 +334,8 @@ def run_streaming(cfg, dataset, logger, args):
                 res_fp.flush()
                 continue
 
-            # Sort: deletion → modification → global
-            type_order = {"deletion": 0, "modification": 1, "global": 2}
-            run_specs.sort(key=lambda s: type_order.get(s.edit_type, 9))
+            # Sort: deletion → modification → scale → material → global
+            run_specs.sort(key=lambda s: TYPE_ORDER.get(s.edit_type, 9))
 
             first_pair_dir = None
 
@@ -340,9 +347,9 @@ def run_streaming(cfg, dataset, logger, args):
                             f"\"{spec.edit_prompt[:60]}\"")
 
                 try:
-                    edit_type = spec.edit_type.capitalize()
+                    edit_type = spec.edit_type
 
-                    if edit_type == "Deletion":
+                    if edit_type == DELETION:
                         # Direct GT mesh deletion — no SLAT/generation needed
                         from partcraft.phase2_assembly.trellis_refine import TrellisRefiner
                         pair_dir = mesh_pairs_dir / spec.edit_id
@@ -367,29 +374,31 @@ def run_streaming(cfg, dataset, logger, args):
                         logger.info(f"    OK (direct deletion, GT mesh) "
                                     f"→ {pair_dir}")
                         continue
-                    elif edit_type == "Modification":
+                    elif edit_type in (MODIFICATION, SCALE):
+                        # S1+S2 repaint — needs part mask
                         if spec.remove_part_ids:
                             edit_part_ids = spec.remove_part_ids
                         else:
                             edit_part_ids = [spec.old_part_id]
-                    elif edit_type == "Global":
+                    elif edit_type == MATERIAL:
+                        # S2 only with part mask — texture change
+                        edit_part_ids = [spec.old_part_id]
+                    elif edit_type == GLOBAL:
                         edit_part_ids = []
                     else:
                         continue
 
-                    # Build mask
+                    # Build mask (build_part_mask uses capitalized type names)
+                    mask_type = edit_type.capitalize()
                     mask, effective_type = refiner.build_part_mask(
-                        uid, obj_record, edit_part_ids, ori_slat, edit_type)
-                    if effective_type != edit_type:
+                        uid, obj_record, edit_part_ids, ori_slat, mask_type)
+                    if effective_type != mask_type:
                         logger.info(f"    Auto-promoted → {effective_type}")
-                        edit_type = effective_type
                     if mask.sum() == 0:
                         raise RuntimeError("Empty mask")
 
                     # Build prompts
                     prompts = build_prompts_from_spec(spec)
-                    if prompts["edit_type"] != edit_type:
-                        prompts["edit_type"] = edit_type
 
                     # Inline 2D edit (with cache read/write)
                     img_cond = None
@@ -516,7 +525,7 @@ def run_streaming(cfg, dataset, logger, args):
                     rec = {
                         "edit_id": spec.edit_id,
                         "edit_type": spec.edit_type,
-                        "effective_edit_type": edit_type,
+                        "effective_edit_type": effective_type,
                         "obj_id": uid,
                         "edit_prompt": spec.edit_prompt,
                         **export_paths,
@@ -566,7 +575,7 @@ def run_streaming(cfg, dataset, logger, args):
                             else:
                                 shutil.copy2(str(src), str(dst))
                     res_fp.write(json.dumps({
-                        "edit_id": spec.edit_id, "edit_type": "addition",
+                        "edit_id": spec.edit_id, "edit_type": ADDITION,
                         "obj_id": uid, "status": "success",
                         "edit_prompt": spec.edit_prompt,
                         "source_del_id": spec.source_del_id,
@@ -579,6 +588,45 @@ def run_streaming(cfg, dataset, logger, args):
                         "edit_id": spec.edit_id, "status": "failed",
                         "reason": f"Source deletion {spec.source_del_id} "
                                   f"output not found",
+                    }) + "\n")
+                    res_fp.flush()
+                    total_fail += 1
+
+            # Handle identity edits (no-op: before=after, for anti-hallucination training)
+            for spec in idt_specs:
+                if spec.edit_id in done_edits:
+                    continue
+                idt_pair = mesh_pairs_dir / spec.edit_id
+                # Reuse any existing "before" from this object
+                if first_pair_dir and (first_pair_dir / "before.ply").exists():
+                    idt_pair.mkdir(parents=True, exist_ok=True)
+                    before_ply = first_pair_dir / "before.ply"
+                    shutil.copy2(str(before_ply),
+                                 str(idt_pair / "before.ply"))
+                    shutil.copy2(str(before_ply),
+                                 str(idt_pair / "after.ply"))
+                    before_slat = first_pair_dir / "before_slat"
+                    if before_slat.exists():
+                        shutil.copytree(str(before_slat),
+                                        str(idt_pair / "before_slat"))
+                        shutil.copytree(str(before_slat),
+                                        str(idt_pair / "after_slat"))
+                    res_fp.write(json.dumps({
+                        "edit_id": spec.edit_id,
+                        "edit_type": IDENTITY,
+                        "effective_edit_type": "Identity",
+                        "obj_id": uid, "status": "success",
+                        "edit_prompt": spec.edit_prompt,
+                    }, ensure_ascii=False) + "\n")
+                    res_fp.flush()
+                    done_edits.add(spec.edit_id)
+                    total_success += 1
+                    logger.info(f"  [{spec.edit_id}] identity: "
+                                f"before=after (no-op)")
+                else:
+                    res_fp.write(json.dumps({
+                        "edit_id": spec.edit_id, "status": "failed",
+                        "reason": "No before mesh available for identity",
                     }) + "\n")
                     res_fp.flush()
                     total_fail += 1

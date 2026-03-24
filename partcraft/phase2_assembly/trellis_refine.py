@@ -114,10 +114,19 @@ def build_prompts_from_spec(spec) -> dict:
     structure (s1) and appearance (s2) channels locally, matching VD's
     decompose_prompt() which uses an LLM to strip shape-adjectives
     for s2 and color/material-adjectives for s1.
+
+    Supports all edit types from partcraft.edit_types:
+      - modification/scale → Modification (S1+S2 repaint)
+      - material           → TextureOnly (S2 only, part mask)
+      - global             → TextureOnly (S2 only, full mask)
+      - deletion           → Deletion (voxel removal)
+      - addition           → Addition (S1+S2 generation)
+      - identity           → not routed here (handled by pipeline)
     """
-    edit_type = spec.edit_type.capitalize()
-    if edit_type not in ("Modification", "Deletion", "Addition", "Global"):
-        edit_type = "Modification"
+    from partcraft.edit_types import trellis_effective_type
+
+    raw_type = spec.edit_type
+    edit_type = trellis_effective_type(raw_type)
 
     obj_desc = spec.object_desc or ""
     after_desc = spec.after_desc or obj_desc
@@ -141,7 +150,8 @@ def build_prompts_from_spec(spec) -> dict:
 
     return {
         "edit_prompt": edit_prompt,
-        "edit_type": edit_type,
+        "edit_type": edit_type,         # TRELLIS-level type
+        "raw_edit_type": raw_type,      # PartCraft-level type
         "editing_part": old_label,
         "target_part": after_part,
         # Complete descriptions (ori = before, new = after)
@@ -451,7 +461,7 @@ class TrellisRefiner:
         # Promote to Global: full mask + Inverse Flow preserves structure,
         # TRELLIS regenerates the whole object guided by the edit prompt.
         n_slat_total = slat.coords.shape[0]
-        if n_slat_total > 0 and edit_type == "Modification":
+        if n_slat_total > 0 and edit_type in ("Modification", "Scale"):
             part_ratio = n_edit_slat / n_slat_total
             if part_ratio > large_part_threshold:
                 logger.warning(
@@ -465,7 +475,7 @@ class TrellisRefiner:
         # and rely on soft S1/S2 blending for smooth transitions.
         # TRELLIS generation fills the edit region; soft mask handles
         # boundary continuity without cutting into preserved geometry.
-        if edit_type == "Modification":
+        if edit_type in ("Modification", "Scale"):
             # Expanded mask: edit_parts + surrounding empty space (pad=3).
             # S1 repaint needs room to generate a replacement part that
             # may differ in size/shape from the original.  Using only
@@ -473,6 +483,12 @@ class TrellisRefiner:
             # in the exact same footprint, producing near-identical output.
             mask = self._compute_editing_region(
                 slat, edit_parts, preserved_parts, pad=3)
+        elif edit_type == "Material":
+            # Material: S2 only within part mask. Tight mask (no expansion)
+            # since geometry is unchanged — only texture gets repainted.
+            mask = edit_parts.clone()
+            logger.info(f"Material mask: {int(mask.sum())} voxels "
+                        f"(S2 texture-only, no geometry change)")
         elif edit_type == "Deletion":
             # Direct deletion: mask = exact edit part, no dilation needed.
             # Voxels in mask are directly removed from SLAT; remaining
@@ -1125,32 +1141,33 @@ class TrellisRefiner:
         """
         from interweave_Trellis import interweave_Trellis_TI
         from trellis.modules import sparse as sp
+        from partcraft.edit_types import (
+            MODIFICATION, SCALE, MATERIAL, GLOBAL,
+            S1_S2_TYPES, S2_ONLY_TYPES, trellis_effective_type,
+        )
 
-        edit_type = prompts.get('edit_type', 'Modification')
+        trellis_type = prompts.get('edit_type', 'Modification')
+        raw_type = prompts.get('raw_edit_type', '')
 
         # --- Route edit types ---
-        is_global = (edit_type == "Global")
-
         if combinations is None:
-            if is_global:
+            if raw_type in S2_ONLY_TYPES or trellis_type == "TextureOnly":
+                # Material (part-level) / Global (full mask): S2 only
                 combinations = [
                     {"s1_pos_cond": "ori_s1_cpl", "s1_neg_cond": "ori_s1_cpl",
                      "s2_pos_cond": "new_s2_cpl", "s2_neg_cond": "ori_s2_cpl",
                      "cnt": 1, "cfg_strength": 5.0},
                 ]
             else:
-                # Modification/Addition
+                # Modification / Scale / Addition: S1+S2 repaint
                 combinations = [
                     {"s1_pos_cond": "new_s1_cpl", "s1_neg_cond": "ori_s1_cpl",
                      "s2_pos_cond": "new_s2_cpl", "s2_neg_cond": "ori_s2_cpl",
                      "cnt": 1, "cfg_strength": 7.5},
                 ]
 
-        # Global → "TextureOnly": skip S1, keep original coords, S2 only.
-        if is_global:
-            effective_edit_type = "TextureOnly"
-        else:
-            effective_edit_type = edit_type
+        # Map to interweave_Trellis_TI's understood types
+        effective_edit_type = trellis_effective_type(raw_type) if raw_type else trellis_type
 
         # Setup image conditioning
         # Priority: img_cond (multi-view averaged) > img_new (single) > blank

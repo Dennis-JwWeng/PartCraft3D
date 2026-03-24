@@ -1,21 +1,28 @@
 """Phase 1: Edit planning — generate edit specifications from the Part Catalog.
 
-Four edit strategies:
-  1. Deletion     (remove a part from an object)
-  2. Addition     (add a part to an object — reverse of deletion)
-  3. Modification (swap a part's shape via VLM + TRELLIS)
-  4. Global       (change whole-object style/theme via VLM + TRELLIS)
+Seven edit strategies (see partcraft/edit_types.py for taxonomy):
+  1. Deletion     — remove a part from an object (GT mesh)
+  2. Addition     — add a part to an object (reverse of deletion)
+  3. Modification — swap a part's shape (TRELLIS S1+S2)
+  4. Scale        — anisotropic part scaling (TRELLIS S1+S2)
+  5. Material     — part-level material/texture change (TRELLIS S2 only)
+  6. Global       — change whole-object style/theme (TRELLIS S2 only)
+  7. Identity     — no-op, irrelevant instruction (anti-hallucination)
 
-Deletion specs are generated first, then additions (as their reverse),
-then modifications (swap only), then global edits.
+Order: deletion → addition → modification → scale → material → global → identity
 """
 
 from __future__ import annotations
 
 import json
+import random
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+from partcraft.edit_types import (
+    DELETION, ADDITION, MODIFICATION, SCALE, MATERIAL, GLOBAL, IDENTITY,
+    ID_PREFIX, SCALE_TEMPLATES, MATERIAL_TEMPLATES, IDENTITY_PROMPTS,
+)
 from partcraft.phase0_semantic.catalog import PartCatalog, CatalogEntry
 
 
@@ -23,7 +30,7 @@ from partcraft.phase0_semantic.catalog import PartCatalog, CatalogEntry
 class EditSpec:
     """Specification for a single edit operation."""
     edit_id: str
-    edit_type: str                     # "deletion" | "addition" | "modification"
+    edit_type: str                     # see partcraft.edit_types for constants
     obj_id: str
     shard: str
     object_desc: str
@@ -407,7 +414,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
         List of EditSpec for this single object.
     """
     # Per-object counters (reset per object, namespaced by obj_id hash)
-    _counters = {"del": 0, "add": 0, "mod": 0, "glb": 0}
+    _counters = {v: 0 for v in ID_PREFIX.values()}
 
     min_parts = cfg["phase1"].get("min_parts_per_object", 2)
     max_global = cfg["phase1"].get("max_global_edits_per_object", 3)
@@ -488,7 +495,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
             elif etype == "modification":
                 specs.append(EditSpec(
                     edit_id=_make_edit_id("mod", obj_id, _counters["mod"]),
-                    edit_type="modification",
+                    edit_type=MODIFICATION,
                     obj_id=obj_id, shard=shard,
                     object_desc=obj_desc, before_desc=obj_desc,
                     old_part_id=grp_pids[0] if grp_pids else -1,
@@ -502,6 +509,23 @@ def plan_edits_for_record(record: dict, cfg: dict,
                     best_view=grp_best_view,
                 ))
                 _counters["mod"] += 1
+            elif etype == "material":
+                specs.append(EditSpec(
+                    edit_id=_make_edit_id("mat", obj_id, _counters["mat"]),
+                    edit_type=MATERIAL,
+                    obj_id=obj_id, shard=shard,
+                    object_desc=obj_desc, before_desc=obj_desc,
+                    old_part_id=grp_pids[0] if grp_pids else -1,
+                    old_label=grp_labels[0] if grp_labels else "",
+                    remove_part_ids=grp_pids, keep_part_ids=keep_pids,
+                    edit_prompt=edit.get("prompt", ""),
+                    after_desc=edit.get("after_desc", ""),
+                    before_part_desc=edit.get("before_part_desc", grp_desc),
+                    after_part_desc=edit.get("after_part_desc", ""),
+                    mod_type="material",
+                    best_view=grp_best_view,
+                ))
+                _counters["mat"] += 1
 
     # --- Per-part edits (deletion / addition / modification) ---
     for part in parts:
@@ -583,7 +607,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
             continue
         specs.append(EditSpec(
             edit_id=_make_edit_id("glb", obj_id, _counters["glb"]),
-            edit_type="global",
+            edit_type=GLOBAL,
             obj_id=obj_id, shard=shard,
             object_desc=obj_desc, before_desc=obj_desc,
             edit_prompt=prompt,
@@ -591,6 +615,82 @@ def plan_edits_for_record(record: dict, cfg: dict,
             best_view=obj_best_view,
         ))
         _counters["glb"] += 1
+
+    # --- Scale edits (anisotropic part scaling) ---
+    max_scale = cfg["phase1"].get("max_scale_edits_per_part", 1)
+    rng = random.Random(hash(obj_id))
+    for part in parts:
+        pid = part["part_id"]
+        label = part.get("label", f"part_{pid}")
+        is_core = part.get("core", False) or label in core_cats
+
+        keep_pids = [p for p in all_pids if p != pid]
+        if not keep_pids:
+            continue
+
+        templates = rng.sample(SCALE_TEMPLATES,
+                               min(max_scale, len(SCALE_TEMPLATES)))
+        for tmpl_prompt, tmpl_before, tmpl_after in templates:
+            specs.append(EditSpec(
+                edit_id=_make_edit_id("scl", obj_id, _counters["scl"]),
+                edit_type=SCALE,
+                obj_id=obj_id, shard=shard,
+                object_desc=obj_desc, before_desc=obj_desc,
+                old_part_id=pid, old_label=label,
+                keep_part_ids=keep_pids,
+                edit_prompt=tmpl_prompt.format(part=label),
+                after_desc=obj_desc,
+                before_part_desc=tmpl_before.format(part=label),
+                after_part_desc=tmpl_after.format(part=label),
+                mod_type="scale",
+                best_view=obj_best_view,
+            ))
+            _counters["scl"] += 1
+
+    # --- Material edits (part-level texture change) ---
+    max_material = cfg["phase1"].get("max_material_edits_per_part", 1)
+    for part in parts:
+        pid = part["part_id"]
+        label = part.get("label", f"part_{pid}")
+
+        keep_pids = [p for p in all_pids if p != pid]
+        if not keep_pids:
+            continue
+
+        templates = rng.sample(MATERIAL_TEMPLATES,
+                               min(max_material, len(MATERIAL_TEMPLATES)))
+        for tmpl_prompt, tmpl_after in templates:
+            specs.append(EditSpec(
+                edit_id=_make_edit_id("mat", obj_id, _counters["mat"]),
+                edit_type=MATERIAL,
+                obj_id=obj_id, shard=shard,
+                object_desc=obj_desc, before_desc=obj_desc,
+                old_part_id=pid, old_label=label,
+                keep_part_ids=keep_pids,
+                edit_prompt=tmpl_prompt.format(part=label),
+                after_desc=obj_desc,
+                before_part_desc=label,
+                after_part_desc=tmpl_after.format(part=label),
+                mod_type="material",
+                best_view=obj_best_view,
+            ))
+            _counters["mat"] += 1
+
+    # --- Identity edits (no-op, anti-hallucination) ---
+    max_identity = cfg["phase1"].get("max_identity_edits_per_object", 1)
+    id_prompts = rng.sample(IDENTITY_PROMPTS,
+                            min(max_identity, len(IDENTITY_PROMPTS)))
+    for prompt in id_prompts:
+        specs.append(EditSpec(
+            edit_id=_make_edit_id("idt", obj_id, _counters["idt"]),
+            edit_type=IDENTITY,
+            obj_id=obj_id, shard=shard,
+            object_desc=obj_desc, before_desc=obj_desc,
+            edit_prompt=prompt,
+            after_desc=obj_desc,
+            best_view=obj_best_view,
+        ))
+        _counters["idt"] += 1
 
     return specs
 
@@ -607,12 +707,13 @@ def run_phase1(cfg: dict, catalog: PartCatalog,
 
     all_specs = plan_edits(catalog, cfg)
 
-    n_del = sum(1 for s in all_specs if s.edit_type == "deletion")
-    n_add = sum(1 for s in all_specs if s.edit_type == "addition")
-    n_mod = sum(1 for s in all_specs if s.edit_type == "modification")
-    n_glb = sum(1 for s in all_specs if s.edit_type == "global")
-    print(f"  Deletion: {n_del}, Addition: {n_add}, "
-          f"Modification(swap): {n_mod}, Global: {n_glb}")
+    from collections import Counter
+    counts = Counter(s.edit_type for s in all_specs)
+    parts = [f"{t}: {counts.get(t, 0)}"
+             for t in [DELETION, ADDITION, MODIFICATION, SCALE, MATERIAL,
+                       GLOBAL, IDENTITY]
+             if counts.get(t, 0) > 0]
+    print(f"  {', '.join(parts)}")
     print(f"  Total: {len(all_specs)} edit specs")
 
     with open(output_path, "w") as f:

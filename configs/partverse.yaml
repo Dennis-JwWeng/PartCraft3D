@@ -43,6 +43,10 @@ phase1:
   core_categories: ["body", "torso", "base", "frame", "main", "head", "wall", "floor"]
   max_swap_candidates: 5
   min_cluster_size: 50
+  max_scale_edits_per_part: 1
+  max_material_edits_per_part: 1
+  max_identity_edits_per_object: 1
+  max_global_edits_per_object: 3
   cache_dir: "cache/phase1"
 
 phase2:
