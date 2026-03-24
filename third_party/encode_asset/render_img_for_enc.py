@@ -42,6 +42,11 @@ def render(file_path, name, output_dir, num_views=150):
 
 def voxelize(file, name, output_dir):
     mesh = o3d.io.read_triangle_mesh(file)
+    if len(mesh.vertices) == 0:
+        raise RuntimeError(
+            f"Open3D failed to read '{file}' (empty mesh). "
+            "The PLY header may contain unsupported custom attributes."
+        )
     # clamp vertices to the range [-0.5, 0.5]
     vertices = np.clip(np.asarray(mesh.vertices), -0.5 + 1e-6, 0.5 - 1e-6)
     mesh.vertices = o3d.utility.Vector3dVector(vertices)

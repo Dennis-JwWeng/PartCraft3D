@@ -22,10 +22,14 @@ Usage:
         python scripts/datasets/partverse/prerender.py \\
         --shard 00 --num-shards 10 --render-workers 4
 
-    # Render + pack only, shard 01 (4 parallel Blender workers)
+    # Render only, shard 01 (4 parallel Blender workers)
     CUDA_VISIBLE_DEVICES=0,1,2,3 \\
         python scripts/datasets/partverse/prerender.py \\
         --shard 01 --num-shards 10 --render-only --render-workers 4
+
+    # Pack only, shard 01 (after render, before or without encode)
+    python scripts/datasets/partverse/prerender.py \\
+        --shard 01 --num-shards 10 --pack-only
 
     # Encode only, shard 02, multi-GPU
     CUDA_VISIBLE_DEVICES=0,1,2,3 ATTN_BACKEND=xformers \\
@@ -160,11 +164,14 @@ def main():
                      help="Cap to first N objects after shard selection (0 = all). "
                           "Useful for quick tests.")
 
-    # Mode
-    parser.add_argument("--render-only", action="store_true",
-                        help="Render + pack only, skip SLAT encode")
-    parser.add_argument("--encode-only", action="store_true",
-                        help="SLAT encode only, skip render + pack")
+    # Mode (mutually exclusive steps; default = all three)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--render-only", action="store_true",
+                      help="Render only (write img_Enc/), skip pack and encode")
+    mode.add_argument("--pack-only", action="store_true",
+                      help="Pack only (img_Enc/ → images/ + mesh/ NPZ), skip render and encode")
+    mode.add_argument("--encode-only", action="store_true",
+                      help="Encode only (img_Enc/ → slat/), skip render and pack")
     parser.add_argument("--force", action="store_true",
                         help="Re-run even if outputs already exist")
 
@@ -204,7 +211,7 @@ def main():
 
     logger.info(f"PartVerse GLB dir: {_GLB_DIR}")
 
-    # ---- Load part captions (for pack step) ----
+    # ---- Load part captions (needed by pack step) ----
     captions: dict = {}
     if not args.encode_only:
         if _CAPTIONS_PATH.exists():
@@ -214,29 +221,42 @@ def main():
         else:
             logger.warning(f"text_captions.json not found — using generic part names")
 
-    # ---- Multi-GPU encode mode (launches subprocesses with --obj-ids) ----
-    if args.num_gpus > 1 and not args.render_only:
+    do_render = not args.pack_only and not args.encode_only
+    do_encode = not args.render_only and not args.pack_only
+    do_pack   = not args.render_only and not args.encode_only
+
+    # ---- Multi-GPU encode shortcut ----
+    if args.num_gpus > 1 and do_encode:
+        if do_render:
+            extra_worker_args = ["--shard", shard, "--num-shards", str(args.num_shards)]
+            run_render(obj_ids, _glb_getter, _IMG_ENC_DIR, _THIRD_PARTY,
+                       args.force, args.render_workers,
+                       Path(__file__).resolve(), logger,
+                       extra_worker_args=extra_worker_args)
         launch_multi_gpu_encode(obj_ids, _SLAT_DIR,
                                 Path(__file__).resolve(),
                                 args.num_gpus, args.force, logger)
+        if do_pack:
+            _run_pack(obj_ids, shard, captions, args.force, logger)
         print_summary(obj_ids, _IMG_ENC_DIR, _SLAT_DIR, logger)
         return
 
-    # ---- Single-process or parallel-render mode ----
-    if not args.encode_only:
-        # Pass --shard to parallel workers so they pack into the correct shard dir
+    # ---- Step 1: Render ----
+    if do_render:
         extra_worker_args = ["--shard", shard, "--num-shards", str(args.num_shards)]
         run_render(obj_ids, _glb_getter, _IMG_ENC_DIR, _THIRD_PARTY,
                    args.force, args.render_workers,
                    Path(__file__).resolve(), logger,
                    extra_worker_args=extra_worker_args)
 
-        # Pack rendered outputs into images/{shard}/ and mesh/{shard}/ NPZ
-        _run_pack(obj_ids, shard, captions, args.force, logger)
-
-    if not args.render_only:
+    # ---- Step 2: Encode (needs raw PNGs + transforms.json) ----
+    if do_encode:
         run_encode(obj_ids, _IMG_ENC_DIR, _SLAT_DIR, _THIRD_PARTY,
                    args.force, logger)
+
+    # ---- Step 3: Pack (img_Enc → NPZ; can delete raw files safely now) ----
+    if do_pack:
+        _run_pack(obj_ids, shard, captions, args.force, logger)
 
     print_summary(obj_ids, _IMG_ENC_DIR, _SLAT_DIR, logger)
 

@@ -514,7 +514,17 @@ def main(arg):
         # export ply mesh (API changed in Blender 4.x)
         ply_path = os.path.join(arg.output_folder, 'mesh.ply')
         if hasattr(bpy.ops, 'wm') and hasattr(bpy.ops.wm, 'ply_export'):
-            bpy.ops.wm.ply_export(filepath=ply_path, export_selected_objects=False)
+            # Blender 4.x: disable non-geometry data to avoid PLY header tokens
+            # (custom attribute names like 'pm0017_00_01') that break Open3D's
+            # RPly parser.
+            bpy.ops.wm.ply_export(
+                filepath=ply_path,
+                export_selected_objects=False,
+                export_uv=False,
+                export_normals=False,
+                export_colors='NONE',
+                export_attributes=False,
+            )
         else:
             bpy.ops.export_mesh.ply(filepath=ply_path)
 

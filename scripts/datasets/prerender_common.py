@@ -327,10 +327,14 @@ def launch_multi_gpu_encode(
     for i, oid in enumerate(pending):
         shards[i % num_gpus].append(oid)
 
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    visible_gpus = [g.strip() for g in visible.split(",") if g.strip()] if visible else []
+
     processes = []
-    for gpu_id, shard in enumerate(shards):
+    for idx, shard in enumerate(shards):
         if not shard:
             continue
+        physical_gpu = visible_gpus[idx] if idx < len(visible_gpus) else str(idx)
         cmd = [
             sys.executable, str(script_path),
             "--encode-only",
@@ -339,14 +343,14 @@ def launch_multi_gpu_encode(
         if force:
             cmd.append("--force")
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-        logger.info(f"[GPU {gpu_id}] {len(shard)} objects")
-        processes.append((gpu_id, subprocess.Popen(cmd, env=env)))
+        env["CUDA_VISIBLE_DEVICES"] = physical_gpu
+        logger.info(f"[GPU {physical_gpu}] {len(shard)} objects")
+        processes.append((physical_gpu, subprocess.Popen(cmd, env=env)))
 
-    for gpu_id, p in processes:
+    for physical_gpu, p in processes:
         ret = p.wait()
         status = "done" if ret == 0 else f"FAILED (exit {ret})"
-        logger.info(f"[GPU {gpu_id}] {status}")
+        logger.info(f"[GPU {physical_gpu}] {status}")
 
 
 # ---------------------------------------------------------------------------
