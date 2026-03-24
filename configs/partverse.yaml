@@ -17,6 +17,7 @@
 #         (update shards: ["00"] to the shard you just packed)
 
 data:
+  data_dir: "data/partverse"
   image_npz_dir: "data/partverse/images"
   mesh_npz_dir:  "data/partverse/mesh"
   # Which shards are ready to process (add as they are packed)
@@ -27,12 +28,12 @@ data:
   img_enc_dir: "data/partverse/img_Enc"
 
 phase0:
-  vlm_backend: "local"
-  vlm_model: "/Node11_nvme/zsn/checkpoints/Qwen3.5-27B"
-  vlm_base_url: "http://localhost:8002/v1"
-  vlm_api_key: "dummy"
+  vlm_backend: "api"
+  vlm_model: "gemini-3.1-flash-lite-preview"
+  vlm_base_url: "https://llm-api.mmchat.xyz/v1"
+  vlm_api_key: "sk-live-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJNZXRhQ2hhdCIsInN1YiI6IjY5YWViNjBjMTk2MzA4YzNlNDJiZTlhYyIsImNsaWVudF9pZCI6IjdmZGFkZDY1MDM5MGU0ZDZiZTg3OGQ0NzFiNGFkMjY5IiwiaWF0IjoxNzczMDYwODE1fQ.gohorU2KohC_lBq2DzGG9S4oGnIVbhB9R-g4nIVlwKA"
   views_for_labeling: [32, 33, 34, 35]
-  max_workers: 2
+  max_workers: 8
   batch_size: 50
   cache_dir: "cache/phase0"
 
@@ -66,7 +67,7 @@ phase2_5:
   max_refine: 1000
   output_format: "glb"
   image_edit_backend: "local_diffusers"
-  image_edit_base_url: "http://localhost:8001"
+  image_edit_base_url: "http://localhost:8002"
   image_edit_enabled: true
   image_edit_workers: 2
   num_edit_views: 8
@@ -87,7 +88,7 @@ phase3:
   min_extent: 0.0001
   max_center_drift: 0.3
   min_bbox_iou: 0.1
-  check_vertex_color: true
+  check_vertex_color: false   # partverse meshes have no baked vertex colors
   max_penetration: 0.3
   max_gap_ratio: 0.15
   max_scale_ratio: 3.0

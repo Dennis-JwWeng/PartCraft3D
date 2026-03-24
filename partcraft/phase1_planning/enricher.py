@@ -45,19 +45,25 @@ def _select_orthogonal_views(obj, target_elev: float = 25.0) -> list[int]:
     """Select 4 orthogonal views at ~target_elev° elevation.
 
     Returns view indices for [front(0°), right(90°), back(180°), left(-90°)].
-    Finds the closest match in the prerendered views for each target direction.
+    Only considers views that actually have images in the NPZ
+    (obj.view_indices). Falls back to all frames if view_indices is empty.
     """
     import math
     import numpy as np
 
     transforms = obj.get_transforms()
     frames = transforms["frames"]
+    # Only search among views that have actual images
+    available = set(obj.view_indices) if obj.view_indices else set(range(len(frames)))
     target_azims = [0, 90, 180, -90]
     selected = []
 
     for t_azim in target_azims:
-        best_idx, best_dist = 0, float('inf')
-        for i, frame in enumerate(frames):
+        best_idx, best_dist = min(available), float('inf')
+        for i in available:
+            if i >= len(frames):
+                continue
+            frame = frames[i]
             c2w = np.array(frame["transform_matrix"])
             pos = c2w[:3, 3]
             r = np.linalg.norm(pos)

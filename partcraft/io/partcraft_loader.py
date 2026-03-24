@@ -82,6 +82,9 @@ class ObjectRecord:
     num_views: int = 0
     parts: list[PartInfo] = field(default_factory=list)
     part_id_to_name: list[str] = field(default_factory=list)
+    # Actual view indices present in the NPZ (e.g. [8,9,10,11,...,100]).
+    # Empty list means legacy contiguous 0..num_views-1.
+    view_indices: list[int] = field(default_factory=list)
 
     # Lazily loaded
     _render_npz: np.lib.npyio.NpzFile | None = field(default=None, repr=False)
@@ -386,8 +389,15 @@ class ObjectRecord:
         return {int(v): int(c) for v, c in zip(unique, counts) if v >= 0}
 
     def get_best_view_for_part(self, part_id: int) -> int:
-        best_view, best_count = 0, 0
-        for v in range(self.num_views):
+        """Find the view where this part occupies the most pixels.
+
+        Uses view_indices (actual NPZ view IDs) when available,
+        otherwise falls back to range(num_views) for legacy datasets.
+        """
+        views = self.view_indices if self.view_indices else list(range(self.num_views))
+        best_view = views[0] if views else 0
+        best_count = 0
+        for v in views:
             mask = self.get_mask(v)
             count = int(np.sum(mask == part_id))
             if count > best_count:
@@ -464,10 +474,14 @@ class PartCraftDataset:
                 cluster_size=cluster_info["cluster_size"],
             ))
 
-        num_views = max(
-            sum(1 for k in rnpz.keys() if k.endswith(".png")),
-            sum(1 for k in rnpz.keys() if k.endswith(".webp")),
+        # Discover actual view indices from NPZ keys.
+        # Keys look like "008.png", "037.webp", etc.
+        view_ids = sorted(
+            int(k.split(".")[0])
+            for k in rnpz.keys()
+            if (k.endswith(".png") or k.endswith(".webp")) and k.split(".")[0].isdigit()
         )
+        num_views = len(view_ids)
         rnpz.close()
 
         return ObjectRecord(
@@ -478,6 +492,7 @@ class PartCraftDataset:
             num_views=num_views,
             parts=parts,
             part_id_to_name=part_id_to_name,
+            view_indices=view_ids,
         )
 
     # ---- Data preparation ----

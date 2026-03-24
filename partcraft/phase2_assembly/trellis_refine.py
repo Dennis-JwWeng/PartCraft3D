@@ -246,23 +246,39 @@ class TrellisRefiner:
 
     # ---- Step 1: Load pre-encoded SLAT ----
 
+    def _find_slat_file(self, obj_id: str, suffix: str) -> str:
+        """Locate a SLAT file, supporting both flat and sharded layouts.
+
+        Flat:    slat_dir/{obj_id}_{suffix}.pt
+        Sharded: slat_dir/{shard}/{obj_id}_{suffix}.pt
+        """
+        fname = f"{obj_id}_{suffix}.pt"
+        flat = self.slat_dir / fname
+        if flat.exists():
+            return str(flat)
+        # Search shard subdirectories (00, 01, ...)
+        for entry in sorted(self.slat_dir.iterdir()):
+            if entry.is_dir():
+                candidate = entry / fname
+                if candidate.exists():
+                    return str(candidate)
+        return str(flat)  # return flat path for error message
+
     def encode_object(self, glb_path: str, obj_id: str) -> Any:
         """Load pre-encoded SLAT for an object.
 
-        Requires prerender.py to have been run first (Blender 150 views +
-        Open3D voxelization + DINOv2 + SLAT encoding).
-
-        SLAT files are stored in data/slat/ directory.
+        Supports both flat (slat/{oid}_feats.pt) and sharded
+        (slat/{shard}/{oid}_feats.pt) directory layouts.
         """
         from trellis.modules import sparse as sp
 
-        feats_path = str(self.slat_dir / f"{obj_id}_feats.pt")
-        coords_path = str(self.slat_dir / f"{obj_id}_coords.pt")
+        feats_path = self._find_slat_file(obj_id, "feats")
+        coords_path = self._find_slat_file(obj_id, "coords")
 
         if not os.path.exists(feats_path) or not os.path.exists(coords_path):
             raise FileNotFoundError(
                 f"Pre-encoded SLAT not found for {obj_id}. "
-                f"Run 'python scripts/prerender.py' first.\n"
+                f"Run prerender.py first.\n"
                 f"  Expected: {feats_path}")
 
         logger.info(f"Loading pre-encoded SLAT for {obj_id}")

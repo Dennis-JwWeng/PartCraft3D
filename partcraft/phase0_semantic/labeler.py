@@ -508,12 +508,38 @@ def _load_semantic_json(cfg: dict) -> dict[str, list[str]]:
 
 
 def _get_prerender_dir(cfg: dict, obj_id: str) -> str | None:
-    """Get pre-rendered views directory for an object (if exists)."""
+    """Get pre-rendered views directory for an object (if exists).
+
+    Searches img_enc_dir from config, then default locations.
+    Supports flat (img_Enc/{obj_id}/) and sharded (img_Enc/{shard}/{obj_id}/) layouts.
+    """
     project_root = Path(__file__).parents[2]
-    render_dir = str(project_root / "data" / "partobjaverse_tiny" / "img_Enc" / obj_id)
-    # Check that renders actually exist
-    if os.path.isdir(render_dir) and os.path.exists(os.path.join(render_dir, "000.png")):
-        return render_dir
+
+    # Derive data_dir from config (image_npz_dir parent is the dataset root)
+    data_dir = Path(cfg["data"].get("data_dir",
+                    cfg["data"].get("image_npz_dir", "data/partobjaverse_tiny")))
+    if not data_dir.is_absolute():
+        data_dir = project_root / data_dir
+    # image_npz_dir might be "data/partverse/images" → parent is dataset root
+    if data_dir.name in ("images", "mesh"):
+        data_dir = data_dir.parent
+
+    img_enc = data_dir / "img_Enc"
+    if not img_enc.is_dir():
+        return None
+
+    # Flat layout: img_Enc/{obj_id}/
+    candidate = img_enc / obj_id
+    if candidate.is_dir() and any(candidate.glob("*.png")):
+        return str(candidate)
+
+    # Sharded layout: img_Enc/{shard}/{obj_id}/
+    for shard in sorted(img_enc.iterdir()):
+        if shard.is_dir():
+            candidate = shard / obj_id
+            if candidate.is_dir() and any(candidate.glob("*.png")):
+                return str(candidate)
+
     return None
 
 
