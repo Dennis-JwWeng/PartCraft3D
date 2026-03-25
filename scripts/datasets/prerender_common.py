@@ -190,6 +190,8 @@ def _render_parallel(
             cmd.append("--force")
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        env.setdefault("OPENBLAS_NUM_THREADS", "1")
+        env.setdefault("MKL_NUM_THREADS", "1")
         logger.info(f"[worker {idx} -> GPU {gpu_id}] {len(shard)} objects")
         processes.append((idx, gpu_id, subprocess.Popen(cmd, env=env)))
 

@@ -1,20 +1,30 @@
 import os
 import json
+import logging
+import re
 import numpy as np
-from subprocess import DEVNULL, call
+from subprocess import DEVNULL, Popen, PIPE, STDOUT
 from .utils import sphere_hammersley_sequence
 import open3d as o3d
 import utils3d
 
+logger = logging.getLogger(__name__)
+
 BLENDER_PATH = os.environ.get(
     'BLENDER_PATH',
-    '/DATA_EDS2/shenlc2403/blender/blender-3.5.1-linux-x64/blender',
+    '/usr/local/bin/blender'
 )
+BLENDER_THREADS = int(os.environ.get('BLENDER_THREADS', '0'))
+
+_ERROR_RE = re.compile(
+    r"Error|Traceback|FAILED|WARNING|WARN|CUDA|out of memory", re.IGNORECASE
+)
+_SAVED_RE = re.compile(r"^(?:Saved|Cached): '.*?/(\d+)\.png'")
 
 def render(file_path, name, output_dir, num_views=150):
+    """Returns the Blender process exit code (0 = success)."""
     output_folder = os.path.join(output_dir, name)
-    
-    # Build camera {yaw, pitch, radius, fov}
+
     yaws = []
     pitchs = []
     for i in range(num_views):
@@ -24,9 +34,11 @@ def render(file_path, name, output_dir, num_views=150):
     radius = [2] * num_views
     fov = [40 / 180 * np.pi] * num_views
     views = [{'yaw': y, 'pitch': p, 'radius': r, 'fov': f} for y, p, r, f in zip(yaws, pitchs, radius, fov)]
-    
+
     args = [
-        BLENDER_PATH, '-b', '-P', os.path.join(os.path.dirname(__file__), 'blender_script', 'render.py'),
+        BLENDER_PATH, '-b',
+        *((['-t', str(BLENDER_THREADS)] if BLENDER_THREADS > 0 else [])),
+        '-P', os.path.join(os.path.dirname(__file__), 'blender_script', 'render.py'),
         '--',
         '--views', json.dumps(views),
         '--object', os.path.abspath(os.path.expanduser(file_path)),
@@ -37,17 +49,34 @@ def render(file_path, name, output_dir, num_views=150):
     ]
     if file_path.endswith('.blend'):
         args.insert(1, file_path)
-    
-    call(args)
+
+    saved_count = 0
+    proc = Popen(args, stdout=PIPE, stderr=STDOUT, text=True, bufsize=1)
+    for line in proc.stdout:
+        line = line.rstrip('\n')
+        m = _SAVED_RE.search(line)
+        if m:
+            saved_count += 1
+            if saved_count == 1 or saved_count % 50 == 0 or saved_count == num_views:
+                print(f"  {name}: view {saved_count}/{num_views}", flush=True)
+            continue
+        if _ERROR_RE.search(line):
+            print(line, flush=True)
+    return proc.wait()
 
 def voxelize(file, name, output_dir):
+    if not os.path.isfile(file):
+        raise FileNotFoundError(
+            f"mesh.ply not found at '{file}' — Blender likely crashed before "
+            "finishing all views. Check GPU resource contention / CUDA errors."
+        )
     mesh = o3d.io.read_triangle_mesh(file)
     if len(mesh.vertices) == 0:
         raise RuntimeError(
-            f"Open3D failed to read '{file}' (empty mesh). "
-            "The PLY header may contain unsupported custom attributes."
+            f"Open3D read '{file}' but got an empty mesh. "
+            "The PLY header may contain unsupported custom attributes "
+            "(common with Blender 4.x if export_attributes=True)."
         )
-    # clamp vertices to the range [-0.5, 0.5]
     vertices = np.clip(np.asarray(mesh.vertices), -0.5 + 1e-6, 0.5 - 1e-6)
     mesh.vertices = o3d.utility.Vector3dVector(vertices)
     voxel_grid = o3d.geometry.VoxelGrid.create_from_triangle_mesh_within_bounds(mesh, voxel_size=1/64, min_bound=(-0.5, -0.5, -0.5), max_bound=(0.5, 0.5, 0.5))
@@ -59,8 +88,15 @@ def voxelize(file, name, output_dir):
 def renderImg_voxelize(input_file):
     name = os.path.splitext(os.path.basename(input_file))[0]
     os.makedirs(f"outputs/img_Enc", exist_ok=True)
-    render(input_file, name, f"outputs/img_Enc/")
-    voxelize(f"outputs/img_Enc/{name}/mesh.ply", name, f"outputs/img_Enc/{name}")
+    ret = render(input_file, name, f"outputs/img_Enc/")
+    mesh_path = f"outputs/img_Enc/{name}/mesh.ply"
+    if ret != 0:
+        logger.error("Blender exited with code %d for %s — skipping voxelize", ret, name)
+        raise RuntimeError(f"Blender failed (exit {ret}) for {name}")
+    if not os.path.isfile(mesh_path):
+        logger.error("Blender exited 0 but mesh.ply missing for %s — skipping voxelize", name)
+        raise FileNotFoundError(f"mesh.ply not produced for {name}")
+    voxelize(mesh_path, name, f"outputs/img_Enc/{name}")
 
 if __name__ == '__main__':
 

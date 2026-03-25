@@ -50,7 +50,7 @@ def init_render(engine='CYCLES', resolution=512, geo_mode=False):
     bpy.context.scene.cycles.glossy_bounces = 1
     bpy.context.scene.cycles.transparent_max_bounces = 3 if not geo_mode else 0
     bpy.context.scene.cycles.transmission_bounces = 3 if not geo_mode else 1
-    bpy.context.scene.cycles.use_denoising = True
+    bpy.context.scene.cycles.use_denoising = False
         
     bpy.context.preferences.addons['cycles'].preferences.get_devices()
     bpy.context.preferences.addons['cycles'].preferences.compute_device_type = 'CUDA'
@@ -485,6 +485,7 @@ def main(arg):
                 os.rename(path, f'{output.file_slots[0].path}.{ext}')
         else:
             # PNG cached — update view layer so transform matrix is correct
+            print(f"Cached: '{out_png}'")
             bpy.context.view_layer.update()
 
         # Save camera parameters
