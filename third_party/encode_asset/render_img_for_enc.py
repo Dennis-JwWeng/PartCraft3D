@@ -5,6 +5,7 @@ import re
 import numpy as np
 from subprocess import DEVNULL, Popen, PIPE, STDOUT
 from .utils import sphere_hammersley_sequence
+from .dataset_root import img_enc_root
 import open3d as o3d
 import utils3d
 
@@ -87,16 +88,17 @@ def voxelize(file, name, output_dir):
 
 def renderImg_voxelize(input_file):
     name = os.path.splitext(os.path.basename(input_file))[0]
-    os.makedirs(f"outputs/img_Enc", exist_ok=True)
-    ret = render(input_file, name, f"outputs/img_Enc/")
-    mesh_path = f"outputs/img_Enc/{name}/mesh.ply"
+    enc_root = img_enc_root()
+    os.makedirs(enc_root, exist_ok=True)
+    ret = render(input_file, name, enc_root + os.sep)
+    mesh_path = os.path.join(enc_root, name, "mesh.ply")
     if ret != 0:
         logger.error("Blender exited with code %d for %s — skipping voxelize", ret, name)
         raise RuntimeError(f"Blender failed (exit {ret}) for {name}")
     if not os.path.isfile(mesh_path):
         logger.error("Blender exited 0 but mesh.ply missing for %s — skipping voxelize", name)
         raise FileNotFoundError(f"mesh.ply not produced for {name}")
-    voxelize(mesh_path, name, f"outputs/img_Enc/{name}")
+    voxelize(mesh_path, name, os.path.join(enc_root, name))
 
 if __name__ == '__main__':
 

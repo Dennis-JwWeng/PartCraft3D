@@ -3,8 +3,11 @@
 Provides GPU discovery, Blender render orchestration, and SLAT encoding that
 are common across PartObjaverse-Tiny, PartVerse, and future datasets.
 
-Dataset-specific scripts (datasets/partobjaverse/prerender.py, etc.) call
-these functions after providing their own path constants and GLB accessors.
+encode_asset reads/writes under the dataset root via PARTCRAFT_DATASET_ROOT
+(parent of img_Enc/); prerender sets this from img_enc_dir.parent.
+
+Dataset-specific scripts call these helpers after providing path constants
+and GLB accessors.
 """
 
 import logging
@@ -37,38 +40,14 @@ def get_available_gpus() -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# third_party/outputs symlink
-# ---------------------------------------------------------------------------
-
-def ensure_outputs_symlink(third_party_dir: Path, data_dir: Path,
-                            logger: logging.Logger | None = None):
-    """Symlink third_party/outputs → data_dir.
-
-    encode_asset scripts use relative paths like outputs/img_Enc/ and
-    outputs/slat/ when cwd = third_party/.  This symlink redirects those
-    writes to the correct dataset data directory.
-    """
-    log = logger or logging.getLogger(__name__)
-    link = third_party_dir / "outputs"
-    target = data_dir
-
-    if link.is_symlink():
-        current = link.resolve()
-        if current == target.resolve():
-            return
-        log.warning(f"third_party/outputs points to {current}, re-linking → {target}")
-        link.unlink()
-    elif link.exists():
-        log.warning("third_party/outputs is a real directory — skipping symlink creation")
-        return
-
-    link.symlink_to(target)
-    log.info(f"Created symlink: third_party/outputs → {target}")
-
-
-# ---------------------------------------------------------------------------
 # Phase A: Blender render + Open3D voxelize
 # ---------------------------------------------------------------------------
+
+def _set_dataset_root_env(img_enc_dir: Path) -> str:
+    """Set PARTCRAFT_DATASET_ROOT for encode_asset (parent of img_Enc/)."""
+    root = str(img_enc_dir.parent.resolve())
+    os.environ["PARTCRAFT_DATASET_ROOT"] = root
+    return root
 
 def run_render(
     obj_ids: list[str],
@@ -104,9 +83,10 @@ def run_render(
     if not pending:
         return
 
+    dataset_root = _set_dataset_root_env(img_enc_dir)
     if render_workers > 1:
         _render_parallel(pending, script_path, render_workers, force, logger,
-                         extra_worker_args or [])
+                         extra_worker_args or [], dataset_root)
     else:
         gpus = get_available_gpus()
         gpu_id = gpus[0] if gpus else None
@@ -126,8 +106,7 @@ def _render_sequential(
         logger.info(f"Blender rendering on GPU {gpu_id}")
 
     sys.path.insert(0, str(third_party_dir))
-    os.chdir(str(third_party_dir))
-    os.makedirs("outputs/img_Enc", exist_ok=True)
+    os.chdir(os.environ["PARTCRAFT_DATASET_ROOT"])
 
     from encode_asset.render_img_for_enc import renderImg_voxelize
 
@@ -151,6 +130,7 @@ def _render_parallel(
     force: bool,
     logger: logging.Logger,
     extra_worker_args: list[str] | None = None,
+    dataset_root: str | None = None,
 ):
     """Launch num_workers subprocesses, each assigned to a dedicated GPU.
 
@@ -190,6 +170,8 @@ def _render_parallel(
             cmd.append("--force")
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        if dataset_root:
+            env["PARTCRAFT_DATASET_ROOT"] = dataset_root
         env.setdefault("OPENBLAS_NUM_THREADS", "1")
         env.setdefault("MKL_NUM_THREADS", "1")
         logger.info(f"[worker {idx} -> GPU {gpu_id}] {len(shard)} objects")
@@ -276,16 +258,16 @@ def run_encode(
     if not pending:
         return
 
+    _set_dataset_root_env(img_enc_dir)
     sys.path.insert(0, str(third_party_dir))
-    os.chdir(str(third_party_dir))
-    os.makedirs("outputs/slat", exist_ok=True)
+    os.chdir(os.environ["PARTCRAFT_DATASET_ROOT"])
+    Path("slat").mkdir(parents=True, exist_ok=True)
     slat_dir.mkdir(parents=True, exist_ok=True)
 
     from encode_asset.encode_into_SLAT import encode_into_SLAT
 
-    # encode_into_SLAT always saves to outputs/slat/ (flat, via symlink).
-    # Resolve its absolute path so we can move files to slat_dir if different.
-    _flat_slat = Path("outputs/slat").resolve()
+    # encode_into_SLAT writes flat files under slat/; move into slat_dir if needed.
+    _flat_slat = Path("slat").resolve()
 
     for i, oid in enumerate(pending):
         logger.info(f"[encode {i+1}/{len(pending)}] {oid}")

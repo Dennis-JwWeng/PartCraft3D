@@ -49,7 +49,6 @@ sys.path.insert(0, str(_THIRD_PARTY))
 from partcraft.utils.config import load_config
 from partcraft.utils.logging import setup_logging
 from scripts.datasets.prerender_common import (
-    ensure_outputs_symlink,
     get_available_gpus,
     launch_multi_gpu_encode,
     print_summary,
@@ -148,7 +147,6 @@ def main():
         logger.error(f"source/mesh.zip not found at {mesh_zip}")
         sys.exit(1)
 
-    ensure_outputs_symlink(_THIRD_PARTY, data_dir, logger)
     img_enc_dir.mkdir(parents=True, exist_ok=True)
     slat_dir.mkdir(parents=True, exist_ok=True)
 

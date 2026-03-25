@@ -13,6 +13,8 @@ import json
 from trellis.modules import sparse as sp
 import trellis.models as models
 
+from .dataset_root import img_enc_root, slat_flat_root
+
 os.environ['SPCONV_ALGO'] = 'native' 
 
 def load_ply_to_numpy(filename):
@@ -39,7 +41,7 @@ def encode_into_SLAT(name):
 
     num_views = 150
 
-    indices = load_ply_to_numpy(f"outputs/img_Enc/{name}/voxels.ply")
+    indices = load_ply_to_numpy(os.path.join(img_enc_root(), name, "voxels.ply"))
     indices = torch.from_numpy((indices+0.5)*64).long().cuda()
     positions = (indices.to(torch.float32)/64.0 - 0.5)
 
@@ -54,10 +56,11 @@ def encode_into_SLAT(name):
     patchtokens_lst = []
     uv_lst = []
     fov = math.radians(40)
-    views = json.load(open(f"outputs/img_Enc/{name}/transforms.json"))["frames"]
+    with open(os.path.join(img_enc_root(), name, "transforms.json")) as tf:
+        views = json.load(tf)["frames"]
     for i in range(num_views):
 
-        img = Image.open(f"outputs/img_Enc/{name}/{i:03d}.png")
+        img = Image.open(os.path.join(img_enc_root(), name, f"{i:03d}.png"))
         img = img.resize((518, 518), Image.Resampling.LANCZOS)
         img = np.array(img).astype(np.float32) / 255
         if img.shape[2] == 4:
@@ -103,8 +106,10 @@ def encode_into_SLAT(name):
     latent = encoder(aggregated_features, sample_posterior=False)
     assert torch.isfinite(latent.feats).all(), "Non-finite latent"
 
-    torch.save(latent.feats, f"outputs/slat/{name}_feats.pt")
-    torch.save(latent.coords, f"outputs/slat/{name}_coords.pt")
+    slat_dir = slat_flat_root()
+    os.makedirs(slat_dir, exist_ok=True)
+    torch.save(latent.feats, os.path.join(slat_dir, f"{name}_feats.pt"))
+    torch.save(latent.coords, os.path.join(slat_dir, f"{name}_coords.pt"))
 
     print(f"finish encoding {name}")
     

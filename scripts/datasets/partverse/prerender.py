@@ -61,7 +61,6 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_THIRD_PARTY))
 
 from scripts.datasets.prerender_common import (
-    ensure_outputs_symlink,
     launch_multi_gpu_encode,
     print_summary,
     run_encode,
@@ -183,7 +182,6 @@ def main():
                              "Should not exceed the number of available GPUs.")
     args = parser.parse_args()
 
-    ensure_outputs_symlink(_THIRD_PARTY, _PARTVERSE_DIR, logger)
     _IMG_ENC_DIR.mkdir(parents=True, exist_ok=True)
     _SLAT_DIR.mkdir(parents=True, exist_ok=True)
 
