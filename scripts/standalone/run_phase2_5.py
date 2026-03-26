@@ -70,6 +70,8 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if cfg.get("ckpt_root"):
+        os.environ.setdefault("PARTCRAFT_CKPT_ROOT", cfg["ckpt_root"])
     logger = setup_logging(cfg, "phase2_5")
     p25_cfg = cfg.get("phase2_5", {})
 
@@ -178,6 +180,7 @@ def main():
         device="cuda",
         image_edit_model=p25_cfg.get("image_edit_model",
                                       "gemini-2.5-flash-image"),
+        ckpt_dir=cfg.get("ckpt_root"),
     )
     refiner.load_models()
 

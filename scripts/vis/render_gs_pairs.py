@@ -24,6 +24,11 @@ Usage:
     # Skip comparison video, only render individual before/after videos
     ATTN_BACKEND=xformers python scripts/vis/render_gs_pairs.py \
         --config configs/partobjaverse.yaml --no-compare
+
+    # PartVerse / sharded output: config matches run_streaming (shard_*/mesh_pairs).
+    # Sample 2 pairs per edit type (deletion, modification, scale, …):
+    python scripts/vis/render_gs_pairs.py --config configs/partverse_local.yaml \
+        --sample-per-type 2
 """
 
 import argparse
@@ -45,6 +50,59 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from partcraft.utils.config import load_config
 from partcraft.utils.logging import setup_logging
+
+# Same output_dir / cache layout as run_streaming (shard_* + phase caches).
+_SCRIPTS_DIR = str(_PROJECT_ROOT / "scripts")
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+import pipeline_common as _pipeline_common  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Edit ID → type (fallback when jsonl has no edit_type)
+# ---------------------------------------------------------------------------
+
+_PREFIX_TO_EDIT_TYPE: tuple[tuple[str, str], ...] = (
+    ("gdel", "deletion"),
+    ("gadd", "addition"),
+    ("del", "deletion"),
+    ("add", "addition"),
+    ("mod", "modification"),
+    ("scl", "scale"),
+    ("mat", "material"),
+    ("glb", "global"),
+    ("idt", "identity"),
+)
+
+
+def infer_edit_type_from_id(edit_id: str) -> str:
+    """Infer PartCraft edit_type from edit_id prefix (see planner._make_edit_id)."""
+    for prefix, etype in _PREFIX_TO_EDIT_TYPE:
+        if edit_id.startswith(prefix + "_"):
+            return etype
+    return "unknown"
+
+
+def sample_pairs_by_type(
+    pair_dirs: list[Path],
+    prompts: dict[str, dict],
+    per_type: int,
+) -> list[Path]:
+    """Keep up to ``per_type`` pairs per edit_type (stable sort by edit_id)."""
+    from collections import defaultdict
+
+    by_type: dict[str, list[Path]] = defaultdict(list)
+    for d in sorted(pair_dirs, key=lambda p: p.name):
+        info = prompts.get(d.name, {})
+        et = (info.get("edit_type") or info.get("effective_edit_type") or "").strip()
+        if not et:
+            et = infer_edit_type_from_id(d.name)
+        by_type[et].append(d)
+    out: list[Path] = []
+    for et in sorted(by_type.keys()):
+        chunk = by_type[et][:per_type]
+        out.extend(chunk)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -261,9 +319,15 @@ def main():
                         help="Number of view images (only with --save-views)")
     parser.add_argument("--force", action="store_true",
                         help="Re-render even if cached")
+    parser.add_argument("--sample-per-type", type=int, default=None,
+                        metavar="N",
+                        help="After SLAT validation, keep at most N pairs per "
+                             "edit_type (from edit_results jsonl or edit_id prefix)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    _pipeline_common.normalize_cache_dirs(cfg)
+    _pipeline_common.set_attn_backend(cfg)
     logger = setup_logging(cfg, "render_gs_pairs")
 
     output_base = Path(cfg["data"]["output_dir"])
@@ -310,10 +374,25 @@ def main():
         logger.error("No valid pairs found with SLAT files")
         sys.exit(1)
 
-    # Load edit prompts — resolve cache_dir relative to project root
+    # Load edit prompts — phase2_5 cache_dir already under output_dir after
+    # normalize_cache_dirs (same path streaming wrote edit_results*.jsonl to).
     raw_cache = cfg.get("phase2_5", {}).get("cache_dir", "cache/phase2_5")
-    cache_dir = _resolve_path(raw_cache)
+    cache_dir = Path(raw_cache) if os.path.isabs(raw_cache) else _resolve_path(
+        raw_cache)
     edit_prompts = load_edit_prompts(cache_dir, args.tag or "")
+
+    if args.sample_per_type is not None:
+        if args.sample_per_type <= 0:
+            logger.error("--sample-per-type must be positive")
+            sys.exit(1)
+        if args.edit_ids:
+            logger.error("Use either --edit-ids or --sample-per-type, not both")
+            sys.exit(1)
+        before_n = len(valid_pairs)
+        valid_pairs = sample_pairs_by_type(valid_pairs, edit_prompts,
+                                           args.sample_per_type)
+        logger.info(f"Sampled {len(valid_pairs)} / {before_n} pairs "
+                    f"(<= {args.sample_per_type} per edit_type)")
 
     logger.info(f"Rendering {len(valid_pairs)} pairs -> {vis_dir}")
 
@@ -324,7 +403,8 @@ def main():
     if third_party not in sys.path:
         sys.path.insert(0, third_party)
 
-    ckpt_dir = Path(p25_cfg.get("ckpt_dir", str(project_root / "checkpoints")))
+    ckpt_dir = Path(cfg.get("ckpt_root") or p25_cfg.get(
+        "ckpt_dir", str(project_root / "checkpoints")))
     text_ckpt = str(ckpt_dir / "TRELLIS-text-xlarge")
 
     from trellis.pipelines import TrellisTextTo3DPipeline

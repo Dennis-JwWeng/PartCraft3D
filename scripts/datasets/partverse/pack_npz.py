@@ -1,11 +1,29 @@
 #!/usr/bin/env python3
 """Pack PartVerse prerender outputs into PartCraft NPZ format.
 
+PartVerse layout (under ``PARTVERSE_DATA_ROOT`` / ``data/partverse/``) and
+where **per-part semantic text** lives:
+
+1. ``source/text_captions.json``  (**唯一**按部件 ID 存自然语言描述)
+   - Top level: ``{ "<object_uuid>": { "<part_id>": [caption0, caption1, …], … }, … }``
+   - ``part_id`` 为字符串 ``"0"``, ``"1"``, …，与 ``face2label`` 里的部件整数 ID 一致。
+   - 每条 ``caption*`` 为一句/一段英文；通常 ``[0]`` 为短标题句，``[1+]`` 为更长 VLM 风格段落。
+   - ``pack_npz`` 用 ``_label_from_part_captions`` 取**第一条非空**字符串写入 NPZ 的 ``part_id_to_name``。
+
+2. ``source/anno_infos/<uuid>/<uuid>_face2label.json``
+   - 仅 ``{ "<face_index>": <part_id_int>, … }``，**没有**文字语义；与 ``segmented.glb`` 面片一一对应。
+
+3. ``source/anno_infos/<uuid>/<uuid>_info.json``
+   - 几何/顺序元数据（如 ``bboxes``, ``ordered_face_label``, ``weights`` 等），**不是**主要文本描述来源。
+
+4. ``normalized_glbs/<uuid>.glb``、``img_Enc/<uuid>/``
+   - 归一化整模与预渲染结果；语义标签仍来自 (1)。
+
 Reads from:
-    data/partverse/normalized_glbs/{uuid}.glb     — source mesh
-    data/partverse/anno_infos/{uuid}/…_face2label.json — per-face part labels
-    data/partverse/img_Enc/{uuid}/                — rendered views + transforms
-    data/partverse/source/text_captions.json      — part label names (optional)
+    source/anno_infos/{uuid}/{uuid}_segmented.glb — mesh for splitting (with part groups)
+    source/anno_infos/{uuid}/{uuid}_face2label.json — per-face → part_id (integers only)
+    img_Enc/{uuid}/                               — rendered views + transforms
+    source/text_captions.json                     — per-part text captions (semantic labels)
 
 Writes:
     data/partverse/images/{shard}/{uuid}.npz      — render NPZ (pipeline input)
@@ -70,6 +88,25 @@ PACK_VIEWS: list[int] = [
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _label_from_part_captions(cap_list: list) -> str | None:
+    """Semantic part label from one part's caption list in text_captions.json.
+
+    Uses the **first non-empty** caption verbatim (whitespace normalized).
+    PartVerse convention: index 0 is the short curated line; later entries
+    are longer VLM-style paragraphs — the short line is what we want for
+    pipeline / VLM prompts.
+    """
+    if not cap_list:
+        return None
+    for c in cap_list:
+        if not isinstance(c, str):
+            continue
+        s = " ".join(c.split())
+        if s:
+            return s
+    return None
+
 
 def _load_face2label(obj_id: str) -> np.ndarray | None:
     """Load face2label.json and return per-face part-id array."""
@@ -164,17 +201,14 @@ def _pack_one(obj_id: str, img_enc_dir: Path,
     # ---- Align source mesh to VD coordinate space ----
     source_mesh = _align_source_to_vd(source_mesh, transforms)
 
-    # ---- Part labels from text_captions (first caption, trimmed) ----
+    # ---- Part labels: full best caption (first non-empty line per part) ----
     obj_caps = captions.get(obj_id, {})
     n_parts = int(instance_gt.max()) + 1
     labels = []
     for pid in range(n_parts):
         cap_list = obj_caps.get(str(pid), [])
-        if cap_list:
-            # Use first 4 words of first caption as a short label
-            label = "_".join(cap_list[0].split()[:4]).lower()
-            label = "".join(c if c.isalnum() or c == "_" else "_" for c in label)
-        else:
+        label = _label_from_part_captions(cap_list)
+        if not label:
             label = f"part_{pid}"
         labels.append(label)
 

@@ -356,6 +356,7 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
         cache_dir=str(cache_dir),
         device="cuda",
         image_edit_model=p25_cfg.get("image_edit_model", "gemini-2.5-flash-image"),
+        ckpt_dir=cfg.get("ckpt_root"),
         image_edit_backend=image_edit_backend,
         image_edit_base_url=p25_cfg.get("image_edit_base_url", "http://localhost:8001"),
         debug=debug,
@@ -817,6 +818,8 @@ Examples:
     cfg = load_config(args.config)
     normalize_cache_dirs(cfg)
     set_attn_backend(cfg)
+    if cfg.get("ckpt_root"):
+        os.environ.setdefault("PARTCRAFT_CKPT_ROOT", cfg["ckpt_root"])
 
     logger = setup_logging(cfg, "pipeline")
 

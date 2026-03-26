@@ -121,13 +121,37 @@ def apply_output_shard_layout(cfg: dict) -> None:
 
 
 def normalize_cache_dirs(cfg: dict) -> None:
-    """Rewrite relative cache_dir paths to be under output_dir."""
+    """Rewrite relative cache_dir paths to be under ``data.output_dir`` (once).
+
+    ``load_config`` may already prefix ``cache_dir`` with the pre-shard
+    ``output_dir`` (e.g. ``outputs/partverse/cache/phase0``). After
+    :func:`apply_output_shard_layout`, ``output_dir`` becomes
+    ``.../shard_XX``; naively joining again produced paths like
+    ``shard_05/outputs/partverse/cache/phase0``.
+    """
     apply_output_shard_layout(cfg)
     _out = cfg["data"].get("output_dir", "outputs")
+    _out_norm = _out.replace("\\", "/")
+    _markers = (
+        "cache/phase0", "cache/phase1", "cache/phase2",
+        "cache/phase2_5", "cache/phase3", "cache/phase4",
+    )
     for _phase_key in ("phase0", "phase1", "phase2", "phase2_5", "phase3", "phase4"):
         _pcfg = cfg.get(_phase_key, {})
         _cd = _pcfg.get("cache_dir", "")
-        if _cd and not os.path.isabs(_cd) and not _cd.startswith(_out):
+        if not _cd or os.path.isabs(_cd):
+            continue
+        cd_norm = _cd.replace("\\", "/")
+        if cd_norm == _out_norm or cd_norm.startswith(_out_norm + "/"):
+            continue
+        rel = None
+        for m in _markers:
+            if m in cd_norm:
+                rel = cd_norm[cd_norm.index(m):]
+                break
+        if rel is not None:
+            _pcfg["cache_dir"] = os.path.join(_out, *rel.split("/"))
+        else:
             _pcfg["cache_dir"] = os.path.join(_out, _cd)
 
 

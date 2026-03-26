@@ -1,4 +1,7 @@
 # PartCraft3D Configuration — Local Qwen3-VL on GPU
+#
+ckpt_root: "/mnt/zsn/ckpts"
+
 # Saves API token costs by running VLM locally via vLLM/SGLang.
 #
 # Quick start:
@@ -14,7 +17,7 @@ data:
 
 phase0:
   vlm_backend: "local"
-  local_model_path: "/mnt/zsn/ckpts/Qwen3.5-27B"
+  local_model_path: "Qwen3.5-27B"
   local_base_url: "http://localhost:8002/v1"
   local_gpu_ids: "6"
   local_max_model_len: 8192

@@ -443,9 +443,11 @@ def run_vlm_filter(
         sys.path.insert(0, third_party)
     from trellis.pipelines import TrellisImageTo3DPipeline
 
-    # Resolve checkpoint path
-    ckpt_rel = p25.get("trellis_image_ckpt", "checkpoints/TRELLIS-image-large")
-    ckpt_path = project_root / ckpt_rel
+    # Resolve checkpoint path (load_config makes this absolute when using ckpt_root)
+    ckpt_spec = p25.get("trellis_image_ckpt", "checkpoints/TRELLIS-image-large")
+    ckpt_path = Path(ckpt_spec)
+    if not ckpt_path.is_absolute():
+        ckpt_path = project_root / ckpt_spec
     if not (ckpt_path / "pipeline.json").exists():
         raise FileNotFoundError(
             f"TRELLIS checkpoint not found at {ckpt_path}")

@@ -67,7 +67,7 @@ launch_sglang() {
     # Auto-detect CUDA_HOME from nvcc location (fixes FlashInfer JIT)
     if [ -z "$CUDA_HOME" ]; then
         local nvcc_path
-        nvcc_path=$(which nvcc 2>/dev/null)
+        nvcc_path=$(which nvcc 2>/dev/null) || true
         if [ -n "$nvcc_path" ]; then
             export CUDA_HOME="$(dirname "$(dirname "$(readlink -f "$nvcc_path")")")"
             echo "  Auto-detected CUDA_HOME=$CUDA_HOME"

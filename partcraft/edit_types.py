@@ -110,7 +110,8 @@ TYPE_ORDER = {
 # ---------------------------------------------------------------------------
 
 # Scale edit templates: (prompt_template, before_template, after_template)
-# {part} is replaced with the part label
+# {part} is replaced with a natural-language part phrase (record ``desc`` or
+# humanized ``label``) in plan_edits_for_record.
 SCALE_TEMPLATES = [
     ("Make the {part} taller",
      "{part}", "taller {part}"),
@@ -131,7 +132,7 @@ SCALE_TEMPLATES = [
 ]
 
 # Material edit templates: (prompt_template, after_part_desc_template)
-# {part} is replaced with the part label
+# {part} is replaced with the same natural-language phrase as scale templates.
 MATERIAL_TEMPLATES = [
     ("Change the {part} to wooden material",
      "wooden {part}"),

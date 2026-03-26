@@ -12,6 +12,7 @@ Note: Phase 2.5 (TRELLIS) requires ATTN_BACKEND=xformers and GPU.
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -91,6 +92,7 @@ def run_phase2_5(cfg, dataset, logger):
     refiner = TrellisRefiner(
         device="cuda",
         cache_dir=str(cache_dir),
+        ckpt_dir=cfg.get("ckpt_root"),
     )
     refiner.load_models()
 
@@ -152,6 +154,8 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if cfg.get("ckpt_root"):
+        os.environ.setdefault("PARTCRAFT_CKPT_ROOT", cfg["ckpt_root"])
     logger = setup_logging(cfg, "pipeline")
     phases = set(args.phases)
     has_phase = lambda p: p in phases

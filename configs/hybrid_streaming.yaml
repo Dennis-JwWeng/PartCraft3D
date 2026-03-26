@@ -1,4 +1,9 @@
 # PartCraft3D Configuration — Hybrid Streaming
+#
+# TRELLIS weights: default under project checkpoints/ (see ckpt_root).
+#
+ckpt_root: "checkpoints"
+
 # Image editing: local GPU (FLUX.2-klein-9B via diffusers HTTP server, 4-step)
 # VLM calls:     remote API (Gemini 2.5 Flash)
 # Mode:          --streaming (per-object full pipeline, no cross-object swaps)

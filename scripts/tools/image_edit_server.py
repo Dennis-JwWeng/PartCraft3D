@@ -34,7 +34,9 @@ import base64
 import io
 import json
 import logging
+import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 
 import torch
 from PIL import Image
@@ -157,8 +159,14 @@ def main():
     global PIPE, BACKEND, STEPS, CFG_SCALE
     BACKEND = args.backend
 
-    # Resolve defaults per backend
-    _ckpt_root = os.environ.get("PARTCRAFT_CKPT_ROOT", "/mnt/zsn/ckpts")
+    # Resolve defaults per backend (same default order as load_config ckpt_root)
+    _proj = Path(__file__).resolve().parents[2]
+    _mnt = Path("/mnt/zsn/ckpts")
+    _default_root = (
+        os.environ.get("PARTCRAFT_CKPT_ROOT", "").strip()
+        or (str(_mnt) if _mnt.is_dir() else str(_proj / "checkpoints"))
+    )
+    _ckpt_root = _default_root
     model_defaults = {
         "flux-klein": {
             "model": os.path.join(_ckpt_root, "FLUX.2-klein-9B"),

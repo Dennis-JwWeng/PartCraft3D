@@ -1,4 +1,7 @@
 # PartCraft3D Configuration — Local Deployment (zero API cost)
+#
+ckpt_root: "/mnt/zsn/ckpts"
+
 # Uses locally deployed models instead of Gemini API.
 #
 # Required services:
@@ -30,10 +33,10 @@ data:
   
 phase0:
   vlm_backend: "local"
-  vlm_model: "/mnt/zsn/ckpts/Qwen3.5-27B"
+  vlm_model: "Qwen3.5-27B"
   vlm_base_url: "http://localhost:8002/v1"
   vlm_api_key: "dummy"                   # SGLang accepts any key
-  local_model_path: "/mnt/zsn/ckpts/Qwen3.5-27B"
+  local_model_path: "Qwen3.5-27B"
   local_base_url: "http://localhost:8002/v1"
   local_gpu_ids: "0"
   local_max_model_len: 32768

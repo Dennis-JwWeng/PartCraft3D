@@ -86,6 +86,23 @@ def _make_edit_id(prefix: str, obj_id: str, seq: int) -> str:
     return f"{prefix}_{obj_id}_{seq:03d}"
 
 
+def _record_part_prompt_name(part: dict) -> str:
+    """Natural-language phrase for prompts and labels in EditSpecs.
+
+    Prefer ``desc`` (e.g. PartVerse caption from enrichment); else un-slug
+    ``label`` (snake_case → spaces). Internal ``label`` is still used for
+    ``core_categories`` matching elsewhere.
+    """
+    d = (part.get("desc") or "").strip()
+    if d:
+        return d
+    lab = (part.get("label") or "").strip()
+    if lab:
+        return lab.replace("_", " ")
+    pid = part.get("part_id", -1)
+    return f"part {pid}"
+
+
 def plan_edits(catalog: PartCatalog, cfg: dict) -> list[EditSpec]:
     """Generate all edit specs: deletion → addition → modification → global.
 
@@ -450,11 +467,11 @@ def plan_edits_for_record(record: dict, cfg: dict,
             found = False
             for p in parts:
                 if p["part_id"] == pid:
-                    grp_labels.append(p.get("label", f"part_{pid}"))
+                    grp_labels.append(_record_part_prompt_name(p))
                     found = True
                     break
             if not found:
-                grp_labels.append(f"part_{pid}")
+                grp_labels.append(f"part {pid}")
 
         keep_pids = [p for p in all_pids if p not in grp_pids]
         if not keep_pids:
@@ -550,12 +567,13 @@ def plan_edits_for_record(record: dict, cfg: dict,
             add_edit = _find_edit_by_type(part_edits, "addition")
 
             del_id = _make_edit_id("del", obj_id, _counters["del"])
+            part_phrase = _record_part_prompt_name(part)
             specs.append(EditSpec(
                 edit_id=del_id,
                 edit_type="deletion",
                 obj_id=obj_id, shard=shard,
                 object_desc=obj_desc, before_desc=obj_desc,
-                remove_part_ids=[pid], remove_labels=[label],
+                remove_part_ids=[pid], remove_labels=[part_phrase],
                 keep_part_ids=keep_pids,
                 edit_prompt=del_edit.get("prompt", "") if del_edit else "",
                 after_desc=del_edit.get("after_desc", "") if del_edit else "",
@@ -569,7 +587,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
                 obj_id=obj_id, shard=shard,
                 object_desc=obj_desc,
                 before_desc=desc_without or obj_desc,
-                add_part_ids=[pid], add_labels=[label],
+                add_part_ids=[pid], add_labels=[part_phrase],
                 base_part_ids=keep_pids,
                 source_del_id=del_id,
                 edit_prompt=add_edit.get("prompt", "") if add_edit else "",
@@ -589,7 +607,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
                 edit_type="modification",
                 obj_id=obj_id, shard=shard,
                 object_desc=obj_desc, before_desc=obj_desc,
-                old_part_id=pid, old_label=label,
+                old_part_id=pid, old_label=_record_part_prompt_name(part),
                 keep_part_ids=keep_pids,
                 edit_prompt=mod_edit.get("prompt", ""),
                 after_desc=mod_edit.get("after_desc", ""),
@@ -628,6 +646,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
         if not keep_pids:
             continue
 
+        part_phrase = _record_part_prompt_name(part)
         templates = rng.sample(SCALE_TEMPLATES,
                                min(max_scale, len(SCALE_TEMPLATES)))
         for tmpl_prompt, tmpl_before, tmpl_after in templates:
@@ -636,12 +655,12 @@ def plan_edits_for_record(record: dict, cfg: dict,
                 edit_type=SCALE,
                 obj_id=obj_id, shard=shard,
                 object_desc=obj_desc, before_desc=obj_desc,
-                old_part_id=pid, old_label=label,
+                old_part_id=pid, old_label=part_phrase,
                 keep_part_ids=keep_pids,
-                edit_prompt=tmpl_prompt.format(part=label),
+                edit_prompt=tmpl_prompt.format(part=part_phrase),
                 after_desc=obj_desc,
-                before_part_desc=tmpl_before.format(part=label),
-                after_part_desc=tmpl_after.format(part=label),
+                before_part_desc=tmpl_before.format(part=part_phrase),
+                after_part_desc=tmpl_after.format(part=part_phrase),
                 mod_type="scale",
                 best_view=obj_best_view,
             ))
@@ -651,12 +670,12 @@ def plan_edits_for_record(record: dict, cfg: dict,
     max_material = cfg["phase1"].get("max_material_edits_per_part", 1)
     for part in parts:
         pid = part["part_id"]
-        label = part.get("label", f"part_{pid}")
 
         keep_pids = [p for p in all_pids if p != pid]
         if not keep_pids:
             continue
 
+        part_phrase = _record_part_prompt_name(part)
         templates = rng.sample(MATERIAL_TEMPLATES,
                                min(max_material, len(MATERIAL_TEMPLATES)))
         for tmpl_prompt, tmpl_after in templates:
@@ -665,12 +684,12 @@ def plan_edits_for_record(record: dict, cfg: dict,
                 edit_type=MATERIAL,
                 obj_id=obj_id, shard=shard,
                 object_desc=obj_desc, before_desc=obj_desc,
-                old_part_id=pid, old_label=label,
+                old_part_id=pid, old_label=part_phrase,
                 keep_part_ids=keep_pids,
-                edit_prompt=tmpl_prompt.format(part=label),
+                edit_prompt=tmpl_prompt.format(part=part_phrase),
                 after_desc=obj_desc,
-                before_part_desc=label,
-                after_part_desc=tmpl_after.format(part=label),
+                before_part_desc=part_phrase,
+                after_part_desc=tmpl_after.format(part=part_phrase),
                 mod_type="material",
                 best_view=obj_best_view,
             ))
