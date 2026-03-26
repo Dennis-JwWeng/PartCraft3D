@@ -1,4 +1,5 @@
 import os
+import tempfile
 
 # Before trellis / spconv import (see spconv docs).
 os.environ.setdefault("SPCONV_ALGO", "native")
@@ -26,25 +27,67 @@ _SLAT_ENC_CKPT = os.environ.get(
     "JeffreyXiang/TRELLIS-image-large/ckpts/slat_enc_swin8_B_64l8_fp16",
 ).strip()
 
+_MIN_VOXELS = 50
+_EXPECTED_FEAT_DIM = 8
+_EXPECTED_COORD_DIM = 4
+
+_cached_encoder = None
+
+
+def _get_slat_encoder():
+    """Return the cached SLAT encoder (loaded once per process)."""
+    global _cached_encoder
+    if _cached_encoder is None:
+        _cached_encoder = models.from_pretrained(_SLAT_ENC_CKPT).eval().cuda()
+    return _cached_encoder
+
+
+def _atomic_save(tensor, path):
+    """Write tensor to a temp file then atomically rename to avoid corruption."""
+    dir_name = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+    try:
+        os.close(fd)
+        torch.save(tensor, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
 def load_ply_to_numpy(filename):
-    """
-    Load a PLY file and extract the point cloud as a (N, 3) NumPy array.
-
-    Parameters:
-        filename (str): Path to the PLY file.
-
-    Returns:
-        numpy.ndarray: Point cloud array of shape (N, 3).
-    """
+    """Load a PLY file and extract the point cloud as a (N, 3) NumPy array."""
     ply_data = PlyData.read(filename)
-
-    # Extract vertex data
     vertex_data = ply_data["vertex"]
-    
-    # Convert to NumPy array (x, y, z)
     points = np.vstack([vertex_data["x"], vertex_data["y"], vertex_data["z"]]).T
-
     return points
+
+
+def validate_slat(feats: torch.Tensor, coords: torch.Tensor, name: str):
+    """Validate SLAT tensors before saving. Raises ValueError on problems."""
+    n_voxels = feats.shape[0]
+    if n_voxels < _MIN_VOXELS:
+        raise ValueError(
+            f"{name}: too few voxels ({n_voxels} < {_MIN_VOXELS}), "
+            "source mesh likely degenerate")
+    if feats.shape[1] != _EXPECTED_FEAT_DIM:
+        raise ValueError(
+            f"{name}: unexpected feat dim {feats.shape[1]}, "
+            f"expected {_EXPECTED_FEAT_DIM}")
+    if coords.shape[1] != _EXPECTED_COORD_DIM:
+        raise ValueError(
+            f"{name}: unexpected coord dim {coords.shape[1]}, "
+            f"expected {_EXPECTED_COORD_DIM}")
+    if feats.shape[0] != coords.shape[0]:
+        raise ValueError(
+            f"{name}: feats/coords row mismatch "
+            f"({feats.shape[0]} vs {coords.shape[0]})")
+    if not torch.isfinite(feats).all():
+        raise ValueError(f"{name}: non-finite values in feats")
+    if (feats == 0).all():
+        raise ValueError(f"{name}: all-zero feats (degenerate encoding)")
+
 
 def encode_into_SLAT(name):
 
@@ -54,7 +97,6 @@ def encode_into_SLAT(name):
     indices = torch.from_numpy((indices+0.5)*64).long().cuda()
     positions = (indices.to(torch.float32)/64.0 - 0.5)
 
-    # Local .pth under PARTCRAFT_CKPT_ROOT (default /mnt/zsn/ckpts if present); cached per process.
     dinov2_model = get_dinov2_vitl14_reg()
     dinov2_model.eval().cuda()
     transform = transforms.Compose([
@@ -104,7 +146,7 @@ def encode_into_SLAT(name):
     ).squeeze(2).permute(0, 2, 1).detach().cpu().numpy()
     feats = np.mean(feats, axis=0).astype(np.float16)
 
-    encoder = models.from_pretrained(_SLAT_ENC_CKPT).eval().cuda()
+    encoder = _get_slat_encoder()
     aggregated_features = sp.SparseTensor(
         feats = torch.from_numpy(feats).float(),
         coords = torch.cat([
@@ -113,12 +155,12 @@ def encode_into_SLAT(name):
         ], dim=1),
     ).cuda()
     latent = encoder(aggregated_features, sample_posterior=False)
-    assert torch.isfinite(latent.feats).all(), "Non-finite latent"
+
+    validate_slat(latent.feats, latent.coords, name)
 
     slat_dir = slat_flat_root()
     os.makedirs(slat_dir, exist_ok=True)
-    torch.save(latent.feats, os.path.join(slat_dir, f"{name}_feats.pt"))
-    torch.save(latent.coords, os.path.join(slat_dir, f"{name}_coords.pt"))
+    _atomic_save(latent.feats, os.path.join(slat_dir, f"{name}_feats.pt"))
+    _atomic_save(latent.coords, os.path.join(slat_dir, f"{name}_coords.pt"))
 
     print(f"finish encoding {name}")
-    

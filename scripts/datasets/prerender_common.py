@@ -223,6 +223,18 @@ def select_shard(all_obj_ids: list[str], shard: str, num_shards: int) -> list[st
 # Phase B: DINOv2 + SLAT encode
 # ---------------------------------------------------------------------------
 
+def _is_valid_slat_cache(feats_path: Path, coords_path: Path) -> bool:
+    """Quick-check that cached .pt files are loadable and non-empty."""
+    import torch
+    try:
+        f = torch.load(str(feats_path), map_location="cpu", weights_only=True)
+        c = torch.load(str(coords_path), map_location="cpu", weights_only=True)
+        return (f.ndim == 2 and f.shape[0] > 0
+                and c.ndim == 2 and f.shape[0] == c.shape[0])
+    except Exception:
+        return False
+
+
 def run_encode(
     obj_ids: list[str],
     img_enc_dir: Path,
@@ -242,18 +254,29 @@ def run_encode(
         logger:         Logger instance.
     """
     pending = []
+    corrupted = 0
     for oid in obj_ids:
         feats  = slat_dir / f"{oid}_feats.pt"
         coords = slat_dir / f"{oid}_coords.pt"
         voxels = img_enc_dir / oid / "voxels.ply"
         if not force and feats.exists() and coords.exists():
-            logger.debug(f"[encode] skip {oid} (cached)")
+            if not _is_valid_slat_cache(feats, coords):
+                logger.warning(f"[encode] {oid}: corrupted cache, will re-encode")
+                feats.unlink(missing_ok=True)
+                coords.unlink(missing_ok=True)
+                corrupted += 1
+                if voxels.exists():
+                    pending.append(oid)
+            else:
+                logger.debug(f"[encode] skip {oid} (cached)")
         elif not voxels.exists():
             logger.warning(f"[encode] skip {oid} (no renders)")
         else:
             pending.append(oid)
 
     cached = len(obj_ids) - len(pending)
+    if corrupted:
+        logger.warning(f"Detected {corrupted} corrupted SLAT caches (deleted)")
     logger.info(f"Encode: {len(pending)} pending, {cached} cached/skipped")
     if not pending:
         return
@@ -295,8 +318,12 @@ def run_encode(
                 src_coords.rename(dst_coords)
 
             if dst_feats.exists():
-                logger.info(f"  -> SLAT encoded ({dst_feats.stat().st_size // 1024} KB)")
-                # Keep PNGs and transforms.json in img_Enc (full 150-view archive).
+                import torch as _th
+                _f = _th.load(str(dst_feats), map_location="cpu", weights_only=True)
+                logger.info(
+                    f"  -> SLAT encoded: shape={tuple(_f.shape)}, "
+                    f"size={dst_feats.stat().st_size // 1024} KB")
+                del _f
             else:
                 logger.error(f"  -> feats.pt not found after encoding")
         except Exception as e:

@@ -279,6 +279,9 @@ class TrellisRefiner:
 
         Supports both flat (slat/{oid}_feats.pt) and sharded
         (slat/{shard}/{oid}_feats.pt) directory layouts.
+
+        Raises FileNotFoundError if files are missing, RuntimeError if
+        files are corrupted or contain invalid data.
         """
         from trellis.modules import sparse as sp
 
@@ -292,10 +295,24 @@ class TrellisRefiner:
                 f"  Expected: {feats_path}")
 
         logger.info(f"Loading pre-encoded SLAT for {obj_id}")
-        slat = sp.SparseTensor(
-            feats=torch.load(feats_path, weights_only=True),
-            coords=torch.load(coords_path, weights_only=True),
-        )
+        try:
+            feats = torch.load(feats_path, weights_only=True)
+            coords = torch.load(coords_path, weights_only=True)
+        except Exception as e:
+            raise RuntimeError(
+                f"Corrupted SLAT file for {obj_id} — delete and re-encode: "
+                f"{feats_path}"
+            ) from e
+
+        if feats.shape[0] != coords.shape[0]:
+            raise RuntimeError(
+                f"SLAT shape mismatch for {obj_id}: feats {feats.shape} "
+                f"vs coords {coords.shape}")
+        if not torch.isfinite(feats).all():
+            raise RuntimeError(
+                f"Non-finite SLAT feats for {obj_id} — re-encode needed")
+
+        slat = sp.SparseTensor(feats=feats, coords=coords)
         return slat
 
     # ---- Step 2: Decode SLAT → Gaussian ----

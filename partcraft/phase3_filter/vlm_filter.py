@@ -103,10 +103,26 @@ def classify_tier(s: VLMScore) -> str:
 # ---------------------------------------------------------------------------
 
 def load_slat(slat_dir: Path, device: str = "cuda"):
-    """Load SLAT from feats.pt + coords.pt."""
+    """Load SLAT from feats.pt + coords.pt.
+
+    Raises RuntimeError if files are corrupted or contain invalid data.
+    """
     from trellis.modules import sparse as sp
-    feats = torch.load(slat_dir / "feats.pt", weights_only=True)
-    coords = torch.load(slat_dir / "coords.pt", weights_only=True)
+    feats_path = slat_dir / "feats.pt"
+    coords_path = slat_dir / "coords.pt"
+    try:
+        feats = torch.load(feats_path, weights_only=True)
+        coords = torch.load(coords_path, weights_only=True)
+    except Exception as e:
+        raise RuntimeError(
+            f"Corrupted SLAT in {slat_dir} — delete and re-encode"
+        ) from e
+    if feats.shape[0] != coords.shape[0]:
+        raise RuntimeError(
+            f"SLAT shape mismatch in {slat_dir}: "
+            f"feats {feats.shape} vs coords {coords.shape}")
+    if not torch.isfinite(feats).all():
+        raise RuntimeError(f"Non-finite SLAT feats in {slat_dir}")
     return sp.SparseTensor(feats=feats.to(device), coords=coords.to(device))
 
 
