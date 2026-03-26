@@ -1,36 +1,9 @@
 #!/usr/bin/env python3
-"""Render before/after comparison turntable videos from Phase 2.5 edit pairs.
+"""SLAT → Gaussian turntable; side-by-side MP4 with prompt overlay (Phase 2.5).
 
-Loads SLAT files saved by export_pair, decodes to Gaussian via TRELLIS,
-renders side-by-side turntable video with edit prompt overlay.
-
-Usage:
-    # Render all pairs as side-by-side comparison videos
-    ATTN_BACKEND=xformers python scripts/vis/render_gs_pairs.py \
-        --config configs/partobjaverse.yaml
-
-    # Render specific tag (e.g. multiview experiment)
-    ATTN_BACKEND=xformers python scripts/vis/render_gs_pairs.py \
-        --config configs/partobjaverse.yaml --tag multiview
-
-    # Render specific edit IDs (new format: {type}_{obj_id}_{seq})
-    ATTN_BACKEND=xformers python scripts/vis/render_gs_pairs.py \
-        --config configs/partobjaverse.yaml --edit-ids del_my-chair-001_000
-
-    # Also save individual views (16 per model)
-    ATTN_BACKEND=xformers python scripts/vis/render_gs_pairs.py \
-        --config configs/partobjaverse.yaml --save-views --num-views 16
-
-    # Skip comparison video, only render individual before/after videos
-    ATTN_BACKEND=xformers python scripts/vis/render_gs_pairs.py \
-        --config configs/partobjaverse.yaml --no-compare
-
-    # PartVerse / sharded output: config matches run_streaming (shard_*/mesh_pairs).
-    # If streaming used --tag 0326 → mesh_pairs_0326/ (pass --tag 0326, or omit tag
-    # when that is the only mesh_pairs_* under the shard — it will be inferred).
-    python scripts/vis/render_gs_pairs.py --config configs/partverse_local.yaml \
-        --sample-per-type 2
-"""
+``--config`` required. Common: ``--tag``, ``--edit-ids``, ``--sample-per-type N``,
+``--save-views``, ``--no-compare``. Sharded runs: single ``mesh_pairs_*`` infers
+``--tag``; else pass ``--tag`` / ``--pairs-dir``."""
 
 import argparse
 import glob as _glob
@@ -52,7 +25,6 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from partcraft.utils.config import load_config
 from partcraft.utils.logging import setup_logging
 
-# Same output_dir / cache layout as run_streaming (shard_* + phase caches).
 _SCRIPTS_DIR = str(_PROJECT_ROOT / "scripts")
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
@@ -87,13 +59,7 @@ def infer_edit_type_from_id(edit_id: str) -> str:
 def _resolve_mesh_pairs_dir(
     output_base: Path, user_tag: str, logger,
 ) -> tuple[Path, str]:
-    """Return ``(mesh_pairs_dir, effective_tag)`` for edit_results / vis_compare.
-
-    Looks for ``mesh_pairs`` or ``mesh_pairs_<user_tag>``. With an empty
-    ``user_tag``, falls back to a *single* ``mesh_pairs_*`` directory under the
-    shard (or its parent), inferring the tag from the folder name — same naming
-    as ``run_streaming.py`` / ``run_phase2_5.py``.
-    """
+    """Resolve ``mesh_pairs[_tag]``; if untagged, use sole ``mesh_pairs_*`` → infer tag."""
     ut = (user_tag or "").strip()
     tag_suffix = f"_{ut}" if ut else ""
     rel = f"mesh_pairs{tag_suffix}"
@@ -113,7 +79,6 @@ def _resolve_mesh_pairs_dir(
             )
             return alt, ut
 
-    # No explicit tag: exactly one mesh_pairs_* → infer tag (e.g. mesh_pairs_0326)
     if not ut:
         scan_roots = [output_base]
         if output_base.name.startswith("shard_"):
@@ -129,32 +94,20 @@ def _resolve_mesh_pairs_dir(
             )
             if len(tagged) == 1:
                 inferred = tagged[0].name[len("mesh_pairs_") :]
-                logger.warning(
-                    "Using %s (inferred --tag %r for edit_results; pass explicitly to silence).",
-                    tagged[0],
-                    inferred,
-                )
+                logger.warning("Using %s (inferred tag %r).", tagged[0], inferred)
                 return tagged[0], inferred
             if len(tagged) > 1:
-                logger.error(
-                    "Multiple tagged mesh_pairs dirs under %s: %s — pass --tag to pick one.",
-                    root,
-                    [p.name for p in tagged],
-                )
+                logger.error("Multiple mesh_pairs_* under %s: %s (use --tag).",
+                             root, [p.name for p in tagged])
                 sys.exit(1)
 
-    logger.error("Pairs directory not found. Checked:")
-    for p in tried:
-        logger.error("  %s", p)
+    logger.error("No mesh_pairs: tried %s", tried)
     if output_base.exists():
         subs = sorted(p.name for p in output_base.iterdir() if p.is_dir())
-        logger.error("Directories under %s: %s", output_base, subs or "(none)")
+        logger.error("%s contains: %s", output_base, subs or "(none)")
     else:
-        logger.error("Output directory does not exist: %s", output_base)
-    logger.error(
-        "Run Phase 2.5 until mesh_pairs/ or mesh_pairs_<tag>/ appears, "
-        "or pass --pairs-dir. If you used streaming --tag MYTAG, pass --tag MYTAG here."
-    )
+        logger.error("Missing output dir: %s", output_base)
+    logger.error("Need Phase 2.5 export, --pairs-dir, or matching --tag.")
     sys.exit(1)
 
 
@@ -369,8 +322,7 @@ def load_edit_prompts(cache_dir: Path, tag: str = "") -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Render before/after comparison from Phase 2.5 pairs")
+    parser = argparse.ArgumentParser(description="Phase 2.5 SLAT → compare MP4")
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--tag", type=str, default=None,
                         help="Experiment tag (matches --tag from run_phase2_5.py)")
@@ -394,10 +346,8 @@ def main():
                         help="Number of view images (only with --save-views)")
     parser.add_argument("--force", action="store_true",
                         help="Re-render even if cached")
-    parser.add_argument("--sample-per-type", type=int, default=None,
-                        metavar="N",
-                        help="After SLAT validation, keep at most N pairs per "
-                             "edit_type (from edit_results jsonl or edit_id prefix)")
+    parser.add_argument("--sample-per-type", type=int, default=None, metavar="N",
+                        help="Cap at N pairs per edit_type after SLAT check")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -455,8 +405,7 @@ def main():
         logger.error("No valid pairs found with SLAT files")
         sys.exit(1)
 
-    # Load edit prompts — phase2_5 cache_dir already under output_dir after
-    # normalize_cache_dirs (same path streaming wrote edit_results*.jsonl to).
+    # edit_results*.jsonl under phase2_5 cache (post-normalize_cache_dirs).
     raw_cache = cfg.get("phase2_5", {}).get("cache_dir", "cache/phase2_5")
     cache_dir = Path(raw_cache) if os.path.isabs(raw_cache) else _resolve_path(
         raw_cache)

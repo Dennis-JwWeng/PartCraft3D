@@ -1,39 +1,10 @@
 #!/usr/bin/env python3
-"""PartCraft3D Batch Pipeline — step-by-step 3D editing data generation.
+"""Batch pipeline: phases 1–6 (semantic → export), one phase at a time, resumable.
 
-Runs all objects through each step before moving to the next step.
-Supports selective step execution and resume from cached intermediates.
-
-Pipeline Steps:
-  Step 1: SEMANTIC — VLM labeling + enrichment → semantic_labels.jsonl
-  Step 2: PLANNING — Part Catalog → edit_specs.jsonl
-  Step 3: 2D EDIT  — Pre-generate edited reference images (API/local)
-  Step 4: 3D EDIT  — TRELLIS editing (GPU, main workload)
-  Step 5: QUALITY  — VLM scoring + tier classification
-  Step 6: EXPORT   — Instruction generation + dataset assembly
-
-Usage:
-    # Full pipeline (all steps)
-    ATTN_BACKEND=xformers python scripts/run_pipeline.py
-
-    # Specific steps
-    ATTN_BACKEND=xformers python scripts/run_pipeline.py --steps 3 4 5
-
-    # With experiment tag
-    ATTN_BACKEND=xformers python scripts/run_pipeline.py --tag v1 --limit 50
-
-    # Skip 2D editing (text-only TRELLIS)
-    ATTN_BACKEND=xformers python scripts/run_pipeline.py --no-2d-edit
-
-    # Step 4 only: TRELLIS with pre-baked 2D (no HTTP / VLM for images)
-    ATTN_BACKEND=xformers python scripts/run_pipeline.py --steps 4 --tag RUN \\
-        --2d-cache-only --edit-dir 2d_edits_RUN
-
-    # Cost estimation only (dry run)
-    python scripts/run_pipeline.py --dry-run
-
-For streaming (per-object) mode, use scripts/run_streaming.py instead.
-"""
+Steps: 1 semantic 2 plan 3 2D 4 TRELLIS 3D 5 quality 6 export.
+Examples: ``python scripts/run_pipeline.py`` | ``--steps 3 4 5`` | ``--tag v1``
+| ``--no-2d-edit`` | ``--steps 4 --2d-cache-only --edit-dir 2d_edits_TAG``
+| ``--dry-run``. Per-object mode: ``scripts/run_streaming.py``."""
 
 import argparse
 import json
@@ -283,13 +254,8 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
                      tag=None, seed=1, limit=None, use_2d=True,
                      edit_types=None, edit_ids=None, combinations=None,
                      edit_dir=None, debug=False, cache_only_2d: bool = False):
-    """Step 4: TRELLIS 3D editing for all edit types.
-
-    When ``use_2d`` is True, loads ``{edit_id}_edited.png`` from
-    ``{phase2_5 cache}/{edit_dir}/`` first (same layout as Step 3 / streaming).
-    If ``cache_only_2d`` is True, never calls local image HTTP or VLM for 2D;
-    missing cache → no image conditioning for that spec.
-    """
+    """TRELLIS Step 4. With ``use_2d``: load ``{edit_dir}/{edit_id}_edited.png``
+    first; if ``cache_only_2d``, skip image HTTP/VLM (missing PNG → no cond)."""
     logger.info("=" * 60)
     logger.info("STEP 4: 3D Editing — TRELLIS")
     logger.info("=" * 60)
@@ -441,7 +407,7 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
                 for spec in idt_specs:
                     out_fp.write(json.dumps({
                         "edit_id": spec.edit_id, "status": "failed",
-                        "reason": "identity requires other edits on same object",
+                        "reason": "identity needs prior edits on object",
                     }, ensure_ascii=False) + "\n")
                     fail += 1
                 out_fp.flush()
@@ -673,9 +639,8 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
                         else:
                             original_images, edited_images = [], []
                             logger.warning(
-                                "  --2d-cache-only: no "
-                                f"{spec.edit_id}_edited.png, "
-                                "TRELLIS without image cond")
+                                "  --2d-cache-only: missing %s_edited.png → no img cond",
+                                spec.edit_id)
 
                         if edited_images:
                             img_cond = refiner.encode_multiview_cond(
@@ -877,25 +842,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="PartCraft3D Batch Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Steps:
-  1  Semantic labeling + enrichment (VLM API)
-  2  Edit planning (CPU)
-  3  2D image editing (VLM API, parallelizable)
-  4  3D editing — TRELLIS (GPU, main workload)
-  5  Quality scoring (VLM API)
-  6  Export (CPU)
-
-Examples:
-  # Full pipeline
-  ATTN_BACKEND=xformers python scripts/run_pipeline.py
-
-  # Only 3D editing + quality
-  ATTN_BACKEND=xformers python scripts/run_pipeline.py --steps 4 5
-
-  # Dry run (cost estimation only)
-  python scripts/run_pipeline.py --dry-run
-""")
+        epilog="Steps 1–6: semantic, plan, 2D, TRELLIS, quality, export. "
+               "Examples: run_pipeline.py | --steps 4 5 | --dry-run")
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--steps", type=int, nargs="*", default=None,
                         help="Steps to run (default: all). E.g. --steps 3 4 5")
@@ -909,8 +857,7 @@ Examples:
                         default=True)
     parser.add_argument("--2d-cache-only", dest="cache_only_2d",
                         action="store_true", default=False,
-                        help="Step 4: use only cached 2D PNGs under phase2_5 "
-                             "cache (no image HTTP / VLM); see --edit-dir")
+                        help="Step 4: 2D from cache only (no image API)")
     parser.add_argument("--edit-dir", type=str, default=None,
                         help="Pre-generated 2D edits subdir")
     parser.add_argument("--edit-ids", nargs="*", default=None,
