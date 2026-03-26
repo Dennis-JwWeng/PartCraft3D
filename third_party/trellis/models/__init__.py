@@ -55,10 +55,22 @@ def from_pretrained(path: str, **kwargs):
         config_file = f"{path}.json"
         model_file = f"{path}.safetensors"
     else:
+        # Never treat absolute filesystem paths as HuggingFace repo ids (Unix
+        # split makes path_parts[0] == '' and repo_id becomes '/root', etc.).
+        norm = path.replace("\\", "/")
+        if os.path.isabs(norm):
+            raise FileNotFoundError(
+                f"Local TRELLIS weights incomplete (need .json + .safetensors): "
+                f"{path}.json / {path}.safetensors"
+            )
         from huggingface_hub import hf_hub_download
-        path_parts = path.split('/')
-        repo_id = f'{path_parts[0]}/{path_parts[1]}'
-        model_name = '/'.join(path_parts[2:])
+        path_parts = [p for p in norm.split("/") if p]
+        if len(path_parts) < 2:
+            raise ValueError(
+                f"Invalid HuggingFace model path (expected org/repo/...): {path!r}"
+            )
+        repo_id = f"{path_parts[0]}/{path_parts[1]}"
+        model_name = "/".join(path_parts[2:])
         config_file = hf_hub_download(repo_id, f"{model_name}.json")
         model_file = hf_hub_download(repo_id, f"{model_name}.safetensors")
 

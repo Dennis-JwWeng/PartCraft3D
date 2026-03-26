@@ -195,9 +195,19 @@ def main():
         if args.shard is not None:
             obj_ids = select_shard(all_ids, args.shard, args.num_shards)
             shard = args.shard
+            if obj_ids:
+                i0, i1 = all_ids.index(obj_ids[0]), all_ids.index(obj_ids[-1])
+                span = f"(idx {i0}–{i1})"
+            else:
+                span = "(empty shard)"
             logger.info(f"Shard {shard}/{args.num_shards}: "
-                        f"{len(obj_ids)}/{len(all_ids)} objects "
-                        f"(idx {all_ids.index(obj_ids[0])}–{all_ids.index(obj_ids[-1])})")
+                        f"{len(obj_ids)}/{len(all_ids)} objects {span}")
+            if not obj_ids:
+                logger.warning(
+                    "This shard has no objects — often caused by fewer GLBs under "
+                    "normalized_glbs/ than a full PartVerse drop, or --num-shards "
+                    "larger than needed. Nothing to render/encode/pack for this shard."
+                )
         else:
             obj_ids = all_ids
             shard = "00"

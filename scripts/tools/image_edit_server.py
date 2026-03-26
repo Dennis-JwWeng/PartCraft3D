@@ -141,8 +141,8 @@ def main():
                         help="Model backend (default: flux-klein)")
     parser.add_argument("--model", default=None,
                         help="Model path override. Defaults: "
-                             "flux-klein → /Node11_nvme/wjw/checkpoints/FLUX.2-klein-9B, "
-                             "qwen → /Node11_nvme/wjw/checkpoints/Qwen-Image-Edit-2511")
+                             "flux-klein → /mnt/zsn/ckpts/FLUX.2-klein-9B, "
+                             "qwen → /mnt/zsn/ckpts/Qwen-Image-Edit-2511")
     parser.add_argument("--gpu", type=int, default=None)
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--steps", type=int, default=None,
@@ -160,12 +160,12 @@ def main():
     # Resolve defaults per backend
     model_defaults = {
         "flux-klein": {
-            "model": "/Node11_nvme/wjw/checkpoints/FLUX.2-klein-9B",
+            "model": "/mnt/zsn/ckpts/FLUX.2-klein-9B",
             "steps": 4,
             "cfg_scale": 1.0,
         },
         "qwen": {
-            "model": "/Node11_nvme/wjw/checkpoints/Qwen-Image-Edit-2511",
+            "model": "/mnt/zsn/ckpts/Qwen-Image-Edit-2511",
             "steps": 50,
             "cfg_scale": 5.0,
         },

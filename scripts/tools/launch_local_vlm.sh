@@ -33,14 +33,14 @@ MODE="${MODE:-vlm}"
 BACKEND="${BACKEND:-sglang}"
 
 # ---- VLM server settings (Qwen3.5-VL-27B) ----
-VLM_MODEL="${VLM_MODEL:-/Node11_nvme/zsn/checkpoints/Qwen3.5-27B}"
+VLM_MODEL="${VLM_MODEL:-/mnt/zsn/ckpts/Qwen3.5-27B}"
 VLM_PORT="${VLM_PORT:-8002}"
 VLM_TP="${VLM_TP:-1}"
 VLM_GPUS="${VLM_GPUS:-0}"
 VLM_MAX_LEN="${VLM_MAX_LEN:-32768}"
 
 # ---- Image edit server settings (qwen-image-2511) ----
-IMG_MODEL="${IMG_MODEL:-/Node11_nvme/wjw/checkpoints/Qwen-Image-Edit-2511}"
+IMG_MODEL="${IMG_MODEL:-/mnt/zsn/ckpts/Qwen-Image-Edit-2511}"
 IMG_PORT="${IMG_PORT:-8001}"
 IMG_TP="${IMG_TP:-1}"
 IMG_GPUS="${IMG_GPUS:-2}"

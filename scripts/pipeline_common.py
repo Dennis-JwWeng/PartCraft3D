@@ -75,8 +75,54 @@ def resolve_api_key(cfg: dict) -> str:
     return api_key
 
 
+def apply_output_shard_layout(cfg: dict) -> None:
+    """Nest ``data.output_dir`` under ``shard_<id>/`` when requested.
+
+    If ``data.output_by_shard`` is true and ``data.shards`` has exactly one
+    entry, sets ``data.output_dir`` to ``<output_dir>/shard_<shard>``. After
+    :func:`normalize_cache_dirs`, phase caches and streaming ``mesh_pairs``
+    live under that subtree (convenient to tar/compress per shard).
+
+    If ``shards`` is empty or lists multiple shards, nesting is skipped and a
+    warning is issued — use one shard per config run for per-shard outputs.
+    """
+    import warnings
+
+    data = cfg.get("data", {})
+    if not data.get("output_by_shard"):
+        return
+    shards = data.get("shards")
+    if not shards:
+        warnings.warn(
+            "output_by_shard is true but data.shards is empty; "
+            "skipping shard output subdirectory.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return
+    if len(shards) > 1:
+        warnings.warn(
+            "output_by_shard is true but data.shards has multiple entries; "
+            "skipping shard subdirectory. Use one shard per config run, or "
+            "set output_by_shard: false.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return
+    shard = str(shards[0]).strip()
+    if not shard:
+        return
+    nested = f"shard_{shard}"
+    out = data.get("output_dir", "outputs")
+    root = Path(out)
+    if root.name == nested:
+        return
+    data["output_dir"] = str(root / nested)
+
+
 def normalize_cache_dirs(cfg: dict) -> None:
     """Rewrite relative cache_dir paths to be under output_dir."""
+    apply_output_shard_layout(cfg)
     _out = cfg["data"].get("output_dir", "outputs")
     for _phase_key in ("phase0", "phase1", "phase2", "phase2_5", "phase3", "phase4"):
         _pcfg = cfg.get(_phase_key, {})

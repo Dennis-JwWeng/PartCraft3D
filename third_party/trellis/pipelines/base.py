@@ -1,7 +1,39 @@
 from typing import *
+import os
 import torch
 import torch.nn as nn
 from .. import models
+
+
+def _resolve_model_entry(pipeline_dir: str, v: str) -> str:
+    """Map pipeline.json ``models`` entry to a local path or HF hub id.
+
+    Text checkpoints reference shared weights as ``org/TRELLIS-image-large/ckpts/...``.
+    Those files live under the sibling ``TRELLIS-image-large`` folder next to
+    ``TRELLIS-text-xlarge``, not under ``TRELLIS-text-xlarge/JeffreyXiang/...``.
+    """
+    pipeline_dir = os.path.abspath(pipeline_dir)
+    joined = os.path.join(pipeline_dir, v)
+
+    def _weights_ok(p: str) -> bool:
+        return os.path.isfile(f"{p}.json") and os.path.isfile(f"{p}.safetensors")
+
+    if _weights_ok(joined):
+        return joined
+    for marker in ("JeffreyXiang/TRELLIS-image-large/", "TRELLIS-image-large/"):
+        if marker in v.replace("\\", "/"):
+            suffix = v.split(marker, 1)[1].lstrip("/")
+            img_root = os.path.join(os.path.dirname(pipeline_dir), "TRELLIS-image-large")
+            alt = os.path.join(img_root, suffix)
+            if _weights_ok(alt):
+                return alt
+    vn = v.replace("\\", "/")
+    # HuggingFace-style org/repo/subpath (not relative ckpts/ under pipeline)
+    if vn.count("/") >= 2 and not vn.startswith("ckpts/"):
+        parts = [p for p in vn.split("/") if p]
+        if len(parts) >= 3:
+            return v
+    return joined
 
 
 class Pipeline:
@@ -23,7 +55,6 @@ class Pipeline:
         """
         Load a pretrained model.
         """
-        import os
         import json
         is_local = os.path.exists(f"{path}/pipeline.json")
 
@@ -38,10 +69,8 @@ class Pipeline:
 
         _models = {}
         for k, v in args['models'].items():
-            try:
-                _models[k] = models.from_pretrained(f"{path}/{v}")
-            except:
-                _models[k] = models.from_pretrained(v)
+            load_id = _resolve_model_entry(path, v)
+            _models[k] = models.from_pretrained(load_id)
 
         new_pipeline = Pipeline(_models)
         new_pipeline._pretrained_args = args

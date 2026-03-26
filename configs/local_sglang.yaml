@@ -30,10 +30,10 @@ data:
   
 phase0:
   vlm_backend: "local"
-  vlm_model: "/Node11_nvme/zsn/checkpoints/Qwen3.5-27B"
+  vlm_model: "/mnt/zsn/ckpts/Qwen3.5-27B"
   vlm_base_url: "http://localhost:8002/v1"
   vlm_api_key: "dummy"                   # SGLang accepts any key
-  local_model_path: "/Node11_nvme/zsn/checkpoints/Qwen3.5-27B"
+  local_model_path: "/mnt/zsn/ckpts/Qwen3.5-27B"
   local_base_url: "http://localhost:8002/v1"
   local_gpu_ids: "0"
   local_max_model_len: 32768

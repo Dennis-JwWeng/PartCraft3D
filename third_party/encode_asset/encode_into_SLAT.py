@@ -1,5 +1,8 @@
-
 import os
+
+# Before trellis / spconv import (see spconv docs).
+os.environ.setdefault("SPCONV_ALGO", "native")
+
 from plyfile import PlyData
 import torch
 import numpy as np
@@ -14,8 +17,14 @@ from trellis.modules import sparse as sp
 import trellis.models as models
 
 from .dataset_root import img_enc_root, slat_flat_root
+from .dinov2_hub import get_dinov2_vitl14_reg
 
-os.environ['SPCONV_ALGO'] = 'native' 
+# Local tree: {path}.json + {path}.safetensors (see trellis.models.from_pretrained).
+# Example: PARTCRAFT_SLAT_ENC_CKPT=/mnt/zsn/ckpts/TRELLIS-image-large/ckpts/slat_enc_swin8_B_64l8_fp16
+_SLAT_ENC_CKPT = os.environ.get(
+    "PARTCRAFT_SLAT_ENC_CKPT",
+    "JeffreyXiang/TRELLIS-image-large/ckpts/slat_enc_swin8_B_64l8_fp16",
+).strip()
 
 def load_ply_to_numpy(filename):
     """
@@ -45,8 +54,8 @@ def encode_into_SLAT(name):
     indices = torch.from_numpy((indices+0.5)*64).long().cuda()
     positions = (indices.to(torch.float32)/64.0 - 0.5)
 
-    # extract feature utilis
-    dinov2_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14_reg')
+    # Local .pth under PARTCRAFT_CKPT_ROOT (default /mnt/zsn/ckpts if present); cached per process.
+    dinov2_model = get_dinov2_vitl14_reg()
     dinov2_model.eval().cuda()
     transform = transforms.Compose([
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -95,7 +104,7 @@ def encode_into_SLAT(name):
     ).squeeze(2).permute(0, 2, 1).detach().cpu().numpy()
     feats = np.mean(feats, axis=0).astype(np.float16)
 
-    encoder = models.from_pretrained("JeffreyXiang/TRELLIS-image-large/ckpts/slat_enc_swin8_B_64l8_fp16").eval().cuda()
+    encoder = models.from_pretrained(_SLAT_ENC_CKPT).eval().cuda()
     aggregated_features = sp.SparseTensor(
         feats = torch.from_numpy(feats).float(),
         coords = torch.cat([

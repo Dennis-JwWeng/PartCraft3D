@@ -260,6 +260,17 @@ def run_encode(
 
     _set_dataset_root_env(img_enc_dir)
     sys.path.insert(0, str(third_party_dir))
+    try:
+        from encode_asset.dinov2_hub import (
+            ensure_dinov2_vitl14_reg_weights_file,
+            ensure_facebook_dinov2_hub_clone,
+        )
+
+        ensure_facebook_dinov2_hub_clone()
+        wp = ensure_dinov2_vitl14_reg_weights_file()
+        logger.info(f"DINOv2 weights: {wp}")
+    except Exception as e:
+        logger.warning(f"DINOv2 prewarm skipped: {e}")
     os.chdir(os.environ["PARTCRAFT_DATASET_ROOT"])
     Path("slat").mkdir(parents=True, exist_ok=True)
     slat_dir.mkdir(parents=True, exist_ok=True)
@@ -319,6 +330,21 @@ def launch_multi_gpu_encode(
     if not pending:
         logger.info("All objects already encoded")
         return
+
+    try:
+        # script_path = .../scripts/datasets/<dataset>/prerender.py → repo root is parents[3]
+        _tp = script_path.resolve().parents[3] / "third_party"
+        sys.path.insert(0, str(_tp))
+        from encode_asset.dinov2_hub import (
+            ensure_dinov2_vitl14_reg_weights_file,
+            ensure_facebook_dinov2_hub_clone,
+        )
+
+        ensure_facebook_dinov2_hub_clone()
+        wp = ensure_dinov2_vitl14_reg_weights_file()
+        logger.info(f"DINOv2 hub + weights ready: {wp}")
+    except Exception as e:
+        logger.warning(f"DINOv2 hub prewarm skipped: {e}")
 
     logger.info(f"Multi-GPU encode: {len(pending)} objects across {num_gpus} GPUs")
 

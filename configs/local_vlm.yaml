@@ -14,7 +14,7 @@ data:
 
 phase0:
   vlm_backend: "local"
-  local_model_path: "/Node11_nvme/wjw/checkpoints/Qwen3-VL-2B-Instruct"
+  local_model_path: "/mnt/zsn/ckpts/Qwen3.5-27B"
   local_base_url: "http://localhost:8000/v1"
   local_gpu_ids: "6"
   local_max_model_len: 8192
