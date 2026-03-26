@@ -26,7 +26,8 @@ Usage:
         --config configs/partobjaverse.yaml --no-compare
 
     # PartVerse / sharded output: config matches run_streaming (shard_*/mesh_pairs).
-    # Sample 2 pairs per edit type (deletion, modification, scale, …):
+    # If streaming used --tag 0326 → mesh_pairs_0326/ (pass --tag 0326, or omit tag
+    # when that is the only mesh_pairs_* under the shard — it will be inferred).
     python scripts/vis/render_gs_pairs.py --config configs/partverse_local.yaml \
         --sample-per-type 2
 """
@@ -81,6 +82,80 @@ def infer_edit_type_from_id(edit_id: str) -> str:
         if edit_id.startswith(prefix + "_"):
             return etype
     return "unknown"
+
+
+def _resolve_mesh_pairs_dir(
+    output_base: Path, user_tag: str, logger,
+) -> tuple[Path, str]:
+    """Return ``(mesh_pairs_dir, effective_tag)`` for edit_results / vis_compare.
+
+    Looks for ``mesh_pairs`` or ``mesh_pairs_<user_tag>``. With an empty
+    ``user_tag``, falls back to a *single* ``mesh_pairs_*`` directory under the
+    shard (or its parent), inferring the tag from the folder name — same naming
+    as ``run_streaming.py`` / ``run_phase2_5.py``.
+    """
+    ut = (user_tag or "").strip()
+    tag_suffix = f"_{ut}" if ut else ""
+    rel = f"mesh_pairs{tag_suffix}"
+    primary = output_base / rel
+    if primary.is_dir():
+        return primary, ut
+
+    tried: list[Path] = [primary]
+    if output_base.name.startswith("shard_"):
+        alt = output_base.parent / rel
+        tried.append(alt)
+        if alt.is_dir():
+            logger.warning(
+                "mesh_pairs not under %s; using %s (export may predate shard layout).",
+                output_base,
+                alt,
+            )
+            return alt, ut
+
+    # No explicit tag: exactly one mesh_pairs_* → infer tag (e.g. mesh_pairs_0326)
+    if not ut:
+        scan_roots = [output_base]
+        if output_base.name.startswith("shard_"):
+            scan_roots.append(output_base.parent)
+        for root in scan_roots:
+            if not root.is_dir():
+                continue
+            tagged = sorted(
+                p for p in root.iterdir()
+                if p.is_dir()
+                and p.name.startswith("mesh_pairs_")
+                and len(p.name) > len("mesh_pairs_")
+            )
+            if len(tagged) == 1:
+                inferred = tagged[0].name[len("mesh_pairs_") :]
+                logger.warning(
+                    "Using %s (inferred --tag %r for edit_results; pass explicitly to silence).",
+                    tagged[0],
+                    inferred,
+                )
+                return tagged[0], inferred
+            if len(tagged) > 1:
+                logger.error(
+                    "Multiple tagged mesh_pairs dirs under %s: %s — pass --tag to pick one.",
+                    root,
+                    [p.name for p in tagged],
+                )
+                sys.exit(1)
+
+    logger.error("Pairs directory not found. Checked:")
+    for p in tried:
+        logger.error("  %s", p)
+    if output_base.exists():
+        subs = sorted(p.name for p in output_base.iterdir() if p.is_dir())
+        logger.error("Directories under %s: %s", output_base, subs or "(none)")
+    else:
+        logger.error("Output directory does not exist: %s", output_base)
+    logger.error(
+        "Run Phase 2.5 until mesh_pairs/ or mesh_pairs_<tag>/ appears, "
+        "or pass --pairs-dir. If you used streaming --tag MYTAG, pass --tag MYTAG here."
+    )
+    sys.exit(1)
 
 
 def sample_pairs_by_type(
@@ -331,17 +406,23 @@ def main():
     logger = setup_logging(cfg, "render_gs_pairs")
 
     output_base = Path(cfg["data"]["output_dir"])
-    tag_suffix = f"_{args.tag}" if args.tag else ""
+    user_tag = (args.tag or "").strip()
 
     # Locate pairs directory
     if args.pairs_dir:
         pairs_dir = Path(args.pairs_dir)
+        if not pairs_dir.is_dir():
+            logger.error("Pairs directory not found or not a directory: %s", pairs_dir)
+            sys.exit(1)
+        effective_tag = user_tag
+        if not effective_tag and pairs_dir.name.startswith("mesh_pairs_") and len(
+                pairs_dir.name) > len("mesh_pairs_"):
+            effective_tag = pairs_dir.name[len("mesh_pairs_") :]
+            logger.info("Inferred --tag %r from pairs directory name.", effective_tag)
     else:
-        pairs_dir = output_base / f"mesh_pairs{tag_suffix}"
+        pairs_dir, effective_tag = _resolve_mesh_pairs_dir(output_base, user_tag, logger)
 
-    if not pairs_dir.exists():
-        logger.error(f"Pairs directory not found: {pairs_dir}")
-        sys.exit(1)
+    tag_suffix = f"_{effective_tag}" if effective_tag else ""
 
     # Output directory for comparison videos
     if args.output_dir:
@@ -379,7 +460,7 @@ def main():
     raw_cache = cfg.get("phase2_5", {}).get("cache_dir", "cache/phase2_5")
     cache_dir = Path(raw_cache) if os.path.isabs(raw_cache) else _resolve_path(
         raw_cache)
-    edit_prompts = load_edit_prompts(cache_dir, args.tag or "")
+    edit_prompts = load_edit_prompts(cache_dir, effective_tag)
 
     if args.sample_per_type is not None:
         if args.sample_per_type <= 0:

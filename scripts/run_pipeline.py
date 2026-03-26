@@ -25,6 +25,10 @@ Usage:
     # Skip 2D editing (text-only TRELLIS)
     ATTN_BACKEND=xformers python scripts/run_pipeline.py --no-2d-edit
 
+    # Step 4 only: TRELLIS with pre-baked 2D (no HTTP / VLM for images)
+    ATTN_BACKEND=xformers python scripts/run_pipeline.py --steps 4 --tag RUN \\
+        --2d-cache-only --edit-dir 2d_edits_RUN
+
     # Cost estimation only (dry run)
     python scripts/run_pipeline.py --dry-run
 
@@ -55,6 +59,7 @@ from scripts.pipeline_common import (
     resolve_api_key, normalize_cache_dirs, set_attn_backend, create_dataset,
     resolve_data_dirs,
 )
+from partcraft.edit_types import IDENTITY, TYPE_ORDER
 
 
 # =========================================================================
@@ -277,8 +282,14 @@ def run_step_2d_edit(cfg, specs_path, dataset, logger,
 def run_step_3d_edit(cfg, specs_path, dataset, logger,
                      tag=None, seed=1, limit=None, use_2d=True,
                      edit_types=None, edit_ids=None, combinations=None,
-                     edit_dir=None, debug=False):
-    """Step 4: TRELLIS 3D editing for all edit types."""
+                     edit_dir=None, debug=False, cache_only_2d: bool = False):
+    """Step 4: TRELLIS 3D editing for all edit types.
+
+    When ``use_2d`` is True, loads ``{edit_id}_edited.png`` from
+    ``{phase2_5 cache}/{edit_dir}/`` first (same layout as Step 3 / streaming).
+    If ``cache_only_2d`` is True, never calls local image HTTP or VLM for 2D;
+    missing cache → no image conditioning for that spec.
+    """
     logger.info("=" * 60)
     logger.info("STEP 4: 3D Editing — TRELLIS")
     logger.info("=" * 60)
@@ -295,8 +306,11 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
     tag_suffix = f"_{tag}" if tag else ""
     mesh_pairs_dir = output_dir / f"mesh_pairs{tag_suffix}"
 
-    # ---- Load specs ----
-    edit_types = edit_types or ["modification", "deletion", "global"]
+    # ---- Load specs (match streaming / PartVerse) ----
+    edit_types = edit_types or [
+        "deletion", "addition", "modification", "scale", "material",
+        "global", "identity",
+    ]
     all_specs = []
     with open(specs_path) as f:
         for line in f:
@@ -378,10 +392,15 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
             logger.info(f"\n{'='*60}")
             logger.info(f"Object: {obj_id} ({len(specs)} edits)")
 
-            # Sort: deletion → addition → modification → global
-            type_order = {"deletion": 0, "addition": 1, "modification": 2,
-                          "global": 3}
-            specs.sort(key=lambda s: type_order.get(s.edit_type, 9))
+            def _spec_order(s: EditSpec):
+                t = s.edit_type
+                if t == "deletion":
+                    return (0, 0)
+                if t == "addition":
+                    return (1, 0)
+                return (2, TYPE_ORDER.get(t, 99))
+
+            specs.sort(key=_spec_order)
 
             # ---- Handle additions (swap from deletion) ----
             add_specs = [s for s in specs if s.edit_type == "addition"]
@@ -413,7 +432,19 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
                 else:
                     run_specs.append(spec)
 
+            idt_specs = [s for s in run_specs if s.edit_type == IDENTITY]
+            run_specs = [s for s in run_specs if s.edit_type != IDENTITY]
+
             if not run_specs:
+                # Identity-only object: still need first_pair_dir from prior
+                # edits on same object (not supported here).
+                for spec in idt_specs:
+                    out_fp.write(json.dumps({
+                        "edit_id": spec.edit_id, "status": "failed",
+                        "reason": "identity requires other edits on same object",
+                    }, ensure_ascii=False) + "\n")
+                    fail += 1
+                out_fp.flush()
                 continue
 
             # ---- Prepare object (pre-encoded SLAT, no mesh.zip) ----
@@ -432,6 +463,8 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
                     fail += len(run_specs)
                 out_fp.flush()
                 continue
+
+            first_pair_dir = None
 
             for spec in run_specs:
                 logger.info(f"\n[{success+fail+1}/{len(pending)}] "
@@ -463,14 +496,18 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
                                                 ensure_ascii=False) + "\n")
                         out_fp.flush()
                         success += 1
+                        if first_pair_dir is None:
+                            first_pair_dir = pair_dir
                         logger.info(f"  → direct deletion (GT mesh) "
                                     f"saved {pair_dir}")
                         continue
-                    elif edit_type == "Modification":
+                    elif edit_type in ("Modification", "Scale"):
                         if spec.remove_part_ids:
                             edit_part_ids = spec.remove_part_ids
                         else:
                             edit_part_ids = [spec.old_part_id]
+                    elif edit_type == "Material":
+                        edit_part_ids = [spec.old_part_id]
                     elif edit_type == "Global":
                         edit_part_ids = []
                     elif edit_type == "Addition":
@@ -538,14 +575,43 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
                     if prompts["edit_type"] != edit_type:
                         prompts["edit_type"] = edit_type
 
-                    # 2D image conditioning
+                    # 2D image conditioning (disk first — same paths as Step 3 / streaming)
                     img_cond = None
-                    if edit_type in ("Modification", "Global") and use_2d:
+                    if edit_type in ("Modification", "Scale", "Material",
+                                     "Global") and use_2d:
                         num_edit_views = p25_cfg.get("num_edit_views", 4)
                         edit_strength = p25_cfg.get("edit_strength", 1.0)
 
                         prerender_img = None
-                        if hasattr(spec, 'best_view') and spec.best_view >= 0:
+                        _2d_base = cache_dir / (edit_dir or "2d_edits")
+                        _ced = _2d_base / f"{spec.edit_id}_edited.png"
+                        if _ced.exists():
+                            try:
+                                from scripts.run_2d_edit import (
+                                    prepare_input_image)
+                                edited = Image.open(_ced).convert("RGB").resize(
+                                    (518, 518))
+                                _cin = _2d_base / f"{spec.edit_id}_input.png"
+                                if _cin.exists():
+                                    pil_in = Image.open(_cin).convert(
+                                        "RGB").resize((518, 518))
+                                elif (hasattr(spec, "best_view")
+                                      and spec.best_view >= 0):
+                                    _, pil_img = prepare_input_image(
+                                        obj_record, spec.best_view)
+                                    pil_in = pil_img.resize((518, 518))
+                                else:
+                                    pil_in = edited
+                                prerender_img = (pil_in, edited)
+                                logger.info(
+                                    f"  2D from disk ({_2d_base.name}/"
+                                    f"{spec.edit_id}_edited.png)")
+                            except Exception as e:
+                                logger.warning(f"  Cached 2D load failed: {e}")
+
+                        if (prerender_img is None and not cache_only_2d
+                                and hasattr(spec, 'best_view')
+                                and spec.best_view >= 0):
                             try:
                                 from scripts.run_2d_edit import (
                                     prepare_input_image, call_local_edit,
@@ -597,13 +663,19 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
                         if prerender_img is not None:
                             original_images = [prerender_img[0]]
                             edited_images = [prerender_img[1]]
-                        else:
+                        elif not cache_only_2d:
                             original_images, edited_images = \
                                 refiner.obtain_edited_images(
                                     ori_gaussian, prompts, vlm_client,
                                     obj_id, spec.edit_id,
                                     num_views=num_edit_views,
                                     edit_dir=edit_dir)
+                        else:
+                            original_images, edited_images = [], []
+                            logger.warning(
+                                "  --2d-cache-only: no "
+                                f"{spec.edit_id}_edited.png, "
+                                "TRELLIS without image cond")
 
                         if edited_images:
                             img_cond = refiner.encode_multiview_cond(
@@ -643,6 +715,8 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
                     out_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
                     out_fp.flush()
                     success += 1
+                    if first_pair_dir is None:
+                        first_pair_dir = pair_dir
                     logger.info(f"  → saved {pair_dir}")
 
                 except Exception as e:
@@ -652,6 +726,39 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
                     out_fp.write(json.dumps({
                         "edit_id": spec.edit_id, "status": "failed",
                         "reason": str(e),
+                    }) + "\n")
+                    out_fp.flush()
+                    fail += 1
+
+            for spec in idt_specs:
+                idt_pair = mesh_pairs_dir / spec.edit_id
+                if first_pair_dir and (first_pair_dir / "before.ply").exists():
+                    idt_pair.mkdir(parents=True, exist_ok=True)
+                    before_ply = first_pair_dir / "before.ply"
+                    shutil.copy2(str(before_ply),
+                                 str(idt_pair / "before.ply"))
+                    shutil.copy2(str(before_ply),
+                                 str(idt_pair / "after.ply"))
+                    before_slat = first_pair_dir / "before_slat"
+                    if before_slat.exists():
+                        shutil.copytree(str(before_slat),
+                                        str(idt_pair / "before_slat"))
+                        shutil.copytree(str(before_slat),
+                                        str(idt_pair / "after_slat"))
+                    out_fp.write(json.dumps({
+                        "edit_id": spec.edit_id,
+                        "edit_type": IDENTITY,
+                        "effective_edit_type": "Identity",
+                        "obj_id": obj_id, "status": "success",
+                        "edit_prompt": spec.edit_prompt,
+                    }, ensure_ascii=False) + "\n")
+                    out_fp.flush()
+                    success += 1
+                    logger.info(f"  [{spec.edit_id}] identity: before=after (no-op)")
+                else:
+                    out_fp.write(json.dumps({
+                        "edit_id": spec.edit_id, "status": "failed",
+                        "reason": "No before mesh available for identity",
                     }) + "\n")
                     out_fp.flush()
                     fail += 1
@@ -800,6 +907,10 @@ Examples:
                         help="Parallel workers for 2D editing API calls")
     parser.add_argument("--no-2d-edit", dest="use_2d", action="store_false",
                         default=True)
+    parser.add_argument("--2d-cache-only", dest="cache_only_2d",
+                        action="store_true", default=False,
+                        help="Step 4: use only cached 2D PNGs under phase2_5 "
+                             "cache (no image HTTP / VLM); see --edit-dir")
     parser.add_argument("--edit-dir", type=str, default=None,
                         help="Pre-generated 2D edits subdir")
     parser.add_argument("--edit-ids", nargs="*", default=None,
@@ -878,7 +989,8 @@ Examples:
             cfg, specs_path, dataset, logger,
             tag=args.tag, seed=args.seed, limit=args.limit,
             use_2d=args.use_2d, edit_ids=args.edit_ids,
-            edit_dir=edit_subdir, debug=args.debug)
+            edit_dir=edit_subdir, debug=args.debug,
+            cache_only_2d=args.cache_only_2d)
 
     if results_path is None:
         p25_cfg = cfg.get("phase2_5", {})
