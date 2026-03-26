@@ -47,9 +47,12 @@ import logging
 import sys
 from pathlib import Path
 
+import os
+
 _PROJECT_ROOT  = Path(__file__).resolve().parents[3]
 _THIRD_PARTY   = _PROJECT_ROOT / "third_party"
-_PARTVERSE_DIR = _PROJECT_ROOT / "data" / "partverse"
+_PARTVERSE_DIR = Path(os.environ.get(
+    "PARTVERSE_DATA_ROOT", str(_PROJECT_ROOT / "data" / "partverse")))
 _GLB_DIR       = _PARTVERSE_DIR / "source" / "normalized_glbs"
 _CAPTIONS_PATH = _PARTVERSE_DIR / "source" / "text_captions.json"
 _IMG_ENC_DIR   = _PARTVERSE_DIR / "img_Enc"
@@ -148,6 +151,8 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="Pre-render PartVerse + pack NPZ + encode SLAT")
+    parser.add_argument("--data-root", type=str, default=None,
+                        help="PartVerse data root (overrides PARTVERSE_DATA_ROOT env var)")
 
     # Object selection (mutually exclusive priority: --obj-ids > --shard > all)
     sel = parser.add_argument_group("object selection")
@@ -181,6 +186,16 @@ def main():
                         help="Parallel Blender workers, each on a dedicated GPU. "
                              "Should not exceed the number of available GPUs.")
     args = parser.parse_args()
+
+    global _PARTVERSE_DIR, _GLB_DIR, _CAPTIONS_PATH, _IMG_ENC_DIR, _SLAT_DIR, _IMAGES_DIR, _MESH_DIR
+    if args.data_root:
+        _PARTVERSE_DIR = Path(args.data_root)
+        _GLB_DIR       = _PARTVERSE_DIR / "source" / "normalized_glbs"
+        _CAPTIONS_PATH = _PARTVERSE_DIR / "source" / "text_captions.json"
+        _IMG_ENC_DIR   = _PARTVERSE_DIR / "img_Enc"
+        _SLAT_DIR      = _PARTVERSE_DIR / "slat"
+        _IMAGES_DIR    = _PARTVERSE_DIR / "images"
+        _MESH_DIR      = _PARTVERSE_DIR / "mesh"
 
     _IMG_ENC_DIR.mkdir(parents=True, exist_ok=True)
     _SLAT_DIR.mkdir(parents=True, exist_ok=True)

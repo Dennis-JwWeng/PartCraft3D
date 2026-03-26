@@ -44,7 +44,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-EDITFORMER_ROOT = Path("/Node11_nvme/wjw/3D_Editing/3DEditFormer")
+EDITFORMER_ROOT = Path(os.environ.get("EDITFORMER_ROOT", "/Node11_nvme/wjw/3D_Editing/3DEditFormer"))
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT / "third_party"))

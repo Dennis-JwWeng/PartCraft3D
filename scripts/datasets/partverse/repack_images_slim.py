@@ -28,8 +28,12 @@ from pathlib import Path
 
 import numpy as np
 
+import os
+
 _PROJECT_ROOT  = Path(__file__).resolve().parents[3]
-_IMAGES_DIR    = _PROJECT_ROOT / "data" / "partverse" / "images"
+_PARTVERSE_DIR = Path(os.environ.get(
+    "PARTVERSE_DATA_ROOT", str(_PROJECT_ROOT / "data" / "partverse")))
+_IMAGES_DIR    = _PARTVERSE_DIR / "images"
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
@@ -98,6 +102,8 @@ def repack_one(npz_path: Path, keep_views: list[int],
 
 def main():
     parser = argparse.ArgumentParser(description="Slim down images/ NPZ files")
+    parser.add_argument("--data-root", type=str, default=None,
+                        help="PartVerse data root (overrides PARTVERSE_DATA_ROOT env var)")
     parser.add_argument("--shard", type=str, required=True,
                         help="Shard to process, e.g. '00'")
     parser.add_argument("--views", type=int, nargs="+", default=None,
@@ -110,6 +116,10 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Estimate savings without writing anything")
     args = parser.parse_args()
+
+    global _IMAGES_DIR
+    if args.data_root:
+        _IMAGES_DIR = Path(args.data_root) / "images"
 
     if args.views:
         keep_views = sorted(set(args.views))

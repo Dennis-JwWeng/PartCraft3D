@@ -146,7 +146,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Match PartObjaverse-Tiny to original textured Objaverse GLBs")
     parser.add_argument("--semantic-json",
-                        default="/Node11_nvme/wjw/3D_Editing/SAMPart3D/PartObjaverse-Tiny/PartObjaverse-Tiny_semantic.json",
+                        default=os.environ.get(
+                            "PARTOBJAVERSE_SEMANTIC_JSON",
+                            "data/partobjaverse_tiny/source/semantic.json"),
                         help="Path to PartObjaverse-Tiny_semantic.json")
     parser.add_argument("--output", default="data/objaverse_glbs",
                         help="Output directory for downloaded GLBs")

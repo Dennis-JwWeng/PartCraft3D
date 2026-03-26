@@ -37,8 +37,11 @@ from pathlib import Path
 
 import numpy as np
 
+import os
+
 _PROJECT_ROOT  = Path(__file__).resolve().parents[3]
-_PARTVERSE_DIR = _PROJECT_ROOT / "data" / "partverse"
+_PARTVERSE_DIR = Path(os.environ.get(
+    "PARTVERSE_DATA_ROOT", str(_PROJECT_ROOT / "data" / "partverse")))
 _ANNO_DIR      = _PARTVERSE_DIR / "source" / "anno_infos"
 _CAPTIONS_PATH = _PARTVERSE_DIR / "source" / "text_captions.json"
 _IMG_ENC_DIR   = _PARTVERSE_DIR / "img_Enc"
@@ -207,6 +210,8 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="Pack PartVerse prerender into PartCraft NPZ format")
+    parser.add_argument("--data-root", type=str, default=None,
+                        help="PartVerse data root (overrides PARTVERSE_DATA_ROOT env var)")
 
     sel = parser.add_argument_group("object selection")
     sel.add_argument("--obj-ids", nargs="*", default=None,
@@ -221,6 +226,15 @@ def main():
     parser.add_argument("--force", action="store_true",
                         help="Re-pack even if output NPZs already exist")
     args = parser.parse_args()
+
+    global _PARTVERSE_DIR, _ANNO_DIR, _CAPTIONS_PATH, _IMG_ENC_DIR, _IMAGES_DIR, _MESH_DIR
+    if args.data_root:
+        _PARTVERSE_DIR = Path(args.data_root)
+        _ANNO_DIR      = _PARTVERSE_DIR / "source" / "anno_infos"
+        _CAPTIONS_PATH = _PARTVERSE_DIR / "source" / "text_captions.json"
+        _IMG_ENC_DIR   = _PARTVERSE_DIR / "img_Enc"
+        _IMAGES_DIR    = _PARTVERSE_DIR / "images"
+        _MESH_DIR      = _PARTVERSE_DIR / "mesh"
 
     # ---- Determine object list ----
     if args.obj_ids:

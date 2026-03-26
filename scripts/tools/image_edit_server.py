@@ -158,14 +158,15 @@ def main():
     BACKEND = args.backend
 
     # Resolve defaults per backend
+    _ckpt_root = os.environ.get("PARTCRAFT_CKPT_ROOT", "/mnt/zsn/ckpts")
     model_defaults = {
         "flux-klein": {
-            "model": "/mnt/zsn/ckpts/FLUX.2-klein-9B",
+            "model": os.path.join(_ckpt_root, "FLUX.2-klein-9B"),
             "steps": 4,
             "cfg_scale": 1.0,
         },
         "qwen": {
-            "model": "/mnt/zsn/ckpts/Qwen-Image-Edit-2511",
+            "model": os.path.join(_ckpt_root, "Qwen-Image-Edit-2511"),
             "steps": 50,
             "cfg_scale": 5.0,
         },

@@ -2,18 +2,18 @@
 # Uses locally deployed models instead of Gemini API.
 #
 # Required services:
-#   1. SGLang — Qwen3.5-27B on port 8000 (semantic labeling, enrichment, quality)
+#   1. SGLang — Qwen3.5-27B on port 8002 (semantic labeling, enrichment, quality)
 #   2. Image edit server — Qwen-Image-Edit-2511 on port 8001 (2D editing)
 #
 # Quick start:
 #   Terminal 1 (VLM):
-#     conda activate partcraft3d
-#     bash scripts/tools/launch_local_vlm.sh            # port 8000
+#     conda activate pipeline_server
+#     CUDA_VISIBLE_DEVICES=0 bash scripts/tools/launch_local_vlm.sh  # port 8002
 #   Terminal 2 (image edit):
-#     conda activate qwen_test
-#     python scripts/tools/image_edit_server.py --gpu 2  # port 8001
+#     conda activate pipeline_server
+#     python scripts/tools/image_edit_server.py --gpu 2               # port 8001
 #   Terminal 3 (pipeline):
-#     conda activate partcraft3d
+#     conda activate pipeline_server
 #     ATTN_BACKEND=xformers python scripts/run_pipeline.py \
 #         --config configs/local_sglang.yaml --tag v1
 

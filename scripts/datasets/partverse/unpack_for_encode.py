@@ -24,8 +24,11 @@ from pathlib import Path
 
 import numpy as np
 
+import os
+
 _PROJECT_ROOT  = Path(__file__).resolve().parents[3]
-_PARTVERSE_DIR = _PROJECT_ROOT / "data" / "partverse"
+_PARTVERSE_DIR = Path(os.environ.get(
+    "PARTVERSE_DATA_ROOT", str(_PROJECT_ROOT / "data" / "partverse")))
 _IMG_ENC_DIR   = _PARTVERSE_DIR / "img_Enc"
 _IMAGES_DIR    = _PARTVERSE_DIR / "images"
 _SLAT_DIR      = _PARTVERSE_DIR / "slat"
@@ -75,6 +78,8 @@ def main():
     logger = logging.getLogger("unpack_for_encode")
 
     parser = argparse.ArgumentParser(description="Restore img_Enc files from NPZ for encoding")
+    parser.add_argument("--data-root", type=str, default=None,
+                        help="PartVerse data root (overrides PARTVERSE_DATA_ROOT env var)")
     parser.add_argument("--shard", type=str, default=None)
     parser.add_argument("--num-shards", type=int, default=10)
     parser.add_argument("--workers", type=int, default=8,
@@ -82,6 +87,13 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Report what would be restored without writing files")
     args = parser.parse_args()
+
+    global _PARTVERSE_DIR, _IMG_ENC_DIR, _IMAGES_DIR, _SLAT_DIR
+    if args.data_root:
+        _PARTVERSE_DIR = Path(args.data_root)
+        _IMG_ENC_DIR   = _PARTVERSE_DIR / "img_Enc"
+        _IMAGES_DIR    = _PARTVERSE_DIR / "images"
+        _SLAT_DIR      = _PARTVERSE_DIR / "slat"
 
     if args.dry_run:
         logger.info("DRY RUN — no files will be written")

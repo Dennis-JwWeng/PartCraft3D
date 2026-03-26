@@ -27,7 +27,10 @@ from pathlib import Path
 
 OBJAVERSE_CACHE = Path.home() / ".objaverse" / "hf-objaverse-v1"
 OBJECT_PATHS_FILE = OBJAVERSE_CACHE / "object-paths.json.gz"
-SEMANTIC_JSON = "/Node11_nvme/wjw/3D_Editing/SAMPart3D/PartObjaverse-Tiny/PartObjaverse-Tiny_semantic.json"
+SEMANTIC_JSON = os.environ.get(
+    "PARTOBJAVERSE_SEMANTIC_JSON",
+    "/Node11_nvme/wjw/3D_Editing/SAMPart3D/PartObjaverse-Tiny/PartObjaverse-Tiny_semantic.json"
+)
 
 
 def load_object_paths() -> dict[str, str]:

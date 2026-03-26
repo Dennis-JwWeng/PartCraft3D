@@ -15,7 +15,7 @@ data:
 phase0:
   vlm_backend: "local"
   local_model_path: "/mnt/zsn/ckpts/Qwen3.5-27B"
-  local_base_url: "http://localhost:8000/v1"
+  local_base_url: "http://localhost:8002/v1"
   local_gpu_ids: "6"
   local_max_model_len: 8192
   local_tensor_parallel: 1
@@ -24,7 +24,7 @@ phase0:
   # For full local: point vlm_base_url to local and set vlm_api_key to "dummy"
   # For API fallback: use remote URL and real key
   vlm_model: "Qwen3.5-27B"
-  vlm_base_url: "http://localhost:8000/v1"
+  vlm_base_url: "http://localhost:8002/v1"
   vlm_api_key: "dummy"
 
   views_for_labeling: [32, 33, 34, 35]

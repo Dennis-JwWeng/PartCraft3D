@@ -21,7 +21,8 @@ from pathlib import Path
 import torch
 
 _PROJECT_ROOT  = Path(__file__).resolve().parents[3]
-_SLAT_DIR      = _PROJECT_ROOT / "data" / "partverse" / "slat"
+_SLAT_DIR      = Path(os.environ.get(
+    "PARTVERSE_DATA_ROOT", str(_PROJECT_ROOT / "data" / "partverse"))) / "slat"
 _THIRD_PARTY   = _PROJECT_ROOT / "third_party"
 
 sys.path.insert(0, str(_PROJECT_ROOT))
