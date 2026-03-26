@@ -1,7 +1,8 @@
 """Phase 3: VLM-based quality filter for Phase 2.5 SLAT edit pairs.
 
-Renders before/after Gaussian views from SLAT, composes side-by-side
-comparison images, and sends them to a VLM for semantic quality scoring.
+Optional **mesh prefilter** (``phase3.vlm_mesh_prefilter``): cheap ``trimesh``
+checks on ``before.ply`` / ``after.ply`` *before* TRELLIS decode and VLM.
+Failsures are scored as ``negative`` and skip rendering + API calls.
 
 The VLM evaluates:
   1. edit_executed   — did the edit actually happen?
@@ -22,13 +23,19 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
 
 import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+# Mesh prefilter: full ``evaluate_pair`` (volume / edit ratio / …) only for types
+# where vertex motion is expected.  Light checks for del/add.  Skip for identity
+# and appearance-only edits (material/global) where metrics misfire.
+_MESH_PREFILTER_FULL = frozenset({"modification", "scale"})
+_MESH_PREFILTER_LIGHT = frozenset({"deletion", "addition"})
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +205,10 @@ Edit information:
 - Target part: {part_label}
 - Edit prompt: "{edit_prompt}"
 
-Evaluate the edit quality and return JSON only, no fences:
+Evaluate the edit quality. Your entire reply MUST be one JSON object only: no prose,
+no markdown fences, no numbered analysis, no text before or after the object.
+First character must be "{{" and the last must be "}}".
+Example shape:
 {{"edit_executed":true,"correct_region":true,"preserve_other":true,"visual_quality":4,"artifact_free":true,"reason":"brief explanation"}}
 
 Scoring criteria:
@@ -212,33 +222,91 @@ Scoring criteria:
 Be strict but fair. Minor imperfections are acceptable (quality=3-4). Only fail edit_executed if there is NO visible change matching the prompt."""
 
 
+def _balanced_brace_object(s: str, start: int) -> str | None:
+    """If s[start] == '{', return the balanced JSON object substring, else None."""
+    if start < 0 or start >= len(s) or s[start] != "{":
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for j in range(start, len(s)):
+        c = s[j]
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+            continue
+        if c == '"':
+            in_string = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start : j + 1]
+    return None
+
+
+def _iter_json_object_substrings(content: str) -> list[str]:
+    """All top-level `{...}` spans in document order (deduped)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for i, c in enumerate(content):
+        if c != "{":
+            continue
+        block = _balanced_brace_object(content, i)
+        if block and block not in seen:
+            seen.add(block)
+            out.append(block)
+    return out
+
+
+def _parse_vlm_score_dict(blob: str) -> dict | None:
+    """Parse JSON object; require VLM judge schema key."""
+    try:
+        d = json.loads(blob)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(d, dict) and "edit_executed" in d:
+        return d
+    return None
+
+
 def _extract_json_from_vlm(content: str) -> dict | None:
-    """Robustly extract JSON from VLM response, handling various formats."""
+    """Robustly extract JSON from VLM response (CoT, markdown, multiple objects)."""
     if not content:
         return None
     content = content.strip()
 
-    # Strip <think>...</think> blocks (Gemini 2.5 Flash thinking mode)
-    content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+    # Strip `think`...`</think>` blocks (Gemini 2.5 Flash thinking mode)
+    content = re.sub(
+        r"`think`.*?`</think>`", "", content, flags=re.DOTALL | re.IGNORECASE
+    ).strip()
 
     # Strip markdown code fences: ```json ... ``` or ``` ... ```
-    fence_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', content, re.DOTALL)
+    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", content, re.DOTALL)
     if fence_match:
-        content = fence_match.group(1).strip()
+        inner = fence_match.group(1).strip()
+        got = _parse_vlm_score_dict(inner)
+        if got is not None:
+            return got
+        content = inner
 
-    # Try direct parse
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        pass
+    # Whole buffer
+    got = _parse_vlm_score_dict(content)
+    if got is not None:
+        return got
 
-    # Try extracting the first {...} block
-    m = re.search(r'\{.*\}', content, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group())
-        except json.JSONDecodeError:
-            pass
+    # Prefer the last valid object with schema keys (final answer after CoT)
+    blocks = _iter_json_object_substrings(content)
+    for blob in reversed(blocks):
+        got = _parse_vlm_score_dict(blob)
+        if got is not None:
+            return got
 
     return None
 
@@ -246,28 +314,62 @@ def _extract_json_from_vlm(content: str) -> dict | None:
 def call_vlm_judge(client, model: str, img_bytes: bytes,
                    edit_prompt: str, edit_type: str,
                    object_desc: str, part_label: str,
-                   max_retries: int = 4) -> dict | None:
+                   max_retries: int = 4,
+                   max_tokens: int = 4096,
+                   json_object_mode: bool = False) -> dict | None:
     """Call VLM to judge edit quality. Returns parsed JSON or None."""
     import time
     b64 = base64.b64encode(img_bytes).decode('utf-8')
-    text = _build_judge_prompt(edit_prompt, edit_type, object_desc, part_label)
+    base_text = _build_judge_prompt(edit_prompt, edit_type, object_desc, part_label)
+    strict_suffix = (
+        "\n\nIf you already wrote analysis above, IGNORE it for the parser: "
+        "output ONE new line that is ONLY the JSON object, starting with { "
+        "and ending with }."
+    )
 
     for attempt in range(max_retries + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url",
-                         "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                        {"type": "text", "text": text},
-                    ]
-                }],
-                temperature=0.3,
-                max_tokens=512,
-                timeout=120,
+        text = base_text + (strict_suffix if attempt > 0 else "")
+        sys_msg = (
+            "You output only valid JSON for machine parsing. "
+            "Never write explanations, headings, or markdown."
+        )
+        if attempt > 0:
+            sys_msg += (
+                " Your reply must be a single JSON object; no chain-of-thought."
             )
+        try:
+            create_kw: dict = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": sys_msg},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url",
+                             "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                            {"type": "text", "text": text},
+                        ],
+                    },
+                ],
+                "temperature": 0.1,
+                "max_tokens": max_tokens,
+                "timeout": 120,
+            }
+            if json_object_mode and attempt == 0:
+                create_kw["response_format"] = {"type": "json_object"}
+            try:
+                resp = client.chat.completions.create(**create_kw)
+            except Exception as e0:
+                if json_object_mode and attempt == 0 and create_kw.pop(
+                        "response_format", None
+                ) is not None:
+                    logger.warning(
+                        "VLM json_object mode rejected by server (%s); retrying without",
+                        e0,
+                    )
+                    resp = client.chat.completions.create(**create_kw)
+                else:
+                    raise
             content = resp.choices[0].message.content
             if not content:
                 logger.warning(
@@ -294,6 +396,104 @@ def call_vlm_judge(client, model: str, img_bytes: bytes,
 
 
 # ---------------------------------------------------------------------------
+# Mesh prefilter (before TRELLIS + VLM)
+# ---------------------------------------------------------------------------
+
+def mesh_prefilter_before_vlm(
+    pair_dir: Path,
+    entry: dict,
+    cfg: dict,
+) -> VLMScore | None:
+    """If enabled, run fast PLY checks. Returns a finished score to skip VLM, or None."""
+    p3 = cfg.get("phase3", {})
+    if not p3.get("vlm_mesh_prefilter", False):
+        return None
+
+    before_ply = pair_dir / "before.ply"
+    after_ply = pair_dir / "after.ply"
+    if not before_ply.is_file() or not after_ply.is_file():
+        return None
+
+    eid = entry["edit_id"]
+    et = (entry.get("edit_type") or "").lower()
+
+    try:
+        import trimesh
+        from partcraft.phase3_filter.filter import (
+            MetricResult,
+            QualityReport,
+            evaluate_pair,
+            metric_connected_components,
+            metric_not_degenerate,
+        )
+
+        before = trimesh.load(str(before_ply), process=False)
+        after = trimesh.load(str(after_ply), process=False)
+    except Exception as e:
+        s = VLMScore(edit_id=eid, edit_type=et, reason=f"Mesh prefilter load: {e}")
+        s.quality_tier = "rejected"
+        return s
+
+    def _negative_from_failed(report, prefix: str) -> VLMScore:
+        failed = [m for m in report.metrics if not m.passed]
+        reasons = "; ".join(
+            f"{m.name}: {m.reason or 'fail'}" for m in failed[:4])
+        s = VLMScore(edit_id=eid, edit_type=et)
+        s.reason = f"{prefix}{reasons}"
+        s.score = round(report.score, 4)
+        s.quality_tier = "negative"
+        s.edit_executed = False
+        return s
+
+    if et in _MESH_PREFILTER_FULL:
+        report = evaluate_pair(eid, et, before, after, cfg)
+        if not report.passed:
+            return _negative_from_failed(report, "Mesh prefilter: ")
+        return None
+
+    if et in _MESH_PREFILTER_LIGHT:
+        results = []
+        for fn in (metric_not_degenerate, metric_connected_components):
+            try:
+                results.append(fn(before, after, cfg))
+            except Exception as e:
+                results.append(
+                    MetricResult(fn.__name__.replace("metric_", ""), 0.0, False,
+                                 reason=str(e)))
+
+        bv, av = len(before.vertices), len(after.vertices)
+        min_v = int(p3.get("vlm_mesh_prefilter_min_vertices", 8))
+        if bv < min_v or av < min_v:
+            results.append(
+                MetricResult(
+                    "min_vertices",
+                    float(min(bv, av)),
+                    False,
+                    weight=2.0,
+                    reason=f"before={bv}, after={av} (min={min_v})",
+                ))
+
+        total_weight = sum(r.weight for r in results)
+        score = (
+            sum(r.weight * (1.0 if r.passed else 0.0) for r in results)
+            / max(total_weight, 1e-8)
+        )
+        passed = all(r.passed for r in results)
+        if not passed:
+            qr = QualityReport(
+                edit_id=eid,
+                edit_type=et,
+                passed=False,
+                score=score,
+                metrics=results,
+            )
+            return _negative_from_failed(qr, "Mesh prefilter (light): ")
+        return None
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Core evaluation
 # ---------------------------------------------------------------------------
 
@@ -310,6 +510,8 @@ def evaluate_edit(
     vlm_model: str,
     num_views: int = 4,
     device: str = "cuda",
+    vlm_max_tokens: int = 4096,
+    vlm_json_object_mode: bool = False,
 ) -> VLMScore:
     """Evaluate a single edit pair: render → compose → VLM judge."""
     score = VLMScore(edit_id=edit_id, edit_type=edit_type)
@@ -329,7 +531,10 @@ def evaluate_edit(
         # Call VLM judge
         result = call_vlm_judge(
             vlm_client, vlm_model, comp_bytes,
-            edit_prompt, edit_type, object_desc, part_label)
+            edit_prompt, edit_type, object_desc, part_label,
+            max_tokens=vlm_max_tokens,
+            json_object_mode=vlm_json_object_mode,
+        )
 
         if result is None:
             score.reason = "VLM returned no valid response"
@@ -390,6 +595,9 @@ def run_vlm_filter(
     mesh_pairs_dir = Path(mesh_pairs_dir)
 
     p3_cfg = cfg.get("phase3", {})
+    num_views = int(p3_cfg.get("num_views", num_views))
+    vlm_max_tokens = int(p3_cfg.get("vlm_max_tokens", 4096))
+    vlm_json_object_mode = bool(p3_cfg.get("vlm_json_response_format", False))
     if output_dir is None:
         output_dir = Path(p3_cfg.get("cache_dir", "cache/phase3"))
     output_dir = Path(output_dir)
@@ -410,7 +618,7 @@ def run_vlm_filter(
 
     if not entries:
         logger.info("No successful edits to filter")
-        return [], []
+        return []
 
     # VLM client
     p0 = cfg.get("phase0", {})
@@ -457,12 +665,24 @@ def run_vlm_filter(
     pipeline = TrellisImageTo3DPipeline.from_pretrained(ckpt)
     pipeline.to(device)
 
-    logger.info(f"Phase 3 VLM filter: {len(entries)} edits, "
-                f"{num_views} views each, model={vlm_model}")
+    pre_on = bool(p3_cfg.get("vlm_mesh_prefilter", False))
+    if pre_on:
+        logger.info(
+            "Mesh prefilter enabled: full=%s light=%s (skips TRELLIS+VLM on fail)",
+            sorted(_MESH_PREFILTER_FULL),
+            sorted(_MESH_PREFILTER_LIGHT),
+        )
+
+    logger.info(
+        f"Phase 3 VLM filter: {len(entries)} edits, {num_views} views each, "
+        f"model={vlm_model}, max_tokens={vlm_max_tokens}, "
+        f"json_object_mode={vlm_json_object_mode}"
+    )
 
     # Evaluate — all results kept, classified by quality tier
     all_scored: list[dict] = []
     scores_path = output_dir / "vlm_scores.jsonl"
+    mesh_prefilter_skipped_vlm = 0
 
     with open(scores_path, "w") as fp:
         for i, entry in enumerate(tqdm(entries, desc="Phase 3: VLM Filter")):
@@ -479,6 +699,19 @@ def run_vlm_filter(
                 fp.write(json.dumps(score_dict, ensure_ascii=False) + "\n")
                 fp.flush()
                 all_scored.append({**entry, **score_dict})
+                continue
+
+            pre_score = mesh_prefilter_before_vlm(pair_dir, entry, cfg)
+            if pre_score is not None:
+                mesh_prefilter_skipped_vlm += 1
+                score_dict = pre_score.to_dict()
+                fp.write(json.dumps(score_dict, ensure_ascii=False) + "\n")
+                fp.flush()
+                all_scored.append({**entry, **score_dict})
+                logger.info(
+                    f"  [{i+1}/{len(entries)}] {eid}: "
+                    f"{pre_score.quality_tier.upper()} (mesh prefilter, skip VLM) "
+                    f"{pre_score.reason[:80]}")
                 continue
 
             # Extract part label from edit_prompt or entry
@@ -501,6 +734,8 @@ def run_vlm_filter(
                 vlm_model=vlm_model,
                 num_views=num_views,
                 device=device,
+                vlm_max_tokens=vlm_max_tokens,
+                vlm_json_object_mode=vlm_json_object_mode,
             )
 
             score_dict = score.to_dict()
@@ -512,6 +747,13 @@ def run_vlm_filter(
             logger.info(f"  [{i+1}/{len(entries)}] {eid}: "
                         f"{tier.upper()} (score={score.score:.2f}) "
                         f"{score.reason}")
+
+    if pre_on and mesh_prefilter_skipped_vlm:
+        logger.info(
+            "Mesh prefilter dropped %d edits before TRELLIS+VLM "
+            "(see reasons in vlm_scores.jsonl)",
+            mesh_prefilter_skipped_vlm,
+        )
 
     # Write tiered output
     _write_tiered_output(all_scored, output_dir)

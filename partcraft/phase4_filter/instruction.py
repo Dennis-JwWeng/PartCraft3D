@@ -83,4 +83,10 @@ def generate_instructions(spec: EditSpec, n_variants: int = 3) -> list[str]:
         for tmpl in random.sample(templates, min(n_variants, len(templates))):
             instructions.append(tmpl.format(old=old, new=new, obj=obj_full))
 
+    else:
+        # material, global, scale, identity, swap, … — use Phase 0/1 prompt
+        base = (spec.edit_prompt or "").strip()
+        if base:
+            instructions.append(base)
+
     return instructions

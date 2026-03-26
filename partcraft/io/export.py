@@ -31,6 +31,9 @@ class EditPairRecord:
     old_part_label: str = ""
     new_part_label: str = ""
     object_desc: str = ""
+    edit_prompt: str = ""
+    after_desc: str = ""
+    quality_tier: str = ""
     quality_score: float = 0.0
     quality_checks: dict[str, bool] = field(default_factory=dict)
 
@@ -38,11 +41,11 @@ class EditPairRecord:
 class EditPairWriter:
     """Writes edit pairs (meshes + renders + manifest) to disk."""
 
-    def __init__(self, output_dir: str | Path):
+    def __init__(self, output_dir: str | Path, filename: str = "edit_pairs.jsonl"):
         self.output_dir = Path(output_dir)
         self.mesh_dir = self.output_dir / "meshes"
         self.render_dir = self.output_dir / "renders"
-        self.manifest_path = self.output_dir / "edit_pairs.jsonl"
+        self.manifest_path = self.output_dir / filename
 
         self.mesh_dir.mkdir(parents=True, exist_ok=True)
         self.render_dir.mkdir(parents=True, exist_ok=True)

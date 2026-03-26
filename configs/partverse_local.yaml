@@ -58,6 +58,7 @@ phase2:
 pipeline:
   # 新版 xformers 已去掉 fmha.BlockDiagonalMask，TRELLIS 稀疏注意力会报错；用 flash_attn（需已安装 flash-attn）。
   attn_backend: "flash_attn"
+  lookahead_objects: 0  # run_streaming prefetch depth; try 2–3 on multi-GPU
 
 phase2_5:
   enabled: true
@@ -76,6 +77,13 @@ phase2_5:
 
 phase3:
   cache_dir: "cache/phase3"
+  # VLM judge: allow long CoT before JSON (local Qwen); raise if server OOMs
+  vlm_max_tokens: 4096
+  # OpenAI json_object mode — enable if your SGLang build supports it
+  vlm_json_response_format: false
+  # Cheap trimesh checks on before.ply/after.ply before TRELLIS decode + VLM judge
+  vlm_mesh_prefilter: true
+  vlm_mesh_prefilter_min_vertices: 8
   min_volume_ratio: 0.15
   max_volume_ratio: 5.0
   min_area_ratio: 0.1

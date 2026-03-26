@@ -706,10 +706,12 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
                                  str(idt_pair / "after.ply"))
                     before_slat = first_pair_dir / "before_slat"
                     if before_slat.exists():
-                        shutil.copytree(str(before_slat),
-                                        str(idt_pair / "before_slat"))
-                        shutil.copytree(str(before_slat),
-                                        str(idt_pair / "after_slat"))
+                        for _slat_name in ("before_slat", "after_slat"):
+                            _dst = idt_pair / _slat_name
+                            if _dst.exists():
+                                shutil.rmtree(_dst)
+                            shutil.copytree(
+                                str(before_slat), str(_dst))
                     out_fp.write(json.dumps({
                         "edit_id": spec.edit_id,
                         "edit_type": IDENTITY,
@@ -752,13 +754,16 @@ def run_step_quality(cfg, results_path, logger, tag=None, limit=None):
     tag_suffix = f"_{tag}" if tag else ""
     mesh_pairs_dir = output_dir / f"mesh_pairs{tag_suffix}"
 
-    scores_path = run_vlm_filter(
+    phase3_dir = cache_dir / f"phase3{tag_suffix}"
+    run_vlm_filter(
         cfg, str(results_path), str(mesh_pairs_dir),
-        str(cache_dir / f"phase3{tag_suffix}"),
+        str(phase3_dir),
         limit=limit)
 
-    logger.info(f"Quality scores: {scores_path}")
-    return scores_path
+    scores_file = phase3_dir / "vlm_scores.jsonl"
+    out = str(scores_file) if scores_file.is_file() else None
+    logger.info(f"Quality scores: {out}")
+    return out
 
 
 # =========================================================================
@@ -781,12 +786,20 @@ def run_step_export(cfg, specs_path, scores_path, logger, tag=None):
     # Load passed entries from quality scoring
     passed_entries = []
     if scores_path and Path(scores_path).exists():
-        with open(scores_path) as f:
-            for line in f:
-                if line.strip():
+        with open(scores_path, encoding="utf-8", errors="replace") as f:
+            for lineno, line in enumerate(f, 1):
+                line = line.strip().replace("\x00", "")
+                if not line or not line.startswith("{"):
+                    continue
+                try:
                     entry = json.loads(line)
-                    if entry.get("quality_tier") in ("high", "medium"):
-                        passed_entries.append(entry)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "Skipping invalid JSON in scores file line %s", lineno
+                    )
+                    continue
+                if entry.get("quality_tier") in ("high", "medium"):
+                    passed_entries.append(entry)
 
     if not passed_entries:
         logger.warning("No passed entries for export")
@@ -825,7 +838,9 @@ def run_step_export(cfg, specs_path, scores_path, logger, tag=None):
                 edit_prompt=spec.edit_prompt,
                 after_desc=spec.after_desc,
                 quality_tier=entry.get("quality_tier", ""),
-                quality_score=entry.get("quality_score", 0.0),
+                quality_score=float(
+                    entry.get("quality_score", entry.get("score", 0.0))
+                ),
             )
             writer.write_pair(record)
             exported += 1
@@ -949,6 +964,13 @@ def main():
     if 5 in steps and results_path and Path(results_path).exists():
         scores_path = run_step_quality(
             cfg, results_path, logger, tag=args.tag, limit=args.limit)
+
+    if scores_path is None and args.tag:
+        p25_cfg = cfg.get("phase2_5", {})
+        cand = Path(p25_cfg["cache_dir"]) / f"phase3_{args.tag}" / "vlm_scores.jsonl"
+        if cand.is_file():
+            scores_path = str(cand)
+            logger.info(f"Using existing quality scores: {scores_path}")
 
     # ---- Step 6: Export ----
     if 6 in steps:
