@@ -22,14 +22,47 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPT_DIR.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from PIL import Image
-
 from scripts.pipeline_common import (
     PROJECT_ROOT, COST,
     load_config, setup_logging,
     PartCraftDataset, EditSpec,
     resolve_api_key, normalize_cache_dirs, set_attn_backend, create_dataset,
-    resolve_data_dirs,
+)
+from scripts.pipeline_diagnostics import (
+    diagnose_step1 as _diagnose_step1,
+    diagnose_step2 as _diagnose_step2,
+    diagnose_step3 as _diagnose_step3,
+    diagnose_step4 as _diagnose_step4,
+    diagnose_step5 as _diagnose_step5,
+    diagnose_step6 as _diagnose_step6,
+)
+from scripts.pipeline_dispatch import (
+    assert_unique_dispatch as _assert_unique_dispatch_impl,
+    merge_jsonl_by_key,
+    split_obj_groups as _split_obj_groups_impl,
+    validate_worker_jsonl_outputs,
+    wait_for_workers,
+)
+from scripts.pipeline_jsonl import (
+    collect_success_ids,
+    dedupe_ids_preserve_order as _dedupe_ids_preserve_order_impl,
+    dedupe_specs_by_edit_id as _dedupe_specs_by_edit_id_impl,
+    iter_jsonl as _iter_jsonl_impl,
+    load_ids_file as _load_ids_file_impl,
+    parse_csv_or_space_list as _parse_csv_or_space_list_impl,
+    write_records,
+)
+from scripts.pipeline_paths import (
+    normalize_shard as _normalize_shard_impl,
+    pipeline_report_dir as _pipeline_report_dir_impl,
+    run_token as _run_token_impl,
+    sync_manifest_link as _sync_manifest_link_impl,
+    write_stage_diag as _write_stage_diag_impl,
+)
+from scripts.pipeline_orchestrator import (
+    build_runtime_context,
+    finalize_summary,
+    run_selected_steps,
 )
 from partcraft.edit_types import (
     ADDITION,
@@ -43,129 +76,66 @@ from partcraft.edit_types import (
 
 STEP4_GPU_TYPES = set(S1_S2_TYPES) | set(S2_ONLY_TYPES)
 STEP4_NON_GPU_TYPES = {ADDITION, DELETION, IDENTITY}
+STEP3_IMAGE_TYPES = ("modification", "scale", "material", "global")
 
 
 def _normalize_shard(shard: str | None) -> str | None:
-    if shard is None:
-        return None
-    s = str(shard).strip()
-    if not s:
-        return None
-    return s.zfill(2)
+    return _normalize_shard_impl(shard)
 
 
 def _run_token(tag: str | None, shard: str | None) -> str:
-    """Build output token. Prefer explicit tag, fallback to shard token."""
-    if tag:
-        return str(tag)
-    if shard:
-        return f"shard{shard}"
-    return ""
+    return _run_token_impl(tag, shard)
 
 
 def _iter_jsonl(path: Path):
-    if not path.exists():
-        return
-    with open(path, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            s = line.strip()
-            if not s:
-                continue
-            try:
-                yield json.loads(s)
-            except Exception:
-                continue
+    yield from _iter_jsonl_impl(path)
 
 
 def _pipeline_report_dir(cfg: dict, shard: str | None) -> Path:
-    out = Path(cfg["data"]["output_dir"])
-    shard_leaf = f"shard_{shard}" if shard else "shard_unknown"
-    shard_dir = out if out.name == shard_leaf else (out / shard_leaf)
-    report_dir = shard_dir / "pipeline" / "reports"
-    report_dir.mkdir(parents=True, exist_ok=True)
-    return report_dir
+    return _pipeline_report_dir_impl(cfg, shard)
 
 
 def _write_stage_diag(report_dir: Path, stage: str, payload: dict):
-    with open(report_dir / f"{stage}.json", "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    _write_stage_diag_impl(report_dir, stage, payload)
 
 
 def _pipeline_manifest_dir(cfg: dict, shard: str | None, phase: str) -> Path:
-    out = Path(cfg["data"]["output_dir"])
-    shard_leaf = f"shard_{shard}" if shard else "shard_unknown"
-    shard_dir = out if out.name == shard_leaf else (out / shard_leaf)
-    mdir = shard_dir / "pipeline" / "manifests" / phase
-    mdir.mkdir(parents=True, exist_ok=True)
-    return mdir
+    # Kept for backward compatibility in this script.
+    from scripts.pipeline_paths import pipeline_manifest_dir
+
+    return pipeline_manifest_dir(cfg, shard, phase)
 
 
 def _sync_manifest_link(cfg: dict, shard: str | None, phase: str, filename: str, src: Path):
-    if not src or not src.exists():
-        return
-    mdir = _pipeline_manifest_dir(cfg, shard, phase)
-    dst = mdir / filename
-    if dst.exists() or dst.is_symlink():
-        try:
-            if dst.is_symlink() and dst.resolve() == src.resolve():
-                return
-        except Exception:
-            pass
-        if dst.is_dir() and not dst.is_symlink():
-            shutil.rmtree(dst)
-        else:
-            dst.unlink(missing_ok=True)
-    dst.symlink_to(src)
+    _sync_manifest_link_impl(cfg, shard, phase, filename, src)
 
 
 def _parse_csv_or_space_list(values) -> list[str]:
-    """Parse repeated args like ['0,1', '2'] into ['0', '1', '2']."""
-    if not values:
-        return []
-    if isinstance(values, str):
-        values = [values]
-    out: list[str] = []
-    for v in values:
-        if v is None:
-            continue
-        for x in str(v).split(","):
-            x = x.strip()
-            if x:
-                out.append(x)
-    return out
+    return _parse_csv_or_space_list_impl(values)
 
 
 def _load_edit_ids_file(path: str | None) -> list[str]:
-    """Load edit IDs from text file (one id per line)."""
-    if not path:
-        return []
-    ids: list[str] = []
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if s and not s.startswith("#"):
-                ids.append(s)
-    return ids
+    return _load_ids_file_impl(path)
 
 
 def _load_generic_ids_file(path: str | None) -> list[str]:
-    """Load generic IDs from file (one per line)."""
-    return _load_edit_ids_file(path)
+    return _load_ids_file_impl(path)
 
 
 def _split_obj_groups(specs, n_buckets: int) -> list[list]:
-    """Greedy split by object groups to balance multi-GPU workloads."""
-    buckets = [[] for _ in range(n_buckets)]
-    bucket_sizes = [0] * n_buckets
-    obj_groups: OrderedDict[str, list] = OrderedDict()
-    for s in specs:
-        obj_groups.setdefault(s.obj_id, []).append(s)
-    groups = sorted(obj_groups.values(), key=lambda g: len(g), reverse=True)
-    for g in groups:
-        idx = min(range(n_buckets), key=lambda i: bucket_sizes[i])
-        buckets[idx].extend(g)
-        bucket_sizes[idx] += len(g)
-    return buckets
+    return _split_obj_groups_impl(specs, n_buckets)
+
+
+def _dedupe_ids_preserve_order(ids: list[str]) -> tuple[list[str], int]:
+    return _dedupe_ids_preserve_order_impl(ids)
+
+
+def _dedupe_specs_by_edit_id(specs: list, logger, stage: str):
+    return _dedupe_specs_by_edit_id_impl(specs, logger, stage)
+
+
+def _assert_unique_dispatch(groups: list[tuple[str, list]], stage: str):
+    _assert_unique_dispatch_impl(groups, stage)
 
 
 # =========================================================================
@@ -257,6 +227,9 @@ def run_step_semantic_multi_gpu(
     all_uids = sorted([obj_id for shard, obj_id in dataset._index if shard == target_shard])
     if limit:
         all_uids = all_uids[:limit]
+    all_uids, dup_uids = _dedupe_ids_preserve_order(all_uids)
+    if dup_uids:
+        logger.warning("Step1: dropped %d duplicate object IDs before dispatch", dup_uids)
 
     done_ids: set[str] = set()
     if labels_path.exists():
@@ -285,13 +258,17 @@ def run_step_semantic_multi_gpu(
 
     worker_label_paths: list[Path] = []
     procs = []
+    pending_set = set(pending)
     for i, url, bucket in plan:
         ids_path = dispatch_dir / f"step1_obj_ids_w{i}.txt"
         with open(ids_path, "w", encoding="utf-8") as f:
             for uid in bucket:
                 f.write(f"{uid}\n")
         labels_name = f"semantic_labels{tag_suffix}_w{i}.jsonl"
-        worker_label_paths.append(cache_dir / labels_name)
+        worker_labels_path = cache_dir / labels_name
+        if worker_labels_path.exists():
+            worker_labels_path.unlink()
+        worker_label_paths.append(worker_labels_path)
 
         cmd = [sys.executable, str(Path(__file__).resolve())]
         if config_path:
@@ -317,46 +294,38 @@ def run_step_semantic_multi_gpu(
                         i, url, len(bucket))
         procs.append((i, subprocess.Popen(cmd, env=env)))
 
-    failed = []
-    for i, p in procs:
-        ret = p.wait()
-        if ret != 0:
-            failed.append((i, ret))
-    if failed:
-        raise RuntimeError(f"Step1 workers failed: {failed}")
+    wait_for_workers(procs, "Step1")
+    missing_pending, dup_pending, unexpected_worker_ids = validate_worker_jsonl_outputs(
+        worker_label_paths,
+        pending_ids=pending_set,
+        id_key="obj_id",
+        stage="Step1",
+    )
+    if unexpected_worker_ids:
+        sample = ", ".join(sorted(unexpected_worker_ids)[:10])
+        raise RuntimeError(
+            "Step1 merge found unexpected obj_ids from worker outputs "
+            f"(sample: {sample}, total={len(unexpected_worker_ids)})"
+        )
+    if missing_pending:
+        sample = ", ".join(missing_pending[:10])
+        raise RuntimeError(
+            "Step1 merge missing worker outputs for pending obj_ids "
+            f"(sample: {sample}, total={len(missing_pending)})"
+        )
+    if dup_pending:
+        sample = ", ".join(dup_pending[:10])
+        raise RuntimeError(
+            "Step1 merge found duplicate obj_id rows across worker outputs "
+            f"(sample: {sample}, total={len(dup_pending)})"
+        )
 
-    merged: OrderedDict[str, dict] = OrderedDict()
-    if labels_path.exists():
-        with open(labels_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    oid = rec.get("obj_id")
-                    if oid:
-                        merged[oid] = rec
-                except Exception:
-                    pass
-    for lp in worker_label_paths:
-        if not lp.exists():
-            continue
-        with open(lp, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    oid = rec.get("obj_id")
-                    if oid:
-                        merged[oid] = rec
-                except Exception:
-                    pass
-    with open(labels_path, "w", encoding="utf-8") as f:
-        for rec in merged.values():
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    merged = merge_jsonl_by_key(
+        output_path=labels_path,
+        worker_paths=worker_label_paths,
+        id_key="obj_id",
+    )
+    write_records(labels_path, merged)
 
     logger.info("Merged Step1 labels → %s (%d objects)", labels_path, len(merged))
     return labels_path
@@ -463,7 +432,9 @@ def run_step_2d_edit(cfg, specs_path, dataset, logger,
         )
 
     # Load specs
-    edit_types = edit_types or ["modification", "deletion", "global"]
+    # Step3 pre-generates 2D conditioning only for TRELLIS-bound edit types.
+    # deletion/addition/identity do not require image editing.
+    edit_types = edit_types or list(STEP3_IMAGE_TYPES)
     specs = []
     with open(specs_path) as f:
         for line in f:
@@ -478,6 +449,7 @@ def run_step_2d_edit(cfg, specs_path, dataset, logger,
 
     if not edit_ids and limit:
         specs = specs[:limit]
+    specs = _dedupe_specs_by_edit_id(specs, logger, "Step3")
 
     # Output directory
     cache_dir = Path(p25.get("cache_dir", "outputs/cache/phase2_5"))
@@ -571,502 +543,25 @@ def run_step_3d_edit(cfg, specs_path, dataset, logger,
                      edit_types=None, edit_ids=None, combinations=None,
                      edit_dir=None, debug=False, cache_only_2d: bool = False,
                      results_name: str | None = None):
-    """TRELLIS Step 4. With ``use_2d``: load ``{edit_dir}/{edit_id}_edited.png``
-    first; if ``cache_only_2d``, skip image HTTP/VLM (missing PNG → no cond)."""
-    logger.info("=" * 60)
-    logger.info("STEP 4: 3D Editing — TRELLIS")
-    logger.info("=" * 60)
+    from scripts.pipeline_step_3d import run_step_3d_edit as _run_step_3d_edit_impl
 
-    p25_cfg = cfg.get("phase2_5", {})
-
-    from partcraft.phase2_assembly.trellis_refine import (
-        TrellisRefiner, build_prompts_from_spec)
-
-    # ---- Paths ----
-    output_dir = Path(cfg["data"]["output_dir"])
-    cache_dir = Path(p25_cfg["cache_dir"])
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    tag_suffix = f"_{tag}" if tag else ""
-    mesh_pairs_dir = output_dir / f"mesh_pairs{tag_suffix}"
-
-    # ---- Load specs (match streaming / PartVerse) ----
-    edit_types = edit_types or [
-        "deletion", "addition", "modification", "scale", "material",
-        "global", "identity",
-    ]
-    all_specs = []
-    with open(specs_path) as f:
-        for line in f:
-            if not line.strip():
-                continue
-            d = json.loads(line)
-            spec = EditSpec(**d)
-            if edit_ids and spec.edit_id not in edit_ids:
-                continue
-            if spec.edit_type in edit_types or spec.edit_type == "addition":
-                all_specs.append(spec)
-
-    if not edit_ids and limit:
-        all_specs = all_specs[:limit]
-
-    if not all_specs:
-        logger.info("No edit specs to process")
-        return None
-
-    # ---- Resume ----
-    output_path = (cache_dir / results_name) if results_name else (
-        cache_dir / f"edit_results{tag_suffix}.jsonl")
-    done_ids: set[str] = set()
-    if output_path.exists():
-        with open(output_path) as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                    if rec.get("status") == "success":
-                        done_ids.add(rec["edit_id"])
-                except (json.JSONDecodeError, KeyError):
-                    pass
-
-    pending = [s for s in all_specs if s.edit_id not in done_ids]
-    logger.info(f"3D edits: {len(pending)} pending ({len(done_ids)} done)")
-    if not pending:
-        logger.info("All 3D edits already done")
-        return output_path
-
-    # ---- VLM client for inline 2D editing ----
-    image_edit_backend = p25_cfg.get("image_edit_backend", "api")
-    vlm_client = None
-    if use_2d and image_edit_backend != "local_diffusers":
-        from openai import OpenAI
-        api_key = resolve_api_key(cfg)
-        if api_key:
-            p0 = cfg["phase0"]
-            image_edit_url = (p25_cfg.get("image_edit_base_url")
-                              or p0.get("vlm_base_url", ""))
-            vlm_client = OpenAI(
-                base_url=image_edit_url,
-                api_key=api_key,
-            )
-
-    # ---- Lazy init refiner ----
-    refiner = None
-
-    def ensure_refiner():
-        nonlocal refiner
-        if refiner is not None:
-            return refiner
-        slat_dir, img_enc_dir = resolve_data_dirs(cfg)
-        refiner = TrellisRefiner(
-            cache_dir=str(cache_dir),
-            device="cuda",
-            image_edit_model=p25_cfg.get("image_edit_model", "gemini-2.5-flash-image"),
-            ckpt_dir=cfg.get("ckpt_root"),
-            image_edit_backend=image_edit_backend,
-            image_edit_base_url=p25_cfg.get("image_edit_base_url", "http://localhost:8001"),
-            debug=debug,
-            slat_dir=slat_dir,
-            img_enc_dir=img_enc_dir,
-        )
-        refiner.load_models()
-        logger.info("TRELLIS models initialized for GPU edit types")
-        return refiner
-
-    # ---- Group by object ----
-    obj_groups: OrderedDict[str, list] = OrderedDict()
-    for spec in pending:
-        obj_groups.setdefault(spec.obj_id, []).append(spec)
-
-    success, fail = 0, 0
-    glb_tmp_dir = tempfile.mkdtemp(prefix="partcraft_glb_")
-
-    with open(output_path, "a") as out_fp:
-        for obj_id, specs in obj_groups.items():
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Object: {obj_id} ({len(specs)} edits)")
-
-            def _spec_order(s: EditSpec):
-                t = s.edit_type
-                if t == "deletion":
-                    return (0, 0)
-                if t == "addition":
-                    return (1, 0)
-                return (2, TYPE_ORDER.get(t, 99))
-
-            specs.sort(key=_spec_order)
-
-            # ---- Handle additions (swap from deletion) ----
-            add_specs = [s for s in specs if s.edit_type == "addition"]
-            run_specs = [s for s in specs if s.edit_type != "addition"]
-
-            for spec in add_specs:
-                del_pair_dir = mesh_pairs_dir / spec.source_del_id
-                add_pair_dir = mesh_pairs_dir / spec.edit_id
-                if (del_pair_dir / "before_slat").exists():
-                    add_pair_dir.mkdir(parents=True, exist_ok=True)
-                    for src, dst in [
-                        (del_pair_dir / "before_slat", add_pair_dir / "after_slat"),
-                        (del_pair_dir / "after_slat", add_pair_dir / "before_slat"),
-                        (del_pair_dir / "before.ply", add_pair_dir / "after.ply"),
-                        (del_pair_dir / "after.ply", add_pair_dir / "before.ply"),
-                    ]:
-                        if src.exists() and not dst.exists():
-                            if src.is_dir():
-                                shutil.copytree(str(src), str(dst))
-                            else:
-                                shutil.copy2(str(src), str(dst))
-                    out_fp.write(json.dumps({
-                        "edit_id": spec.edit_id, "edit_type": "addition",
-                        "obj_id": obj_id, "status": "success",
-                        "source_del_id": spec.source_del_id,
-                    }, ensure_ascii=False) + "\n")
-                    out_fp.flush()
-                    success += 1
-                else:
-                    run_specs.append(spec)
-
-            idt_specs = [s for s in run_specs if s.edit_type == IDENTITY]
-            run_specs = [s for s in run_specs if s.edit_type != IDENTITY]
-            first_pair_dir = None
-            cpu_specs = [s for s in run_specs if s.edit_type == DELETION]
-            gpu_specs = [s for s in run_specs if s.edit_type in STEP4_GPU_TYPES]
-            unknown_specs = [
-                s for s in run_specs
-                if s.edit_type not in (STEP4_NON_GPU_TYPES | STEP4_GPU_TYPES)
-            ]
-            for spec in unknown_specs:
-                logger.warning(f"Unknown edit type: {spec.edit_type}")
-                out_fp.write(json.dumps({
-                    "edit_id": spec.edit_id, "status": "failed",
-                    "reason": f"Unknown edit type: {spec.edit_type}",
-                }, ensure_ascii=False) + "\n")
-                fail += 1
-            if unknown_specs:
-                out_fp.flush()
-
-            if not cpu_specs and not gpu_specs:
-                # Identity-only object: still need first_pair_dir from prior
-                # edits on same object (not supported here).
-                for spec in idt_specs:
-                    out_fp.write(json.dumps({
-                        "edit_id": spec.edit_id, "status": "failed",
-                        "reason": "identity needs prior edits on object",
-                    }, ensure_ascii=False) + "\n")
-                    fail += 1
-                out_fp.flush()
-                continue
-
-            obj_record = None
-            ori_slat = None
-            ori_gaussian = None
-            if cpu_specs or gpu_specs:
-                try:
-                    shard = (cpu_specs[0].shard if cpu_specs
-                             else gpu_specs[0].shard)
-                    obj_record = dataset.load_object(shard, obj_id)
-                except Exception as e:
-                    logger.error(f"Failed to load object {obj_id}: {e}")
-                    for spec in cpu_specs + gpu_specs:
-                        out_fp.write(json.dumps({
-                            "edit_id": spec.edit_id, "status": "failed",
-                            "reason": f"Object load failed: {e}",
-                        }, ensure_ascii=False) + "\n")
-                    fail += len(cpu_specs) + len(gpu_specs)
-                    out_fp.flush()
-                    continue
-
-            for spec in cpu_specs:
-                logger.info(f"\n[{success+fail+1}/{len(pending)}] "
-                            f"{spec.edit_id} ({spec.edit_type}): "
-                            f"\"{spec.edit_prompt[:80]}\"")
-                try:
-                    pair_dir = mesh_pairs_dir / spec.edit_id
-                    export_paths = TrellisRefiner.direct_delete_mesh(
-                        obj_record, spec.remove_part_ids, pair_dir)
-                    record = {
-                        "edit_id": spec.edit_id,
-                        "edit_type": spec.edit_type,
-                        "effective_edit_type": "DirectDeletion",
-                        "obj_id": obj_id,
-                        "shard": spec.shard,
-                        "object_desc": spec.object_desc,
-                        "edit_prompt": spec.edit_prompt,
-                        "after_desc": spec.after_desc,
-                        **export_paths,
-                        "status": "success",
-                    }
-                    out_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    out_fp.flush()
-                    success += 1
-                    if first_pair_dir is None:
-                        first_pair_dir = pair_dir
-                    logger.info(f"  → direct deletion (GT mesh) saved {pair_dir}")
-                except Exception as e:
-                    import traceback
-                    logger.error(f"Failed {spec.edit_id}: {e}")
-                    traceback.print_exc()
-                    out_fp.write(json.dumps({
-                        "edit_id": spec.edit_id, "status": "failed",
-                        "reason": str(e),
-                    }, ensure_ascii=False) + "\n")
-                    out_fp.flush()
-                    fail += 1
-
-            if gpu_specs:
-                try:
-                    refiner = ensure_refiner()
-                    ori_slat = refiner.encode_object(None, obj_id)
-                    ori_gaussian = refiner.decode_to_gaussian(ori_slat)
-                except Exception as e:
-                    logger.error(f"Failed to prepare TRELLIS state for {obj_id}: {e}")
-                    for spec in gpu_specs:
-                        out_fp.write(json.dumps({
-                            "edit_id": spec.edit_id, "status": "failed",
-                            "reason": f"Preparation failed: {e}",
-                        }, ensure_ascii=False) + "\n")
-                    fail += len(gpu_specs)
-                    out_fp.flush()
-                    gpu_specs = []
-
-            for spec in gpu_specs:
-                logger.info(f"\n[{success+fail+1}/{len(pending)}] "
-                            f"{spec.edit_id} ({spec.edit_type}): "
-                            f"\"{spec.edit_prompt[:80]}\"")
-
-                try:
-                    edit_type = spec.edit_type.capitalize()
-                    if edit_type in ("Modification", "Scale"):
-                        if spec.remove_part_ids:
-                            edit_part_ids = spec.remove_part_ids
-                        else:
-                            edit_part_ids = [spec.old_part_id]
-                    elif edit_type == "Material":
-                        edit_part_ids = [spec.old_part_id]
-                    elif edit_type == "Global":
-                        edit_part_ids = []
-                    else:
-                        logger.warning(f"Skipped non-GPU type in GPU queue: {spec.edit_type}")
-                        continue
-
-                    # Build mask (may auto-promote to Global)
-                    mask, effective_type = refiner.build_part_mask(
-                        obj_id, obj_record, edit_part_ids,
-                        ori_slat, edit_type)
-
-                    if effective_type != edit_type:
-                        logger.info(f"  Auto-promoted {edit_type} → "
-                                    f"{effective_type} (large part)")
-                        edit_type = effective_type
-
-                    if mask.sum() == 0:
-                        logger.warning(f"Empty mask for {spec.edit_id}")
-                        out_fp.write(json.dumps({
-                            "edit_id": spec.edit_id, "status": "failed",
-                            "reason": "Empty mask",
-                        }) + "\n")
-                        out_fp.flush()
-                        fail += 1
-                        continue
-
-                    # Build prompts
-                    prompts = build_prompts_from_spec(spec)
-                    if prompts["edit_type"] != edit_type:
-                        prompts["edit_type"] = edit_type
-
-                    # 2D image conditioning (disk first — same paths as Step 3 / streaming)
-                    img_cond = None
-                    if edit_type in ("Modification", "Scale", "Material",
-                                     "Global") and use_2d:
-                        num_edit_views = p25_cfg.get("num_edit_views", 4)
-                        edit_strength = p25_cfg.get("edit_strength", 1.0)
-
-                        prerender_img = None
-                        _2d_base = cache_dir / (edit_dir or "2d_edits")
-                        _ced = _2d_base / f"{spec.edit_id}_edited.png"
-                        if _ced.exists():
-                            try:
-                                from scripts.run_2d_edit import (
-                                    prepare_input_image)
-                                edited = Image.open(_ced).convert("RGB").resize(
-                                    (518, 518))
-                                _cin = _2d_base / f"{spec.edit_id}_input.png"
-                                if _cin.exists():
-                                    pil_in = Image.open(_cin).convert(
-                                        "RGB").resize((518, 518))
-                                elif (hasattr(spec, "best_view")
-                                      and spec.best_view >= 0):
-                                    _, pil_img = prepare_input_image(
-                                        obj_record, spec.best_view)
-                                    pil_in = pil_img.resize((518, 518))
-                                else:
-                                    pil_in = edited
-                                prerender_img = (pil_in, edited)
-                                logger.info(
-                                    f"  2D from disk ({_2d_base.name}/"
-                                    f"{spec.edit_id}_edited.png)")
-                            except Exception as e:
-                                logger.warning(f"  Cached 2D load failed: {e}")
-
-                        if (prerender_img is None and not cache_only_2d
-                                and hasattr(spec, 'best_view')
-                                and spec.best_view >= 0):
-                            try:
-                                from scripts.run_2d_edit import (
-                                    prepare_input_image, call_local_edit,
-                                    call_vlm_edit)
-                                img_bytes, pil_img = prepare_input_image(
-                                    obj_record, spec.best_view)
-                                after_desc = (spec.after_desc
-                                              or spec.after_part_desc or "")
-                                before_desc = (getattr(spec, 'before_part_desc', '')
-                                               or '')
-                                remove_labels = getattr(spec, 'remove_labels', [])
-                                old_label = getattr(spec, 'old_label', '') or ''
-                                if remove_labels and len(remove_labels) > 1:
-                                    part_label = ", ".join(remove_labels)
-                                elif remove_labels:
-                                    part_label = remove_labels[0]
-                                else:
-                                    part_label = old_label
-
-                                if image_edit_backend == "local_diffusers":
-                                    edit_url = p25_cfg.get(
-                                        "image_edit_base_url",
-                                        "http://localhost:8001")
-                                    edited = call_local_edit(
-                                        edit_url, img_bytes, spec.edit_prompt,
-                                        after_desc, old_part_label=part_label,
-                                        before_part_desc=before_desc,
-                                        edit_type=spec.edit_type)
-                                elif vlm_client is not None:
-                                    edited = call_vlm_edit(
-                                        vlm_client, img_bytes, spec.edit_prompt,
-                                        after_desc,
-                                        p25_cfg.get("image_edit_model", ""),
-                                        old_part_label=part_label,
-                                        before_part_desc=before_desc,
-                                        edit_type=spec.edit_type)
-                                else:
-                                    edited = None
-                                if edited is not None:
-                                    edited = edited.resize((518, 518))
-                                    prerender_img = (pil_img.resize((518, 518)),
-                                                     edited)
-                                    logger.info(f"  2D edit from prerender "
-                                                f"view {spec.best_view}")
-                            except Exception as e:
-                                logger.warning(
-                                    f"  Prerender 2D edit failed: {e}")
-
-                        if prerender_img is not None:
-                            original_images = [prerender_img[0]]
-                            edited_images = [prerender_img[1]]
-                        elif not cache_only_2d:
-                            original_images, edited_images = \
-                                refiner.obtain_edited_images(
-                                    ori_gaussian, prompts, vlm_client,
-                                    obj_id, spec.edit_id,
-                                    num_views=num_edit_views,
-                                    edit_dir=edit_dir)
-                        else:
-                            original_images, edited_images = [], []
-                            logger.warning(
-                                "  --2d-cache-only: missing %s_edited.png → no img cond",
-                                spec.edit_id)
-
-                        if edited_images:
-                            img_cond = refiner.encode_multiview_cond(
-                                edited_images, original_images,
-                                edit_strength=edit_strength)
-
-                    # Run TRELLIS editing
-                    slats_edited = refiner.edit(
-                        ori_slat, mask, prompts,
-                        img_cond=img_cond,
-                        seed=seed,
-                        combinations=combinations,
-                    )
-
-                    if not slats_edited:
-                        raise RuntimeError("No edited SLATs produced")
-
-                    best_slat = slats_edited[0]
-
-                    # Export before/after pair
-                    pair_dir = mesh_pairs_dir / spec.edit_id
-                    export_paths = refiner.export_pair(
-                        ori_slat, best_slat, pair_dir)
-
-                    record = {
-                        "edit_id": spec.edit_id,
-                        "edit_type": spec.edit_type,
-                        "effective_edit_type": edit_type,
-                        "obj_id": obj_id,
-                        "shard": spec.shard,
-                        "object_desc": spec.object_desc,
-                        "edit_prompt": spec.edit_prompt,
-                        "after_desc": spec.after_desc,
-                        **export_paths,
-                        "status": "success",
-                    }
-                    out_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    out_fp.flush()
-                    success += 1
-                    if first_pair_dir is None:
-                        first_pair_dir = pair_dir
-                    logger.info(f"  → saved {pair_dir}")
-
-                except Exception as e:
-                    import traceback
-                    logger.error(f"Failed {spec.edit_id}: {e}")
-                    traceback.print_exc()
-                    out_fp.write(json.dumps({
-                        "edit_id": spec.edit_id, "status": "failed",
-                        "reason": str(e),
-                    }) + "\n")
-                    out_fp.flush()
-                    fail += 1
-
-            for spec in idt_specs:
-                idt_pair = mesh_pairs_dir / spec.edit_id
-                if first_pair_dir and (first_pair_dir / "before.ply").exists():
-                    idt_pair.mkdir(parents=True, exist_ok=True)
-                    before_ply = first_pair_dir / "before.ply"
-                    shutil.copy2(str(before_ply),
-                                 str(idt_pair / "before.ply"))
-                    shutil.copy2(str(before_ply),
-                                 str(idt_pair / "after.ply"))
-                    before_slat = first_pair_dir / "before_slat"
-                    if before_slat.exists():
-                        for _slat_name in ("before_slat", "after_slat"):
-                            _dst = idt_pair / _slat_name
-                            if _dst.exists():
-                                shutil.rmtree(_dst)
-                            shutil.copytree(
-                                str(before_slat), str(_dst))
-                    out_fp.write(json.dumps({
-                        "edit_id": spec.edit_id,
-                        "edit_type": IDENTITY,
-                        "effective_edit_type": "Identity",
-                        "obj_id": obj_id, "status": "success",
-                        "edit_prompt": spec.edit_prompt,
-                    }, ensure_ascii=False) + "\n")
-                    out_fp.flush()
-                    success += 1
-                    logger.info(f"  [{spec.edit_id}] identity: before=after (no-op)")
-                else:
-                    out_fp.write(json.dumps({
-                        "edit_id": spec.edit_id, "status": "failed",
-                        "reason": "No before mesh available for identity",
-                    }) + "\n")
-                    out_fp.flush()
-                    fail += 1
-
-            if obj_record is not None:
-                obj_record.close()
-
-    shutil.rmtree(glb_tmp_dir, ignore_errors=True)
-    logger.info(f"\n3D edits: {success} ok, {fail} fail → {output_path}")
-    return output_path
+    return _run_step_3d_edit_impl(
+        cfg,
+        specs_path,
+        dataset,
+        logger,
+        tag=tag,
+        seed=seed,
+        limit=limit,
+        use_2d=use_2d,
+        edit_types=edit_types,
+        edit_ids=edit_ids,
+        combinations=combinations,
+        edit_dir=edit_dir,
+        debug=debug,
+        cache_only_2d=cache_only_2d,
+        results_name=results_name,
+    )
 
 
 def run_step_3d_edit_multi_gpu(
@@ -1108,6 +603,7 @@ def run_step_3d_edit_multi_gpu(
                 all_specs.append(spec)
     if not edit_ids and limit:
         all_specs = all_specs[:limit]
+    all_specs = _dedupe_specs_by_edit_id(all_specs, logger, "Step4(multi)")
     if not all_specs:
         logger.info("No edit specs to process")
         return None
@@ -1118,16 +614,7 @@ def run_step_3d_edit_multi_gpu(
     tag_suffix = f"_{tag}" if tag else ""
     merged_path = cache_dir / f"edit_results{tag_suffix}.jsonl"
 
-    done_ids: set[str] = set()
-    if merged_path.exists():
-        with open(merged_path, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                    if rec.get("status") == "success":
-                        done_ids.add(rec["edit_id"])
-                except Exception:
-                    pass
+    done_ids = collect_success_ids(merged_path, id_key="edit_id")
     pending = [s for s in all_specs if s.edit_id not in done_ids]
     if not pending:
         logger.info("All 3D edits already done")
@@ -1135,6 +622,10 @@ def run_step_3d_edit_multi_gpu(
 
     nongpu_pending = [s for s in pending if s.edit_type in STEP4_NON_GPU_TYPES]
     gpu_pending = [s for s in pending if s.edit_type not in STEP4_NON_GPU_TYPES]
+    _assert_unique_dispatch(
+        [("gpu_pending", gpu_pending), ("nongpu_pending", nongpu_pending)],
+        "Step4 routing",
+    )
 
     logger.info(
         "Step4 routing: GPU=%d, non-GPU=%d",
@@ -1145,6 +636,10 @@ def run_step_3d_edit_multi_gpu(
     if gpu_pending:
         buckets = _split_obj_groups(gpu_pending, len(gpus))
         gpu_plan = [(gpu, bucket) for gpu, bucket in zip(gpus, buckets) if bucket]
+        _assert_unique_dispatch(
+            [(f"gpu_{gpu}", bucket) for gpu, bucket in gpu_plan],
+            "Step4 GPU plan",
+        )
         logger.info("Step4 GPU plan: %s", ", ".join(
             f"GPU {gpu}: {len(bucket)} edits" for gpu, bucket in gpu_plan))
     else:
@@ -1155,13 +650,18 @@ def run_step_3d_edit_multi_gpu(
 
     worker_result_paths: list[Path] = []
     procs = []
+    pending_set = {s.edit_id for s in pending}
+    full_run = (not edit_ids and not limit)
     for wi, (gpu, bucket) in enumerate(gpu_plan):
         ids_path = dispatch_dir / f"edit_ids_gpu{gpu}.txt"
         with open(ids_path, "w", encoding="utf-8") as f:
             for s in bucket:
                 f.write(f"{s.edit_id}\n")
         res_name = f"edit_results{tag_suffix}_gpu{gpu}.jsonl"
-        worker_result_paths.append(cache_dir / res_name)
+        worker_res_path = cache_dir / res_name
+        if worker_res_path.exists():
+            worker_res_path.unlink()
+        worker_result_paths.append(worker_res_path)
 
         cmd = [sys.executable, str(Path(__file__).resolve())]
         if config_path:
@@ -1192,7 +692,10 @@ def run_step_3d_edit_multi_gpu(
             for s in nongpu_pending:
                 f.write(f"{s.edit_id}\n")
         cpu_res_name = f"edit_results{tag_suffix}_nongpu.jsonl"
-        worker_result_paths.append(cache_dir / cpu_res_name)
+        cpu_res_path = cache_dir / cpu_res_name
+        if cpu_res_path.exists():
+            cpu_res_path.unlink()
+        worker_result_paths.append(cpu_res_path)
 
         cpu_cmd = [sys.executable, str(Path(__file__).resolve())]
         if config_path:
@@ -1215,47 +718,56 @@ def run_step_3d_edit_multi_gpu(
         logger.info("Launch non-GPU worker with %d edits", len(nongpu_pending))
         procs.append(("nongpu", subprocess.Popen(cpu_cmd, env=cpu_env)))
 
-    failed_gpus = []
-    for gpu, p in procs:
-        ret = p.wait()
-        if ret != 0:
-            failed_gpus.append((gpu, ret))
-    if failed_gpus:
-        raise RuntimeError(f"Multi-GPU worker failed: {failed_gpus}")
+    wait_for_workers(procs, "Step4")
+    missing_pending, dup_pending, unexpected_ids = validate_worker_jsonl_outputs(
+        worker_result_paths,
+        pending_ids=pending_set,
+        id_key="edit_id",
+        stage="Step4",
+    )
+    if missing_pending:
+        sample = ", ".join(missing_pending[:10])
+        raise RuntimeError(
+            "Step4 merge missing pending edit_ids from worker outputs "
+            f"(sample: {sample}, total={len(missing_pending)})"
+        )
+    if dup_pending:
+        sample = ", ".join(dup_pending[:10])
+        raise RuntimeError(
+            "Step4 merge found duplicate edit_id rows across worker outputs "
+            f"(sample: {sample}, total={len(dup_pending)})"
+        )
+    if unexpected_ids:
+        sample = ", ".join(sorted(unexpected_ids)[:10])
+        raise RuntimeError(
+            "Step4 merge found unexpected edit_ids in worker outputs "
+            f"(sample: {sample}, total={len(unexpected_ids)})"
+        )
 
-    # Merge worker result files into canonical edit_results{tag}.jsonl
-    merged: OrderedDict[str, dict] = OrderedDict()
-    if merged_path.exists():
-        with open(merged_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    eid = rec.get("edit_id")
-                    if eid:
-                        merged[eid] = rec
-                except Exception:
-                    pass
-    for rp in worker_result_paths:
-        if not rp.exists():
-            continue
-        with open(rp, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    eid = rec.get("edit_id")
-                    if eid:
-                        merged[eid] = rec
-                except Exception:
-                    pass
-    with open(merged_path, "w", encoding="utf-8") as f:
-        for rec in merged.values():
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    merged = merge_jsonl_by_key(
+        output_path=merged_path,
+        worker_paths=worker_result_paths,
+        id_key="edit_id",
+    )
+    write_records(merged_path, merged)
+
+    all_spec_ids = {s.edit_id for s in all_specs}
+    merged_ids = set(merged.keys())
+    missing_after_merge = sorted([eid for eid in all_spec_ids if eid not in merged_ids])
+    if missing_after_merge:
+        sample = ", ".join(missing_after_merge[:10])
+        raise RuntimeError(
+            "Step4 canonical merge missing edit_ids required for downstream steps "
+            f"(sample: {sample}, total={len(missing_after_merge)})"
+        )
+    if full_run:
+        unexpected_after_merge = sorted([eid for eid in merged_ids if eid not in all_spec_ids])
+        if unexpected_after_merge:
+            sample = ", ".join(unexpected_after_merge[:10])
+            raise RuntimeError(
+                "Step4 canonical merge contains edit_ids not in current specs "
+                f"(sample: {sample}, total={len(unexpected_after_merge)})"
+            )
 
     logger.info("Merged multi-GPU results → %s (%d records)",
                 merged_path, len(merged))
@@ -1375,92 +887,27 @@ def run_step_export(cfg, specs_path, scores_path, logger, tag=None):
 
 
 def diagnose_step1(labels_path: Path, shard: str | None) -> dict:
-    rows = list(_iter_jsonl(labels_path))
-    ids = [r.get("obj_id") for r in rows if r.get("obj_id")]
-    shard_counter = Counter(str(r.get("shard", "")).zfill(2) for r in rows)
-    dup_count = len(ids) - len(set(ids))
-    return {
-        "stage": "step1_semantic",
-        "file": str(labels_path),
-        "count": len(rows),
-        "unique_obj_ids": len(set(ids)),
-        "duplicate_obj_id_rows": dup_count,
-        "target_shard": shard,
-        "by_shard": dict(shard_counter),
-    }
+    return _diagnose_step1(labels_path, shard)
 
 
 def diagnose_step2(specs_path: Path) -> dict:
-    rows = list(_iter_jsonl(specs_path))
-    edit_ids = [r.get("edit_id") for r in rows if r.get("edit_id")]
-    type_counter = Counter(r.get("edit_type", "unknown") for r in rows)
-    return {
-        "stage": "step2_planning",
-        "file": str(specs_path),
-        "count": len(rows),
-        "unique_edit_ids": len(set(edit_ids)),
-        "duplicate_edit_id_rows": len(edit_ids) - len(set(edit_ids)),
-        "by_edit_type": dict(type_counter),
-    }
+    return _diagnose_step2(specs_path)
 
 
 def diagnose_step3(manifest_path: Path) -> dict:
-    rows = list(_iter_jsonl(manifest_path))
-    status_counter = Counter(r.get("status", "unknown") for r in rows)
-    return {
-        "stage": "step3_2d_edit",
-        "file": str(manifest_path),
-        "count": len(rows),
-        "status": dict(status_counter),
-    }
+    return _diagnose_step3(manifest_path)
 
 
 def diagnose_step4(results_path: Path, expected_edit_ids: set[str] | None = None) -> dict:
-    rows = list(_iter_jsonl(results_path))
-    status_counter = Counter(r.get("status", "unknown") for r in rows)
-    type_counter = Counter(r.get("edit_type", "unknown") for r in rows)
-    fail_reason_counter = Counter(
-        (r.get("reason") or "unknown")[:120]
-        for r in rows
-        if r.get("status") != "success"
-    )
-    result_ids = {r.get("edit_id") for r in rows if r.get("edit_id")}
-    missing = []
-    if expected_edit_ids:
-        missing = sorted([eid for eid in expected_edit_ids if eid not in result_ids])
-    return {
-        "stage": "step4_3d_edit",
-        "file": str(results_path),
-        "count": len(rows),
-        "status": dict(status_counter),
-        "by_edit_type": dict(type_counter),
-        "top_fail_reasons": fail_reason_counter.most_common(20),
-        "expected_edit_ids": len(expected_edit_ids or []),
-        "missing_edit_ids_count": len(missing),
-        "missing_edit_ids_examples": missing[:50],
-    }
+    return _diagnose_step4(results_path, expected_edit_ids=expected_edit_ids)
 
 
 def diagnose_step5(scores_path: Path) -> dict:
-    rows = list(_iter_jsonl(scores_path))
-    tier_counter = Counter(r.get("quality_tier", "unknown") for r in rows)
-    return {
-        "stage": "step5_quality",
-        "file": str(scores_path),
-        "count": len(rows),
-        "by_tier": dict(tier_counter),
-    }
+    return _diagnose_step5(scores_path)
 
 
 def diagnose_step6(export_path: Path) -> dict:
-    rows = list(_iter_jsonl(export_path))
-    type_counter = Counter(r.get("edit_type", "unknown") for r in rows)
-    return {
-        "stage": "step6_export",
-        "file": str(export_path),
-        "count": len(rows),
-        "by_edit_type": dict(type_counter),
-    }
+    return _diagnose_step6(export_path)
 
 
 # =========================================================================
@@ -1546,13 +993,10 @@ def main():
 
     logger = setup_logging(cfg, "pipeline")
     run_token = _run_token(args.tag, target_shard)
-    token_suffix = f"_{run_token}" if run_token else ""
     report_dir = _pipeline_report_dir(cfg, target_shard)
     logger.info("Run token: %s (shard=%s)", run_token, target_shard or "N/A")
     logger.info("Diagnostics: %s", report_dir)
-    stage_diagnostics = {}
 
-    steps = set(args.steps) if args.steps else {1, 2, 3, 4, 5, 6}
     if args.max_parallel and args.workers == 4:
         args.workers = max(8, (os.cpu_count() or 8))
     if args.max_parallel and (args.step1_workers is None):
@@ -1563,191 +1007,75 @@ def main():
         )
 
     dataset = create_dataset(cfg)
-    logger.info(f"Dataset: {len(dataset)} objects")
+    logger.info("Dataset: %d objects", len(dataset))
 
-    # ---- Resolve paths ----
-    suffix = args.suffix
-    labels_path = (Path(cfg["phase0"]["cache_dir"])
-                   / f"semantic_labels{token_suffix}.jsonl")
-    specs_path = (Path(cfg["phase1"]["cache_dir"])
-                  / f"edit_specs{suffix}{token_suffix}.jsonl")
+    ctx = build_runtime_context(
+        args,
+        cfg,
+        target_shard=target_shard,
+        run_token=run_token,
+        report_dir=report_dir,
+    )
 
-    # ---- Step 1: Semantic ----
-    if 1 in steps:
-        step1_obj_ids = _load_generic_ids_file(args.step1_obj_ids_file)
-        step1_urls = _parse_csv_or_space_list(args.step1_vlm_urls)
-        if not step1_urls:
-            cfg_urls = cfg.get("phase0", {}).get("vlm_base_urls", [])
-            if isinstance(cfg_urls, list):
-                step1_urls = [str(u).strip() for u in cfg_urls if str(u).strip()]
-        step1_gpus = _parse_csv_or_space_list(args.step1_gpus)
+    if args.dry_run:
+        estimate = {
+            "dry_run": True,
+            "run_token": run_token,
+            "shard": target_shard,
+            "steps_requested": sorted(ctx["steps"]),
+            "cost_table": COST,
+            "paths": {
+                "labels": str(ctx["labels_path"]),
+                "specs": str(ctx["specs_path"]),
+            },
+        }
+        _write_stage_diag(report_dir, "pipeline_summary", estimate)
+        logger.info("Dry run only; no processing steps executed.")
+        return
 
-        if len(step1_urls) > 1 and not step1_obj_ids:
-            labels_path = run_step_semantic_multi_gpu(
-                cfg, dataset, logger,
-                vlm_urls=step1_urls,
-                gpus=step1_gpus if step1_gpus else None,
-                tag=run_token, limit=args.limit,
-                force=args.force, debug=args.debug,
-                step1_workers=args.step1_workers,
-                config_path=args.config,
-            )
-        else:
-            labels_path = run_step_semantic(
-                cfg, dataset, logger, limit=args.limit,
-                force=args.force, tag=run_token, debug=args.debug,
-                object_ids=step1_obj_ids or None,
-                labels_name=args.step1_labels_name,
-            )
-        stage_diagnostics["step1"] = diagnose_step1(labels_path, target_shard)
-        _write_stage_diag(report_dir, "step1_semantic", stage_diagnostics["step1"])
-        _sync_manifest_link(
-            cfg, target_shard, "phase0", "semantic_labels.jsonl", labels_path
-        )
-
-    if not labels_path.exists():
-        logger.error(f"Labels not found: {labels_path}")
-        logger.error("Run step 1 first, or provide cached labels")
-        sys.exit(1)
-
-    # ---- Step 2: Planning ----
-    if 2 in steps:
-        specs_path = run_step_planning(cfg, labels_path, logger,
-                                       suffix=f"{suffix}{token_suffix}")
-        stage_diagnostics["step2"] = diagnose_step2(specs_path)
-        _write_stage_diag(report_dir, "step2_planning", stage_diagnostics["step2"])
-        _sync_manifest_link(
-            cfg, target_shard, "phase1", "edit_specs.jsonl", specs_path
-        )
-
-    needs_specs = bool({2, 3, 4, 6} & steps)
-    if needs_specs and not specs_path.exists():
-        logger.error(f"Specs not found: {specs_path}")
-        logger.error("Run step 2 first, or provide cached specs")
-        sys.exit(1)
-
-    # ---- Step 3: 2D Edit ----
-    edit_2d_dir = None
-    if 3 in steps:
-        image_edit_urls = _parse_csv_or_space_list(args.image_edit_urls)
-        edit_2d_dir = run_step_2d_edit(
-            cfg, specs_path, dataset, logger,
-            tag=run_token, workers=args.workers, limit=args.limit,
-            edit_ids=set(args.edit_ids) if args.edit_ids else None,
-            edit_server_urls=image_edit_urls,
-            auto_max_parallel=args.max_parallel)
-        if edit_2d_dir:
-            manifest = Path(edit_2d_dir) / "manifest.jsonl"
-            stage_diagnostics["step3"] = diagnose_step3(manifest)
-            _write_stage_diag(report_dir, "step3_2d_edit", stage_diagnostics["step3"])
-            _sync_manifest_link(
-                cfg, target_shard, "phase2_5", "2d_manifest.jsonl", manifest
-            )
-
-    # ---- Step 4: 3D Edit ----
-    edit_subdir = args.edit_dir
-    if not edit_subdir and run_token:
-        edit_subdir = f"2d_edits_{run_token}"
-    elif not edit_subdir:
-        edit_subdir = "2d_edits"
-
-    results_path = None
-    if 4 in steps:
-        file_edit_ids = _load_edit_ids_file(args.edit_ids_file)
-        cli_edit_ids = list(args.edit_ids) if args.edit_ids else []
-        merged_edit_ids = cli_edit_ids + file_edit_ids
-        final_edit_ids = merged_edit_ids if merged_edit_ids else None
-
-        gpu_list = _parse_csv_or_space_list(args.gpus)
-        if len(gpu_list) > 1:
-            results_path = run_step_3d_edit_multi_gpu(
-                cfg, specs_path, logger,
-                gpus=gpu_list,
-                tag=run_token, seed=args.seed, limit=args.limit,
-                use_2d=args.use_2d, edit_ids=final_edit_ids,
-                edit_dir=edit_subdir, debug=args.debug,
-                cache_only_2d=args.cache_only_2d,
-                config_path=args.config,
-            )
-        else:
-            results_path = run_step_3d_edit(
-                cfg, specs_path, dataset, logger,
-                tag=run_token, seed=args.seed, limit=args.limit,
-                use_2d=args.use_2d, edit_ids=final_edit_ids,
-                edit_dir=edit_subdir, debug=args.debug,
-                cache_only_2d=args.cache_only_2d,
-                results_name=args.results_name)
-        if results_path and Path(results_path).exists():
-            expected_ids = {
-                r.get("edit_id") for r in _iter_jsonl(specs_path)
-                if r.get("edit_id")
-            }
-            stage_diagnostics["step4"] = diagnose_step4(
-                Path(results_path), expected_edit_ids=expected_ids
-            )
-            _write_stage_diag(report_dir, "step4_3d_edit", stage_diagnostics["step4"])
-            _sync_manifest_link(
-                cfg, target_shard, "phase2_5", "edit_results.jsonl", Path(results_path)
-            )
-
-    if results_path is None:
-        p25_cfg = cfg.get("phase2_5", {})
-        results_path = (Path(p25_cfg["cache_dir"])
-                        / f"edit_results{token_suffix}.jsonl")
-
-    # ---- Step 5: Quality ----
-    scores_path = None
-    if 5 in steps and results_path and Path(results_path).exists():
-        scores_path = run_step_quality(
-            cfg, results_path, logger, tag=run_token, limit=args.limit)
-        if scores_path and Path(scores_path).exists():
-            stage_diagnostics["step5"] = diagnose_step5(Path(scores_path))
-            _write_stage_diag(report_dir, "step5_quality", stage_diagnostics["step5"])
-            _sync_manifest_link(
-                cfg, target_shard, "phase3", "vlm_scores.jsonl", Path(scores_path)
-            )
-
-    if scores_path is None and run_token:
-        p25_cfg = cfg.get("phase2_5", {})
-        cand = Path(p25_cfg["cache_dir"]) / f"phase3_{run_token}" / "vlm_scores.jsonl"
-        if cand.is_file():
-            scores_path = str(cand)
-            logger.info(f"Using existing quality scores: {scores_path}")
-            stage_diagnostics["step5"] = diagnose_step5(cand)
-            _write_stage_diag(report_dir, "step5_quality", stage_diagnostics["step5"])
-            _sync_manifest_link(
-                cfg, target_shard, "phase3", "vlm_scores.jsonl", cand
-            )
-
-    # ---- Step 6: Export ----
-    export_path = None
-    if 6 in steps:
-        export_path = run_step_export(cfg, specs_path, scores_path, logger, tag=run_token)
-        if export_path and Path(export_path).exists():
-            stage_diagnostics["step6"] = diagnose_step6(Path(export_path))
-            _write_stage_diag(report_dir, "step6_export", stage_diagnostics["step6"])
-            _sync_manifest_link(
-                cfg, target_shard, "phase4", "edit_pairs.jsonl", Path(export_path)
-            )
-
-    summary = {
+    callbacks = {
         "run_token": run_token,
-        "shard": target_shard,
-        "steps_requested": sorted(steps),
-        "paths": {
-            "labels": str(labels_path),
-            "specs": str(specs_path),
-            "results": str(results_path) if results_path else None,
-            "scores": scores_path,
-            "export": str(export_path) if export_path else None,
-        },
-        "stages_with_diagnostics": sorted(stage_diagnostics.keys()),
+        "parse_list": _parse_csv_or_space_list,
+        "load_generic_ids_file": _load_generic_ids_file,
+        "load_edit_ids_file": _load_edit_ids_file,
+        "iter_jsonl": _iter_jsonl,
+        "write_stage_diag": _write_stage_diag,
+        "sync_manifest_link": _sync_manifest_link,
+        "diagnose_step1": diagnose_step1,
+        "diagnose_step2": diagnose_step2,
+        "diagnose_step3": diagnose_step3,
+        "diagnose_step4": diagnose_step4,
+        "diagnose_step5": diagnose_step5,
+        "diagnose_step6": diagnose_step6,
+        "run_step_semantic": run_step_semantic,
+        "run_step_semantic_multi_gpu": run_step_semantic_multi_gpu,
+        "run_step_planning": run_step_planning,
+        "run_step_2d_edit": run_step_2d_edit,
+        "run_step_3d_edit": run_step_3d_edit,
+        "run_step_3d_edit_multi_gpu": run_step_3d_edit_multi_gpu,
+        "run_step_quality": run_step_quality,
+        "run_step_export": run_step_export,
     }
+    try:
+        ctx = run_selected_steps(
+            ctx,
+            args=args,
+            cfg=cfg,
+            logger=logger,
+            dataset=dataset,
+            callbacks=callbacks,
+        )
+    except FileNotFoundError as exc:
+        logger.error(str(exc))
+        logger.error("Run prerequisite steps first, or provide cached artifacts")
+        sys.exit(1)
+
+    summary = finalize_summary(ctx, run_token=run_token)
     _write_stage_diag(report_dir, "pipeline_summary", summary)
 
     logger.info("\n" + "=" * 60)
     logger.info("Pipeline complete!")
-    logger.info("Shard-centric diagnostics → %s", report_dir)
+    logger.info("Shard-centric diagnostics -> %s", report_dir)
     logger.info("=" * 60)
 
 

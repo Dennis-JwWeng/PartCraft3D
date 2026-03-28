@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Phase 2D: Batch 2D image editing for modification specs.
+"""Standalone 2D edit utility.
+
+This script is soft-archived for debugging/offline generation. For the main
+pipeline path, prefer `scripts/run_pipeline.py --steps 3`.
+
+Phase 2D: Batch 2D image editing for TRELLIS-bound edit specs.
 
 Pre-generates edited reference images for Phase 2.5 TRELLIS,
 so GPU-heavy 3D editing doesn't block on API calls.
 
-For each modification spec:
+For each TRELLIS-bound spec (modification/scale/material/global):
   1. Select best view showing the target part
   2. Composite RGBA → RGB on white background
   3. Call VLM image editor (e.g. Gemini) with edit prompt
@@ -356,7 +361,7 @@ def process_one(spec: EditSpec, dataset, client, output_dir: Path,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Phase 2D: Batch 2D image editing for modification specs")
+        description="Phase 2D: Batch 2D image editing for TRELLIS-bound specs")
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--workers", type=int, default=4,
@@ -372,7 +377,7 @@ def main():
                              "(default: '2d_edits'). Use e.g. '2d_edits_action' "
                              "to avoid mixing with default-style edits")
     parser.add_argument("--type", type=str, default=None,
-                        choices=["modification", "deletion", "global"],
+                        choices=["modification", "scale", "material", "global"],
                         help="Filter by edit type (default: modification)")
     parser.add_argument("--tag", type=str, default=None,
                         help="Run tag. Output goes to 2d_edits_{tag} "
