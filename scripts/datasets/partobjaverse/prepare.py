@@ -28,6 +28,10 @@ from pathlib import Path
 
 import numpy as np
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(_PROJECT_ROOT))
+from partcraft.utils.config import load_config
+
 # ---------------------------------------------------------------------------
 # Lazy imports (so --help works without GPU)
 # ---------------------------------------------------------------------------
@@ -64,8 +68,8 @@ DATASET_REPO = "yhyang-myron/PartObjaverse-Tiny"
 NUM_VIEWS = 42
 RENDER_RES = 518  # match HY3D-Part
 SHARD = "00"
-BLENDER_PATH = "/home/artgen/software/blender-3.3.1-linux-x64/blender"
-BLENDER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "blender_render.py")
+BLENDER_PATH = "blender"
+BLENDER_SCRIPT = str(_PROJECT_ROOT / "scripts" / "blender_render.py")
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +274,10 @@ def render_views_from_scene(
 
     Falls back to pyrender if Blender is unavailable.
     """
-    if glb_path and os.path.exists(BLENDER_PATH):
+    blender_ready = (
+        os.path.isabs(BLENDER_PATH) and os.path.exists(BLENDER_PATH)
+    ) or (not os.path.isabs(BLENDER_PATH) and shutil.which(BLENDER_PATH))
+    if glb_path and blender_ready:
         return _render_blender(glb_path, poses, fov, resolution)
     return _render_pyrender(scene_tm, scale, centroid, poses, fov, resolution, ssaa)
 
@@ -998,9 +1005,13 @@ def generate_phase0_cache(
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    global BLENDER_PATH, BLENDER_SCRIPT
     parser = argparse.ArgumentParser(description="Prepare PartObjaverse-Tiny dataset")
-    parser.add_argument("--output", default="data/partobjaverse",
-                        help="Output directory")
+    parser.add_argument("--config", type=str,
+                        default="configs/prerender_partobjaverse.yaml",
+                        help="Prerender config path")
+    parser.add_argument("--output", default=None,
+                        help="Output directory (default: paths.dataset_root from config)")
     parser.add_argument("--limit", type=int, default=0,
                         help="Process only first N objects (0=all)")
     parser.add_argument("--workers", type=int, default=1,
@@ -1009,6 +1020,10 @@ def main():
                         help="Skip download if data already cached")
     parser.add_argument("--local-source", default="",
                         help="Path to local source dir (with objaverse_mapping.json, mesh.zip, etc.)")
+    parser.add_argument("--blender-path", default=None,
+                        help="Override tools.blender_path for this run")
+    parser.add_argument("--blender-script", default=None,
+                        help="Override tools.blender_script for this run")
     parser.add_argument("--no-render", action="store_true",
                         help="Skip 42-view rendering. Only produce mesh NPZ "
                              "(full.ply + part_*.ply) and minimal image NPZ "
@@ -1016,9 +1031,31 @@ def main():
                              "rendering separately. Much faster (~10x).")
     args = parser.parse_args()
 
+    cfg = load_config(
+        args.config,
+        for_prerender=True,
+        prerender_mode="partobjaverse_prepare",
+    )
+    paths = cfg["paths"]
+    tools = cfg["tools"]
+    BLENDER_PATH = args.blender_path or tools["blender_path"]
+    BLENDER_SCRIPT = args.blender_script or tools["blender_script"]
+    if not args.no_render:
+        if not Path(BLENDER_SCRIPT).exists():
+            raise FileNotFoundError(
+                f"Missing Blender script at tools.blender_script: {BLENDER_SCRIPT}"
+            )
+        blender_exists = (
+            os.path.isabs(BLENDER_PATH) and os.path.exists(BLENDER_PATH)
+        ) or (not os.path.isabs(BLENDER_PATH) and shutil.which(BLENDER_PATH))
+        if not blender_exists:
+            raise FileNotFoundError(
+                f"Blender executable not found from tools.blender_path: {BLENDER_PATH}"
+            )
+
     _lazy_imports(no_render=args.no_render)
 
-    output_dir = Path(args.output)
+    output_dir = Path(args.output or paths["dataset_root"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Step 1: Get PartObjaverse-Tiny data ----
@@ -1027,6 +1064,11 @@ def main():
     print("=" * 60)
 
     local_src = Path(args.local_source) if args.local_source else None
+    if local_src is None:
+        source_dir = Path(paths["dataset_root"]) / "source"
+        req = ("mesh.zip", "semantic.json", "semantic_gt.zip", "instance_gt.zip")
+        if source_dir.is_dir() and all((source_dir / name).exists() for name in req):
+            local_src = source_dir
     if local_src and local_src.exists():
         # Use pre-organized local source directory
         pot_files = {

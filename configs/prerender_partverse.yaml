@@ -1,0 +1,36 @@
+# Portable prerender config (PartVerse).
+# Cross-machine migration: update this file only; avoid editing script paths.
+
+ckpt_root: "checkpoints"
+
+data:
+  # Dataset root; all prerender paths below can be derived from this.
+  data_dir: "data/partverse"
+  derive_dataset_subpaths: true
+
+  # Used by shared logging/cache path normalization.
+  output_dir: "outputs/partverse"
+  shards: ["00"]
+  output_by_shard: false
+
+paths:
+  # Core dataset tree
+  dataset_root: "data/partverse"
+  source_glb_dir: "data/partverse/source/normalized_glbs"
+  captions_json: "data/partverse/source/text_captions.json"
+
+  # Prerender artifacts
+  img_enc_dir: "data/partverse/img_Enc"
+  slat_dir: "data/partverse/slat"
+  images_npz_dir: "data/partverse/images"
+  mesh_npz_dir: "data/partverse/mesh"
+  cache_root: "data/partverse/cache"
+
+tools:
+  # Keep executable names portable; rely on PATH by default.
+  blender_path: "blender"
+  blender_script: "scripts/blender_render.py"
+
+logging:
+  level: "INFO"
+  log_dir: "logs/prerender_partverse"

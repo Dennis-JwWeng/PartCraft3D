@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 import yaml
 from pathlib import Path
 
@@ -50,6 +51,155 @@ def _apply_data_roots_and_layout(cfg: dict) -> None:
         v = data.get(key, None)
         if v is None or (isinstance(v, str) and not v.strip()):
             data[key] = str(base / sub)
+
+
+def _resolve_path(raw: str | Path | None, *, base: Path) -> str | None:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    p = Path(s).expanduser()
+    if not p.is_absolute():
+        p = (base / p).resolve()
+    else:
+        p = p.resolve()
+    return str(p)
+
+
+def _resolve_tool_executable(raw: str | None, *, base: Path) -> str | None:
+    """Resolve tool executable path while preserving command names like ``blender``."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    if "/" not in s and "\\" not in s:
+        return s
+    return _resolve_path(s, base=base)
+
+
+def _apply_prerender_paths(cfg: dict) -> None:
+    """Normalize prerender path contract under cfg['paths'] and sync cfg['data']."""
+    data = cfg.setdefault("data", {})
+    paths = cfg.setdefault("paths", {})
+
+    if not paths.get("dataset_root") and data.get("data_dir"):
+        paths["dataset_root"] = data.get("data_dir")
+
+    deprecated_env = os.environ.get("PARTVERSE_DATA_ROOT", "").strip()
+    if deprecated_env:
+        warnings.warn(
+            "PARTVERSE_DATA_ROOT is deprecated; prefer config paths.dataset_root.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        paths["dataset_root"] = deprecated_env
+    compat_root = os.environ.get("PARTCRAFT_DATASET_ROOT", "").strip()
+    if compat_root:
+        warnings.warn(
+            "PARTCRAFT_DATASET_ROOT is deprecated for prerender; "
+            "prefer config paths.dataset_root.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        paths["dataset_root"] = compat_root
+
+    dataset_root = _resolve_path(paths.get("dataset_root"), base=_PROJECT_ROOT)
+    if dataset_root:
+        paths["dataset_root"] = dataset_root
+        data["data_dir"] = dataset_root
+
+    base = Path(dataset_root) if dataset_root else _PROJECT_ROOT
+
+    def _default(key: str, rel: str):
+        if not paths.get(key):
+            paths[key] = str(base / rel)
+
+    _default("source_glb_dir", "source/normalized_glbs")
+    _default("source_mesh_zip", "source/mesh.zip")
+    _default("captions_json", "source/text_captions.json")
+    _default("img_enc_dir", "img_Enc")
+    _default("slat_dir", "slat")
+    _default("images_npz_dir", "images")
+    _default("mesh_npz_dir", "mesh")
+    _default("cache_root", "cache")
+
+    for k in (
+        "source_glb_dir",
+        "source_mesh_zip",
+        "captions_json",
+        "img_enc_dir",
+        "slat_dir",
+        "images_npz_dir",
+        "mesh_npz_dir",
+        "cache_root",
+    ):
+        paths[k] = _resolve_path(paths.get(k), base=base)
+
+    # Keep existing pipeline/data consumers working with the normalized contract.
+    data["img_enc_dir"] = paths["img_enc_dir"]
+    data["slat_dir"] = paths["slat_dir"]
+    data["image_npz_dir"] = paths["images_npz_dir"]
+    data["mesh_npz_dir"] = paths["mesh_npz_dir"]
+
+
+def _apply_tool_paths(cfg: dict) -> None:
+    tools = cfg.setdefault("tools", {})
+    if not tools.get("blender_path"):
+        tools["blender_path"] = "blender"
+    if not tools.get("blender_script"):
+        tools["blender_script"] = str(_PROJECT_ROOT / "scripts" / "blender_render.py")
+
+    env_blender = os.environ.get("BLENDER_PATH", "").strip()
+    if env_blender:
+        warnings.warn(
+            "BLENDER_PATH env override is deprecated; prefer config tools.blender_path.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        tools["blender_path"] = env_blender
+
+    env_blender_script = os.environ.get("BLENDER_SCRIPT", "").strip()
+    if env_blender_script:
+        warnings.warn(
+            "BLENDER_SCRIPT env override is deprecated; prefer config tools.blender_script.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        tools["blender_script"] = env_blender_script
+
+    tools["blender_path"] = _resolve_tool_executable(
+        tools.get("blender_path"),
+        base=_PROJECT_ROOT,
+    )
+    tools["blender_script"] = _resolve_path(
+        tools.get("blender_script"),
+        base=_PROJECT_ROOT,
+    )
+
+
+def _validate_prerender_config(cfg: dict, *, mode: str | None) -> None:
+    paths = cfg.get("paths", {})
+    tools = cfg.get("tools", {})
+    missing = []
+    for key in ("dataset_root", "img_enc_dir", "slat_dir", "images_npz_dir", "mesh_npz_dir"):
+        if not paths.get(key):
+            missing.append(f"paths.{key}")
+    for key in ("blender_path", "blender_script"):
+        if not tools.get(key):
+            missing.append(f"tools.{key}")
+    if mode == "partverse" and not paths.get("source_glb_dir"):
+        missing.append("paths.source_glb_dir")
+    if mode in {"partobjaverse", "partobjaverse_prepare"} and not paths.get("source_mesh_zip"):
+        missing.append("paths.source_mesh_zip")
+    if missing:
+        msg = ", ".join(missing)
+        raise ValueError(
+            "Missing required prerender config keys: "
+            f"{msg}. See configs/prerender_partverse.yaml "
+            "or configs/prerender_partobjaverse.yaml."
+        )
 
 
 def _resolve_trellis_ckpt_path(value: str, ckpt_root: Path) -> str:
@@ -118,7 +268,12 @@ def _apply_ckpt_root(cfg: dict) -> None:
             p0[key] = str((root / v).resolve())
 
 
-def load_config(config_path: str | Path = None) -> dict:
+def load_config(
+    config_path: str | Path = None,
+    *,
+    for_prerender: bool = False,
+    prerender_mode: str | None = None,
+) -> dict:
     """Load YAML config, falling back to default.yaml."""
     if config_path is None:
         config_path = Path(__file__).parents[2] / "configs" / "default.yaml"
@@ -130,6 +285,10 @@ def load_config(config_path: str | Path = None) -> dict:
 
     _apply_data_roots_and_layout(cfg)
     _apply_ckpt_root(cfg)
+    if for_prerender:
+        _apply_prerender_paths(cfg)
+        _apply_tool_paths(cfg)
+        _validate_prerender_config(cfg, mode=prerender_mode)
 
     # Resolve environment variables for API keys
     phase0 = cfg.get("phase0", {})
@@ -146,6 +305,7 @@ def load_config(config_path: str | Path = None) -> dict:
         if cache and not os.path.isabs(cache):
             cfg[phase_key]["cache_dir"] = os.path.join(output_dir, cache)
 
+    cfg.setdefault("logging", {})
     log_dir = cfg.get("logging", {}).get("log_dir", "logs")
     if not os.path.isabs(log_dir):
         cfg["logging"]["log_dir"] = os.path.join(output_dir, log_dir)

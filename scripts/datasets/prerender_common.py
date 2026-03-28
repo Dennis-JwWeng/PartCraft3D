@@ -14,6 +14,7 @@ import logging
 import os
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 from typing import Callable
 
@@ -43,9 +44,31 @@ def get_available_gpus() -> list[int]:
 # Phase A: Blender render + Open3D voxelize
 # ---------------------------------------------------------------------------
 
-def _set_dataset_root_env(img_enc_dir: Path) -> str:
-    """Set PARTCRAFT_DATASET_ROOT for encode_asset (parent of img_Enc/)."""
-    root = str(img_enc_dir.parent.resolve())
+def _set_dataset_root_env(
+    img_enc_dir: Path,
+    dataset_root: str | Path | None = None,
+) -> str:
+    """Set PARTCRAFT_DATASET_ROOT for encode_asset.
+
+    Compatibility fallback order:
+      1) explicit ``dataset_root`` argument
+      2) PARTCRAFT_DATASET_ROOT env (deprecated)
+      3) img_enc_dir.parent
+    """
+    if dataset_root is not None and str(dataset_root).strip():
+        root = str(Path(str(dataset_root)).expanduser().resolve())
+    else:
+        compat = os.environ.get("PARTCRAFT_DATASET_ROOT", "").strip()
+        if compat:
+            warnings.warn(
+                "PARTCRAFT_DATASET_ROOT implicit usage is deprecated; pass "
+                "dataset_root explicitly from config.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            root = str(Path(compat).expanduser().resolve())
+        else:
+            root = str(img_enc_dir.parent.resolve())
     os.environ["PARTCRAFT_DATASET_ROOT"] = root
     return root
 
@@ -59,6 +82,7 @@ def run_render(
     script_path: Path,
     logger: logging.Logger,
     extra_worker_args: list[str] | None = None,
+    dataset_root: str | Path | None = None,
 ):
     """Render pending objects. Dispatches to parallel or sequential mode.
 
@@ -83,10 +107,10 @@ def run_render(
     if not pending:
         return
 
-    dataset_root = _set_dataset_root_env(img_enc_dir)
+    resolved_dataset_root = _set_dataset_root_env(img_enc_dir, dataset_root=dataset_root)
     if render_workers > 1:
         _render_parallel(pending, script_path, render_workers, force, logger,
-                         extra_worker_args or [], dataset_root)
+                         extra_worker_args or [], resolved_dataset_root)
     else:
         gpus = get_available_gpus()
         gpu_id = gpus[0] if gpus else None
@@ -242,6 +266,7 @@ def run_encode(
     third_party_dir: Path,
     force: bool,
     logger: logging.Logger,
+    dataset_root: str | Path | None = None,
 ):
     """Encode pending objects into SLAT features. Requires GPU.
 
@@ -281,7 +306,7 @@ def run_encode(
     if not pending:
         return
 
-    _set_dataset_root_env(img_enc_dir)
+    _set_dataset_root_env(img_enc_dir, dataset_root=dataset_root)
     sys.path.insert(0, str(third_party_dir))
     try:
         from encode_asset.dinov2_hub import (
@@ -343,6 +368,7 @@ def launch_multi_gpu_encode(
     force: bool,
     logger: logging.Logger,
     extra_args: list[str] | None = None,
+    dataset_root: str | Path | None = None,
 ):
     """Launch one encode subprocess per GPU, each processing a shard.
 
@@ -397,6 +423,10 @@ def launch_multi_gpu_encode(
             cmd.append("--force")
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = physical_gpu
+        if dataset_root is not None and str(dataset_root).strip():
+            env["PARTCRAFT_DATASET_ROOT"] = str(
+                Path(str(dataset_root)).expanduser().resolve()
+            )
         logger.info(f"[GPU {physical_gpu}] {len(shard)} objects")
         processes.append((physical_gpu, subprocess.Popen(cmd, env=env)))
 

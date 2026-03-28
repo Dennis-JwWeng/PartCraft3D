@@ -45,13 +45,43 @@
 
 - `scripts/datasets/prerender_common.py`
   - GPU 发现、并行渲染调度、SLAT 编码、shard 切分与汇总。
+  - `run_render/run_encode/launch_multi_gpu_encode` 支持显式 `dataset_root`，不再强依赖隐式环境变量。
   - 被 `partverse/prerender.py` 与 `partobjaverse/prerender.py` 复用。
+- `partcraft/utils/config.py`
+  - 预渲染模式下可启用 `load_config(..., for_prerender=True, prerender_mode=...)`。
+  - 统一归一化 `paths.*`、`tools.*`，并将 `paths.images_npz_dir/mesh_npz_dir/slat_dir/img_enc_dir` 同步到 `data.*` 供 pipeline 侧复用。
+
+## 预渲染配置驱动约定（新增）
+
+预渲染链路采用“配置优先，机器无关”的路径契约。建议直接使用模板：
+
+- `configs/prerender_partverse.yaml`
+- `configs/prerender_partobjaverse.yaml`
+
+关键字段：
+
+- `paths.dataset_root`
+- `paths.source_glb_dir`（PartVerse） / `paths.source_mesh_zip`（PartObjaverse）
+- `paths.captions_json`（可选，PartVerse pack 使用）
+- `paths.img_enc_dir`
+- `paths.slat_dir`
+- `paths.images_npz_dir`
+- `paths.mesh_npz_dir`
+- `tools.blender_path`
+- `tools.blender_script`
+
+行为规则：
+
+- 预渲染脚本从 `--config` 读取路径，路径统一在配置层绝对化。
+- 相对路径按项目根解析；迁移机器时优先仅改配置文件。
+- 缺失关键键时 fail-fast 并指向对应配置项。
+- 旧环境变量覆盖（`PARTVERSE_DATA_ROOT`、`PARTCRAFT_DATASET_ROOT`、`BLENDER_PATH`、`BLENDER_SCRIPT`）仅保留兼容并会给出 deprecation 提示。
 
 ### PartVerse 预处理链
 
 - `scripts/datasets/partverse/prerender.py`
   - 主入口：`render -> encode -> pack`（支持 `--render-only/--pack-only/--encode-only`）。
-  - 输入：`source/normalized_glbs` + `source/text_captions.json` + `source/anno_infos/*`。
+  - 默认从 `configs/prerender_partverse.yaml` 读取路径；支持 `--config` 指定。
   - 产出：`img_Enc/`、`slat/{shard}/`、`images/{shard}/`、`mesh/{shard}/`。
 - `scripts/datasets/partverse/pack_npz.py`
   - 将 `img_Enc` 和标注打包为 pipeline 输入 NPZ（含 `split_mesh.json`、`transforms.json`）。
@@ -68,9 +98,10 @@
 
 - `scripts/datasets/partobjaverse/prepare.py`
   - 数据准备入口：下载/解析 tiny 数据，转换到 `images/mesh` NPZ；可选 `--no-render`。
+  - Blender 路径改为配置驱动：`tools.blender_path` / `tools.blender_script`（支持 CLI 覆盖）。
   - 可生成 `cache/phase0/semantic_labels.jsonl`。
 - `scripts/datasets/partobjaverse/prerender.py`
-  - 150 视角渲染 + SLAT 编码入口。
+  - 150 视角渲染 + SLAT 编码入口，使用 `paths.*` 统一读写目录。
 - `scripts/datasets/partobjaverse/pack_npz.py`
   - 将 prerender 产物整理成 pipeline 输入 NPZ。
 - `scripts/datasets/partobjaverse/build_dataset.py`

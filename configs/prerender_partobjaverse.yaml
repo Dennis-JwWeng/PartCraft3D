@@ -1,0 +1,31 @@
+# Portable prerender config (PartObjaverse).
+# Cross-machine migration: update this file only; scripts stay unchanged.
+
+ckpt_root: "checkpoints"
+
+data:
+  data_dir: "data/partobjaverse_tiny"
+  derive_dataset_subpaths: true
+  output_dir: "outputs/partobjaverse_tiny"
+  shards: ["00"]
+  output_by_shard: false
+
+paths:
+  dataset_root: "data/partobjaverse_tiny"
+  source_mesh_zip: "data/partobjaverse_tiny/source/mesh.zip"
+  source_glb_dir: "data/partobjaverse_tiny/source/normalized_glbs"
+  captions_json: "data/partobjaverse_tiny/source/text_captions.json"
+
+  img_enc_dir: "data/partobjaverse_tiny/img_Enc"
+  slat_dir: "data/partobjaverse_tiny/slat"
+  images_npz_dir: "data/partobjaverse_tiny/images"
+  mesh_npz_dir: "data/partobjaverse_tiny/mesh"
+  cache_root: "data/partobjaverse_tiny/cache"
+
+tools:
+  blender_path: "blender"
+  blender_script: "scripts/blender_render.py"
+
+logging:
+  level: "INFO"
+  log_dir: "logs/prerender_partobjaverse"

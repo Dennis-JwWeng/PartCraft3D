@@ -48,29 +48,7 @@ sys.path.insert(0, str(_THIRD_PARTY))
 
 from partcraft.utils.config import load_config
 from partcraft.utils.logging import setup_logging
-from scripts.datasets.prerender_common import (
-    get_available_gpus,
-    launch_multi_gpu_encode,
-    print_summary,
-    run_encode,
-    run_render,
-)
-
-
-# ---------------------------------------------------------------------------
-# Dataset paths (resolved from config)
-# ---------------------------------------------------------------------------
-
-def _get_data_dir(cfg: dict) -> Path:
-    data_dir = Path(cfg["data"].get("data_dir", "data/partobjaverse_tiny"))
-    if not data_dir.is_absolute():
-        data_dir = _PROJECT_ROOT / data_dir
-    if not data_dir.exists():
-        img_dir = Path(cfg["data"]["image_npz_dir"])
-        if not img_dir.is_absolute():
-            img_dir = _PROJECT_ROOT / img_dir
-        data_dir = img_dir.parent
-    return data_dir
+from scripts.datasets.prerender_common import launch_multi_gpu_encode, print_summary, run_encode, run_render
 
 
 # ---------------------------------------------------------------------------
@@ -99,9 +77,7 @@ def _make_glb_getter(mesh_zip: Path, tmp_dir: str):
 # ---------------------------------------------------------------------------
 
 def get_all_obj_ids(cfg: dict) -> list[str]:
-    mesh_dir = Path(cfg["data"]["mesh_npz_dir"])
-    if not mesh_dir.is_absolute():
-        mesh_dir = _PROJECT_ROOT / mesh_dir
+    mesh_dir = Path(cfg["paths"]["mesh_npz_dir"])
     shards = cfg["data"].get("shards", ["00"])
     obj_ids = []
     for shard in shards:
@@ -120,7 +96,8 @@ def get_all_obj_ids(cfg: dict) -> list[str]:
 def main():
     parser = argparse.ArgumentParser(
         description="Pre-render PartObjaverse-Tiny + encode SLAT")
-    parser.add_argument("--config", type=str, default=None)
+    parser.add_argument("--config", type=str,
+                        default="configs/prerender_partobjaverse.yaml")
     parser.add_argument("--obj-ids", nargs="*", default=None,
                         help="Specific object IDs (default: all)")
     parser.add_argument("--limit", type=int, default=0,
@@ -135,13 +112,13 @@ def main():
                         help="Parallel Blender workers, each on a dedicated GPU")
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, for_prerender=True, prerender_mode="partobjaverse")
     logger = setup_logging(cfg, "prerender_partobjaverse")
-
-    data_dir   = _get_data_dir(cfg)
-    mesh_zip   = data_dir / "source" / "mesh.zip"
-    img_enc_dir = data_dir / "img_Enc"
-    slat_dir   = data_dir / "slat"
+    paths = cfg["paths"]
+    data_dir = Path(paths["dataset_root"])
+    mesh_zip = Path(paths["source_mesh_zip"])
+    img_enc_dir = Path(paths["img_enc_dir"])
+    slat_dir = Path(paths["slat_dir"])
 
     if not mesh_zip.exists():
         logger.error(f"source/mesh.zip not found at {mesh_zip}")
@@ -165,7 +142,8 @@ def main():
     if args.num_gpus > 1 and not args.render_only:
         launch_multi_gpu_encode(obj_ids, slat_dir,
                                 Path(__file__).resolve(),
-                                args.num_gpus, args.force, logger)
+                                args.num_gpus, args.force, logger,
+                                dataset_root=data_dir)
         print_summary(obj_ids, img_enc_dir, slat_dir, logger)
         return
 
@@ -176,11 +154,12 @@ def main():
         if not args.encode_only:
             run_render(obj_ids, glb_getter, img_enc_dir, _THIRD_PARTY,
                        args.force, args.render_workers,
-                       Path(__file__).resolve(), logger)
+                       Path(__file__).resolve(), logger,
+                       dataset_root=data_dir)
 
     if not args.render_only:
         run_encode(obj_ids, img_enc_dir, slat_dir, _THIRD_PARTY,
-                   args.force, logger)
+                   args.force, logger, dataset_root=data_dir)
 
     print_summary(obj_ids, img_enc_dir, slat_dir, logger)
 

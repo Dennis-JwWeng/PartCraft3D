@@ -44,25 +44,19 @@ Usage:
 import argparse
 import json
 import logging
-import sys
-from pathlib import Path
-
 import os
+import sys
+import warnings
+from pathlib import Path
 
 _PROJECT_ROOT  = Path(__file__).resolve().parents[3]
 _THIRD_PARTY   = _PROJECT_ROOT / "third_party"
-_PARTVERSE_DIR = Path(os.environ.get(
-    "PARTVERSE_DATA_ROOT", str(_PROJECT_ROOT / "data" / "partverse")))
-_GLB_DIR       = _PARTVERSE_DIR / "source" / "normalized_glbs"
-_CAPTIONS_PATH = _PARTVERSE_DIR / "source" / "text_captions.json"
-_IMG_ENC_DIR   = _PARTVERSE_DIR / "img_Enc"
-_SLAT_DIR      = _PARTVERSE_DIR / "slat"
-_IMAGES_DIR    = _PARTVERSE_DIR / "images"
-_MESH_DIR      = _PARTVERSE_DIR / "mesh"
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_THIRD_PARTY))
 
+from partcraft.utils.config import load_config
+from partcraft.utils.logging import setup_logging
 from scripts.datasets.prerender_common import (
     launch_multi_gpu_encode,
     print_summary,
@@ -76,24 +70,33 @@ from scripts.datasets.prerender_common import (
 # Object discovery
 # ---------------------------------------------------------------------------
 
-def get_all_obj_ids() -> list[str]:
-    return sorted(p.stem for p in _GLB_DIR.glob("*.glb"))
+def get_all_obj_ids(glb_dir: Path) -> list[str]:
+    return sorted(p.stem for p in glb_dir.glob("*.glb"))
 
 
 # ---------------------------------------------------------------------------
 # GLB access: direct file lookup
 # ---------------------------------------------------------------------------
 
-def _glb_getter(obj_id: str) -> Path:
-    return _GLB_DIR / f"{obj_id}.glb"
+def _glb_getter(glb_dir: Path, obj_id: str) -> Path:
+    return glb_dir / f"{obj_id}.glb"
 
 
 # ---------------------------------------------------------------------------
 # Pack step: render outputs → images/ + mesh/ NPZ, clean up img_Enc PNGs
 # ---------------------------------------------------------------------------
 
-def _run_pack(obj_ids: list[str], shard: str, captions: dict,
-              force: bool, logger: logging.Logger):
+def _run_pack(
+    obj_ids: list[str],
+    shard: str,
+    captions: dict,
+    force: bool,
+    logger: logging.Logger,
+    *,
+    img_enc_dir: Path,
+    images_dir: Path,
+    mesh_dir: Path,
+):
     """Pack rendered img_Enc outputs into images/{shard}/ + mesh/{shard}/ NPZ.
 
     After successful packing, PNGs / transforms.json / mesh.ply are removed
@@ -101,8 +104,8 @@ def _run_pack(obj_ids: list[str], shard: str, captions: dict,
     """
     from scripts.datasets.partverse.pack_npz import _pack_one, PACK_VIEWS
 
-    render_out = _IMAGES_DIR / shard
-    mesh_out   = _MESH_DIR   / shard
+    render_out = images_dir / shard
+    mesh_out   = mesh_dir   / shard
     render_out.mkdir(parents=True, exist_ok=True)
     mesh_out.mkdir(parents=True, exist_ok=True)
 
@@ -116,12 +119,12 @@ def _run_pack(obj_ids: list[str], shard: str, captions: dict,
             skip += 1
             continue
 
-        img_enc_dir = _IMG_ENC_DIR / obj_id
-        if not img_enc_dir.exists():
+        one_img_enc_dir = img_enc_dir / obj_id
+        if not one_img_enc_dir.exists():
             skip += 1
             continue
 
-        result = _pack_one(obj_id, img_enc_dir, render_out, mesh_out, captions,
+        result = _pack_one(obj_id, one_img_enc_dir, render_out, mesh_out, captions,
                            keep_views=PACK_VIEWS)
         if result["status"] == "ok":
             ok += 1
@@ -142,17 +145,13 @@ def _run_pack(obj_ids: list[str], shard: str, captions: dict,
 # ---------------------------------------------------------------------------
 
 def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    logger = logging.getLogger("prerender_partverse")
-
     parser = argparse.ArgumentParser(
         description="Pre-render PartVerse + pack NPZ + encode SLAT")
+    parser.add_argument("--config", type=str,
+                        default="configs/prerender_partverse.yaml",
+                        help="Prerender config path")
     parser.add_argument("--data-root", type=str, default=None,
-                        help="PartVerse data root (overrides PARTVERSE_DATA_ROOT env var)")
+                        help="Deprecated: override paths.dataset_root for this run")
 
     # Object selection (mutually exclusive priority: --obj-ids > --shard > all)
     sel = parser.add_argument_group("object selection")
@@ -187,18 +186,38 @@ def main():
                              "Should not exceed the number of available GPUs.")
     args = parser.parse_args()
 
-    global _PARTVERSE_DIR, _GLB_DIR, _CAPTIONS_PATH, _IMG_ENC_DIR, _SLAT_DIR, _IMAGES_DIR, _MESH_DIR
-    if args.data_root:
-        _PARTVERSE_DIR = Path(args.data_root)
-        _GLB_DIR       = _PARTVERSE_DIR / "source" / "normalized_glbs"
-        _CAPTIONS_PATH = _PARTVERSE_DIR / "source" / "text_captions.json"
-        _IMG_ENC_DIR   = _PARTVERSE_DIR / "img_Enc"
-        _SLAT_DIR      = _PARTVERSE_DIR / "slat"
-        _IMAGES_DIR    = _PARTVERSE_DIR / "images"
-        _MESH_DIR      = _PARTVERSE_DIR / "mesh"
+    cfg = load_config(args.config, for_prerender=True, prerender_mode="partverse")
+    logger = setup_logging(cfg, "prerender_partverse")
 
-    _IMG_ENC_DIR.mkdir(parents=True, exist_ok=True)
-    _SLAT_DIR.mkdir(parents=True, exist_ok=True)
+    if args.data_root:
+        warnings.warn(
+            "--data-root is deprecated; prefer paths.dataset_root in config.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        root = Path(args.data_root).expanduser().resolve()
+        cfg.setdefault("paths", {})["dataset_root"] = str(root)
+        cfg["paths"]["source_glb_dir"] = str(root / "source" / "normalized_glbs")
+        cfg["paths"]["captions_json"] = str(root / "source" / "text_captions.json")
+        cfg["paths"]["img_enc_dir"] = str(root / "img_Enc")
+        cfg["paths"]["slat_dir"] = str(root / "slat")
+        cfg["paths"]["images_npz_dir"] = str(root / "images")
+        cfg["paths"]["mesh_npz_dir"] = str(root / "mesh")
+
+    paths = cfg["paths"]
+    partverse_dir = Path(paths["dataset_root"])
+    glb_dir = Path(paths["source_glb_dir"])
+    captions_path = Path(paths["captions_json"])
+    img_enc_dir = Path(paths["img_enc_dir"])
+    slat_root_dir = Path(paths["slat_dir"])
+    images_dir = Path(paths["images_npz_dir"])
+    mesh_dir = Path(paths["mesh_npz_dir"])
+
+    if not glb_dir.exists():
+        raise FileNotFoundError(f"Missing paths.source_glb_dir: {glb_dir}")
+
+    img_enc_dir.mkdir(parents=True, exist_ok=True)
+    slat_root_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Determine object list and shard ----
     if args.obj_ids:
@@ -206,7 +225,7 @@ def main():
         shard = args.shard if args.shard is not None else "00"
         logger.info(f"Explicit --obj-ids: {len(obj_ids)} objects → shard {shard}")
     else:
-        all_ids = get_all_obj_ids()
+        all_ids = get_all_obj_ids(glb_dir)
         if args.shard is not None:
             obj_ids = select_shard(all_ids, args.shard, args.num_shards)
             shard = args.shard
@@ -233,14 +252,14 @@ def main():
         logger.info(f"--limit: capped to {len(obj_ids)} objects")
 
     # SLAT output goes into a per-shard subdirectory for easy batched compression.
-    slat_shard_dir = _SLAT_DIR / shard
+    slat_shard_dir = slat_root_dir / shard
     slat_shard_dir.mkdir(parents=True, exist_ok=True)
 
     # Migrate any flat legacy files (slat/{obj_id}_*.pt) into the shard subdir.
     _migrated = 0
     for oid in obj_ids:
-        src_f = _SLAT_DIR / f"{oid}_feats.pt"
-        src_c = _SLAT_DIR / f"{oid}_coords.pt"
+        src_f = slat_root_dir / f"{oid}_feats.pt"
+        src_c = slat_root_dir / f"{oid}_coords.pt"
         if src_f.exists():
             src_f.rename(slat_shard_dir / f"{oid}_feats.pt")
             src_c.rename(slat_shard_dir / f"{oid}_coords.pt")
@@ -248,13 +267,14 @@ def main():
     if _migrated:
         logger.info(f"Migrated {_migrated} flat SLAT files → slat/{shard}/")
 
-    logger.info(f"PartVerse GLB dir: {_GLB_DIR}")
+    logger.info("PartVerse dataset root: %s", partverse_dir)
+    logger.info("PartVerse GLB dir: %s", glb_dir)
 
     # ---- Load part captions (needed by pack step) ----
     captions: dict = {}
     if not args.encode_only:
-        if _CAPTIONS_PATH.exists():
-            with open(_CAPTIONS_PATH) as f:
+        if captions_path.exists():
+            with open(captions_path) as f:
                 captions = json.load(f)
             logger.info(f"Loaded captions for {len(captions)} objects")
         else:
@@ -268,37 +288,79 @@ def main():
     if args.num_gpus > 1 and do_encode:
         extra_shard_args = ["--shard", shard, "--num-shards", str(args.num_shards)]
         if do_render:
-            run_render(obj_ids, _glb_getter, _IMG_ENC_DIR, _THIRD_PARTY,
-                       args.force, args.render_workers,
-                       Path(__file__).resolve(), logger,
-                       extra_worker_args=extra_shard_args)
+            run_render(
+                obj_ids,
+                lambda oid: _glb_getter(glb_dir, oid),
+                img_enc_dir,
+                _THIRD_PARTY,
+                args.force,
+                args.render_workers,
+                Path(__file__).resolve(),
+                logger,
+                extra_worker_args=extra_shard_args,
+                dataset_root=partverse_dir,
+            )
         launch_multi_gpu_encode(obj_ids, slat_shard_dir,
                                 Path(__file__).resolve(),
                                 args.num_gpus, args.force, logger,
-                                extra_args=extra_shard_args)
+                                extra_args=extra_shard_args,
+                                dataset_root=partverse_dir)
         if do_pack:
-            _run_pack(obj_ids, shard, captions, args.force, logger)
-        print_summary(obj_ids, _IMG_ENC_DIR, slat_shard_dir, logger)
+            _run_pack(
+                obj_ids,
+                shard,
+                captions,
+                args.force,
+                logger,
+                img_enc_dir=img_enc_dir,
+                images_dir=images_dir,
+                mesh_dir=mesh_dir,
+            )
+        print_summary(obj_ids, img_enc_dir, slat_shard_dir, logger)
         return
 
     # ---- Step 1: Render ----
     if do_render:
         extra_worker_args = ["--shard", shard, "--num-shards", str(args.num_shards)]
-        run_render(obj_ids, _glb_getter, _IMG_ENC_DIR, _THIRD_PARTY,
-                   args.force, args.render_workers,
-                   Path(__file__).resolve(), logger,
-                   extra_worker_args=extra_worker_args)
+        run_render(
+            obj_ids,
+            lambda oid: _glb_getter(glb_dir, oid),
+            img_enc_dir,
+            _THIRD_PARTY,
+            args.force,
+            args.render_workers,
+            Path(__file__).resolve(),
+            logger,
+            extra_worker_args=extra_worker_args,
+            dataset_root=partverse_dir,
+        )
 
     # ---- Step 2: Encode (needs raw PNGs + transforms.json) ----
     if do_encode:
-        run_encode(obj_ids, _IMG_ENC_DIR, slat_shard_dir, _THIRD_PARTY,
-                   args.force, logger)
+        run_encode(
+            obj_ids,
+            img_enc_dir,
+            slat_shard_dir,
+            _THIRD_PARTY,
+            args.force,
+            logger,
+            dataset_root=partverse_dir,
+        )
 
     # ---- Step 3: Pack (img_Enc → NPZ; can delete raw files safely now) ----
     if do_pack:
-        _run_pack(obj_ids, shard, captions, args.force, logger)
+        _run_pack(
+            obj_ids,
+            shard,
+            captions,
+            args.force,
+            logger,
+            img_enc_dir=img_enc_dir,
+            images_dir=images_dir,
+            mesh_dir=mesh_dir,
+        )
 
-    print_summary(obj_ids, _IMG_ENC_DIR, slat_shard_dir, logger)
+    print_summary(obj_ids, img_enc_dir, slat_shard_dir, logger)
 
 
 if __name__ == "__main__":
