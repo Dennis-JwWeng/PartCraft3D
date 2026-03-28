@@ -870,6 +870,7 @@ def enrich_semantic_labels(
     visual_grounding: bool = True,
     dataset=None,
     debug: bool = False,
+    object_ids: list[str] | None = None,
 ) -> Path:
     """Enrich all objects via VLM.
 
@@ -958,6 +959,9 @@ def enrich_semantic_labels(
         raise ValueError("Need either semantic_json_path or dataset")
 
     all_uids = sorted(uid_info.keys())
+    if object_ids:
+        allow = set(object_ids)
+        all_uids = [u for u in all_uids if u in allow]
     if limit > 0:
         all_uids = all_uids[:limit]
 
