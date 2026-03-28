@@ -155,6 +155,47 @@ flowchart TD
 - `partcraft/phase3_filter/filter.py`
 - `partcraft/phase2_assembly/alignment.py`
 
+## Batch 管线运行器
+
+`scripts/tools/run_shard_batch_pipeline.sh` 是 shard 级 batch 运行的推荐入口，按阶段顺序执行 Step12 → 3 → 4 → 5 → 6，自动管理服务启停和 GPU 资源复用。
+
+### 机器配置驱动
+
+所有机器相关路径（conda、checkpoint、数据）集中在 `configs/machine/<hostname>.env`，脚本启动时按 `$(hostname)` 自动加载。迁移新机器只需：
+
+1. `cp configs/machine/node39.env configs/machine/<新主机名>.env`
+2. 编辑路径
+3. `SHARD=01 bash scripts/tools/run_shard_batch_pipeline.sh`
+
+### 环境变量
+
+| 变量 | 说明 | 示例 |
+|------|------|------|
+| `SHARD` | 目标 shard | `01` |
+| `STEPS` | 执行步骤 | `12,3,4` 或 `all` |
+| `LIMIT` | 限制对象数（调试用） | `3` |
+| `VLM_GPUS` | VLM 服务 GPU | `0,4,5,6,7` |
+| `VLM_TP` | VLM tensor parallel | `1`（单卡）或 `2` |
+| `EDIT_GPUS` | 图像编辑服务 GPU | `0,4,5,6,7` |
+| `STEP4_GPUS` | TRELLIS 3D GPU | `0,4,5,6,7` |
+
+### GPU 资源生命周期
+
+同一组 GPU 在步骤间复用，每步结束后自动 kill 服务释放显存：
+
+- Step12：启动 VLM → 语义+规划 → kill VLM
+- Step3：启动 FLUX → 2D 编辑 → kill FLUX
+- Step4：子进程加载 TRELLIS → 3D 编辑 → 子进程退出
+- Step5/6：CPU 为主
+
+### machine env 必填字段
+
+```
+CONDA_INIT, CONDA_ENV_SERVER, CONDA_ENV_PIPELINE
+VLM_CKPT, EDIT_CKPT, TRELLIS_CKPT_ROOT
+DATA_DIR, OUTPUT_ROOT
+```
+
 ## 后续演进规则
 
 - 不新增第三条主编排入口。
