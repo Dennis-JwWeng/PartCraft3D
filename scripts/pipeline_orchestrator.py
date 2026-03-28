@@ -135,6 +135,8 @@ def run_selected_steps(ctx: dict, *, args, cfg, logger, dataset, callbacks: dict
                 debug=args.debug,
                 cache_only_2d=args.cache_only_2d,
                 config_path=args.config,
+                resume_merge_precheck=args.resume_merge_precheck,
+                strict_resume_check=args.strict_resume_check,
             )
         else:
             results_path = callbacks["run_step_3d_edit"](

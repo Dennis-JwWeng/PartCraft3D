@@ -38,7 +38,9 @@ from scripts.pipeline_diagnostics import (
 )
 from scripts.pipeline_dispatch import (
     assert_unique_dispatch as _assert_unique_dispatch_impl,
+    discover_step4_worker_results,
     merge_jsonl_by_key,
+    reconcile_step4_results,
     split_obj_groups as _split_obj_groups_impl,
     validate_worker_jsonl_outputs,
     wait_for_workers,
@@ -579,6 +581,8 @@ def run_step_3d_edit_multi_gpu(
     debug=False,
     cache_only_2d: bool = False,
     config_path: str | None = None,
+    resume_merge_precheck: bool = True,
+    strict_resume_check: bool = False,
 ):
     """Dispatch Step4 with split routing: GPU-bound and non-GPU edit types."""
     logger.info("=" * 60)
@@ -613,6 +617,47 @@ def run_step_3d_edit_multi_gpu(
     cache_dir.mkdir(parents=True, exist_ok=True)
     tag_suffix = f"_{tag}" if tag else ""
     merged_path = cache_dir / f"edit_results{tag_suffix}.jsonl"
+    all_spec_ids = {s.edit_id for s in all_specs}
+
+    if resume_merge_precheck:
+        historical_worker_paths = discover_step4_worker_results(cache_dir, tag_suffix)
+        if historical_worker_paths or merged_path.exists():
+            preflight_merged, preflight_stats = reconcile_step4_results(
+                output_path=merged_path,
+                worker_paths=historical_worker_paths,
+                expected_ids=all_spec_ids,
+                strict=strict_resume_check,
+            )
+            if preflight_merged:
+                write_records(merged_path, preflight_merged)
+            logger.info(
+                "Step4 resume precheck: worker_shards=%d, merged_records=%d, "
+                "done_success=%d",
+                preflight_stats["worker_shards_found"],
+                preflight_stats["merged_records"],
+                preflight_stats["done_success_ids"],
+            )
+            if preflight_stats["bad_json_lines"] or preflight_stats["missing_id_rows"]:
+                logger.warning(
+                    "Step4 resume precheck quality: bad_json_lines=%d, "
+                    "missing_edit_id_rows=%d",
+                    preflight_stats["bad_json_lines"],
+                    preflight_stats["missing_id_rows"],
+                )
+            if preflight_stats["duplicate_rows_detected"]:
+                logger.warning(
+                    "Step4 resume precheck duplicates: %d rows (sample: %s)",
+                    preflight_stats["duplicate_rows_detected"],
+                    ", ".join(preflight_stats["duplicate_ids_sample"]) or "n/a",
+                )
+            if preflight_stats["unexpected_ids_count"]:
+                logger.warning(
+                    "Step4 resume precheck unexpected edit_ids: %d (sample: %s)",
+                    preflight_stats["unexpected_ids_count"],
+                    ", ".join(preflight_stats["unexpected_ids_sample"]) or "n/a",
+                )
+        else:
+            logger.info("Step4 resume precheck: no historical result shards found")
 
     done_ids = collect_success_ids(merged_path, id_key="edit_id")
     pending = [s for s in all_specs if s.edit_id not in done_ids]
@@ -751,7 +796,6 @@ def run_step_3d_edit_multi_gpu(
     )
     write_records(merged_path, merged)
 
-    all_spec_ids = {s.edit_id for s in all_specs}
     merged_ids = set(merged.keys())
     missing_after_merge = sorted([eid for eid in all_spec_ids if eid not in merged_ids])
     if missing_after_merge:
@@ -962,6 +1006,14 @@ def main():
                         help="Auto maximize per-step parallelism")
     parser.add_argument("--results-name", type=str, default=None,
                         help="Internal: override Step4 result filename")
+    parser.add_argument("--resume-merge-precheck", dest="resume_merge_precheck",
+                        action="store_true", default=True,
+                        help="Step4 multi-GPU: reconcile historical worker shards before dispatch")
+    parser.add_argument("--no-resume-merge-precheck", dest="resume_merge_precheck",
+                        action="store_false",
+                        help="Disable Step4 historical shard reconcile before dispatch")
+    parser.add_argument("--strict-resume-check", action="store_true",
+                        help="Step4 precheck: fail on malformed or unexpected historical records")
     parser.add_argument("--dry-run", action="store_true",
                         help="Cost estimation only, no actual processing")
     parser.add_argument("--suffix", type=str, default="",
