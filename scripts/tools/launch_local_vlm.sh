@@ -39,6 +39,7 @@ VLM_PORT="${VLM_PORT:-8002}"
 VLM_TP="${VLM_TP:-1}"
 VLM_GPUS="${VLM_GPUS:-0}"
 VLM_MAX_LEN="${VLM_MAX_LEN:-32768}"
+VLM_MEM_FRAC="${VLM_MEM_FRAC:-0.5}"
 
 # ---- Image edit server settings (qwen-image-2511) ----
 IMG_MODEL="${IMG_MODEL:-${_CKPT_ROOT}/Qwen-Image-Edit-2511}"
@@ -87,7 +88,7 @@ launch_sglang() {
         --port "$port" \
         --tp "$tp" \
         --max-total-tokens "$max_len" \
-        --mem-fraction-static 0.5 \
+        --mem-fraction-static "$VLM_MEM_FRAC" \
         --attention-backend triton
 }
 
