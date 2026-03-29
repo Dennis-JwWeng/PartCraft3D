@@ -40,14 +40,25 @@ def assert_unique_dispatch(groups: list[tuple[str, list]], stage: str):
         )
 
 
-def wait_for_workers(procs: list[tuple[str, subprocess.Popen]], stage: str):
+def wait_for_workers(
+    procs: list[tuple[str, subprocess.Popen]],
+    stage: str,
+    *,
+    fail_fast: bool = True,
+) -> list[tuple[str, int]]:
+    """Wait for all worker subprocesses to finish.
+
+    Returns list of (name, returncode) for failed workers.
+    If *fail_fast* is True (default, backward-compatible), raises on failure.
+    """
     failed = []
     for name, proc in procs:
         ret = proc.wait()
         if ret != 0:
             failed.append((name, ret))
-    if failed:
+    if failed and fail_fast:
         raise RuntimeError(f"{stage} workers failed: {failed}")
+    return failed
 
 
 def validate_worker_jsonl_outputs(
@@ -121,6 +132,15 @@ def merge_jsonl_by_key(
     return merged
 
 
+def discover_step1_worker_results(cache_dir: Path, tag_suffix: str) -> list[Path]:
+    """Discover historical Step1 worker label shards for resume precheck."""
+    shards = sorted(
+        cache_dir.glob(f"semantic_labels{tag_suffix}_w*.jsonl"),
+        key=lambda p: p.name,
+    )
+    return [p for p in shards if p.is_file()]
+
+
 def discover_step4_worker_results(cache_dir: Path, tag_suffix: str) -> list[Path]:
     """Discover historical Step4 worker result shards for resume precheck."""
     gpu_shards = sorted(
@@ -141,14 +161,19 @@ def discover_step4_worker_results(cache_dir: Path, tag_suffix: str) -> list[Path
     return found
 
 
-def reconcile_step4_results(
+def reconcile_worker_results(
     *,
     output_path: Path,
     worker_paths: list[Path],
     expected_ids: set[str],
+    id_key: str,
     strict: bool,
+    stage: str = "Worker",
 ) -> tuple[OrderedDict[str, dict], dict]:
-    """Merge canonical + worker shards and return diagnostics for resume precheck."""
+    """Merge canonical + worker shards and return diagnostics for resume precheck.
+
+    Generalized version — works for any step by accepting *id_key* and *stage*.
+    """
     source_paths: list[Path] = []
     if output_path.is_file():
         source_paths.append(output_path)
@@ -171,7 +196,7 @@ def reconcile_step4_results(
                 except Exception:
                     bad_json_lines += 1
                     continue
-                rid = rec.get("edit_id")
+                rid = rec.get(id_key)
                 if not rid:
                     missing_id_rows += 1
                     continue
@@ -183,25 +208,25 @@ def reconcile_step4_results(
     if strict:
         if bad_json_lines:
             raise RuntimeError(
-                "Step4 resume precheck found invalid JSON lines: "
+                f"{stage} resume precheck found invalid JSON lines: "
                 f"{bad_json_lines}"
             )
         if missing_id_rows:
             raise RuntimeError(
-                "Step4 resume precheck found rows without edit_id: "
+                f"{stage} resume precheck found rows without {id_key}: "
                 f"{missing_id_rows}"
             )
         if unexpected_ids:
             sample = ", ".join(sorted(unexpected_ids)[:10])
             raise RuntimeError(
-                "Step4 resume precheck found unexpected edit_ids "
+                f"{stage} resume precheck found unexpected {id_key}s "
                 f"(sample: {sample}, total={len(unexpected_ids)})"
             )
 
     merged = merge_jsonl_by_key(
         output_path=output_path,
         worker_paths=worker_paths,
-        id_key="edit_id",
+        id_key=id_key,
     )
     merged_ids = set(merged.keys())
     missing_expected = sorted([eid for eid in expected_ids if eid not in merged_ids])
@@ -227,3 +252,21 @@ def reconcile_step4_results(
         "missing_expected_ids_sample": missing_expected[:10],
     }
     return merged, stats
+
+
+def reconcile_step4_results(
+    *,
+    output_path: Path,
+    worker_paths: list[Path],
+    expected_ids: set[str],
+    strict: bool,
+) -> tuple[OrderedDict[str, dict], dict]:
+    """Step4 backward-compatible wrapper around reconcile_worker_results."""
+    return reconcile_worker_results(
+        output_path=output_path,
+        worker_paths=worker_paths,
+        expected_ids=expected_ids,
+        id_key="edit_id",
+        strict=strict,
+        stage="Step4",
+    )

@@ -38,9 +38,11 @@ from scripts.pipeline_diagnostics import (
 )
 from scripts.pipeline_dispatch import (
     assert_unique_dispatch as _assert_unique_dispatch_impl,
+    discover_step1_worker_results,
     discover_step4_worker_results,
     merge_jsonl_by_key,
     reconcile_step4_results,
+    reconcile_worker_results,
     split_obj_groups as _split_obj_groups_impl,
     validate_worker_jsonl_outputs,
     wait_for_workers,
@@ -233,6 +235,31 @@ def run_step_semantic_multi_gpu(
     if dup_uids:
         logger.warning("Step1: dropped %d duplicate object IDs before dispatch", dup_uids)
 
+    # --- Resume precheck: reconcile historical worker shards ---
+    historical = discover_step1_worker_results(cache_dir, tag_suffix)
+    if historical or labels_path.exists():
+        preflight_merged, preflight_stats = reconcile_worker_results(
+            output_path=labels_path,
+            worker_paths=historical,
+            expected_ids=set(all_uids),
+            id_key="obj_id",
+            strict=False,
+            stage="Step1",
+        )
+        if preflight_merged:
+            write_records(labels_path, preflight_merged)
+        logger.info(
+            "Step1 resume precheck: worker_shards=%d, merged=%d",
+            preflight_stats["worker_shards_found"],
+            preflight_stats["merged_records"],
+        )
+        if preflight_stats["bad_json_lines"] or preflight_stats["missing_id_rows"]:
+            logger.warning(
+                "Step1 resume precheck quality: bad_json=%d, missing_obj_id=%d",
+                preflight_stats["bad_json_lines"],
+                preflight_stats["missing_id_rows"],
+            )
+
     done_ids: set[str] = set()
     if labels_path.exists():
         with open(labels_path, encoding="utf-8") as f:
@@ -260,6 +287,7 @@ def run_step_semantic_multi_gpu(
 
     worker_label_paths: list[Path] = []
     procs = []
+    worker_log_fps = []
     pending_set = set(pending)
     for i, url, bucket in plan:
         ids_path = dispatch_dir / f"step1_obj_ids_w{i}.txt"
@@ -287,16 +315,48 @@ def run_step_semantic_multi_gpu(
             cmd.extend(["--step1-workers", str(step1_workers)])
 
         env = os.environ.copy()
+        worker_log_path = cache_dir / f"worker_w{i}.log"
+        log_fp = open(worker_log_path, "w", encoding="utf-8")
+        worker_log_fps.append(log_fp)
         if gpus:
             env["CUDA_VISIBLE_DEVICES"] = str(gpus[i])
-            logger.info("Launch Step1 worker %d on GPU %s → %s (%d objs)",
-                        i, gpus[i], url, len(bucket))
+            logger.info("Launch Step1 worker %d on GPU %s → %s (%d objs, log=%s)",
+                        i, gpus[i], url, len(bucket), worker_log_path)
         else:
-            logger.info("Launch Step1 worker %d → %s (%d objs)",
-                        i, url, len(bucket))
-        procs.append((i, subprocess.Popen(cmd, env=env)))
+            logger.info("Launch Step1 worker %d → %s (%d objs, log=%s)",
+                        i, url, len(bucket), worker_log_path)
+        procs.append((i, subprocess.Popen(
+            cmd, env=env, stdout=log_fp, stderr=subprocess.STDOUT)))
 
-    wait_for_workers(procs, "Step1")
+    failed = wait_for_workers(procs, "Step1", fail_fast=False)
+    for fp in worker_log_fps:
+        fp.close()
+
+    # Always merge whatever was produced — even on partial failure
+    merged = merge_jsonl_by_key(
+        output_path=labels_path,
+        worker_paths=worker_label_paths,
+        id_key="obj_id",
+    )
+    write_records(labels_path, merged)
+
+    if failed:
+        failed_names = [f"w{name}(rc={rc})" for name, rc in failed]
+        logger.warning(
+            "Step1 partial failure: %s. Merged %d/%d objects. "
+            "Re-run to complete remaining.",
+            ", ".join(failed_names), len(merged), len(all_uids),
+        )
+        for name, rc in failed:
+            wlog = cache_dir / f"worker_w{name}.log"
+            if wlog.exists():
+                logger.warning("  Worker %s log: %s", name, wlog)
+        raise RuntimeError(
+            f"Step1 workers failed: {failed} "
+            f"(partial merge saved: {len(merged)}/{len(all_uids)} objects)"
+        )
+
+    # Full success — validate completeness
     missing_pending, dup_pending, unexpected_worker_ids = validate_worker_jsonl_outputs(
         worker_label_paths,
         pending_ids=pending_set,
@@ -321,13 +381,6 @@ def run_step_semantic_multi_gpu(
             "Step1 merge found duplicate obj_id rows across worker outputs "
             f"(sample: {sample}, total={len(dup_pending)})"
         )
-
-    merged = merge_jsonl_by_key(
-        output_path=labels_path,
-        worker_paths=worker_label_paths,
-        id_key="obj_id",
-    )
-    write_records(labels_path, merged)
 
     logger.info("Merged Step1 labels → %s (%d objects)", labels_path, len(merged))
     return labels_path
@@ -763,7 +816,30 @@ def run_step_3d_edit_multi_gpu(
         logger.info("Launch non-GPU worker with %d edits", len(nongpu_pending))
         procs.append(("nongpu", subprocess.Popen(cpu_cmd, env=cpu_env)))
 
-    wait_for_workers(procs, "Step4")
+    failed = wait_for_workers(procs, "Step4", fail_fast=False)
+
+    # Always merge whatever was produced — even on partial failure
+    merged = merge_jsonl_by_key(
+        output_path=merged_path,
+        worker_paths=worker_result_paths,
+        id_key="edit_id",
+    )
+    write_records(merged_path, merged)
+
+    if failed:
+        failed_names = [f"gpu{name}(rc={rc})" for name, rc in failed]
+        n_success = sum(1 for r in merged.values() if r.get("status") == "success")
+        logger.warning(
+            "Step4 partial failure: %s. Merged %d records (%d success). "
+            "Re-run to complete remaining.",
+            ", ".join(failed_names), len(merged), n_success,
+        )
+        raise RuntimeError(
+            f"Step4 workers failed: {failed} "
+            f"(partial merge saved: {len(merged)} records)"
+        )
+
+    # Full success — validate completeness
     missing_pending, dup_pending, unexpected_ids = validate_worker_jsonl_outputs(
         worker_result_paths,
         pending_ids=pending_set,
@@ -788,13 +864,6 @@ def run_step_3d_edit_multi_gpu(
             "Step4 merge found unexpected edit_ids in worker outputs "
             f"(sample: {sample}, total={len(unexpected_ids)})"
         )
-
-    merged = merge_jsonl_by_key(
-        output_path=merged_path,
-        worker_paths=worker_result_paths,
-        id_key="edit_id",
-    )
-    write_records(merged_path, merged)
 
     merged_ids = set(merged.keys())
     missing_after_merge = sorted([eid for eid in all_spec_ids if eid not in merged_ids])
