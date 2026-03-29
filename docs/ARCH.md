@@ -97,6 +97,15 @@ Step1 的 prompt 生成分为“VLM 主生成 + 模板兜底”两层：
 - 缺失关键键时 fail-fast 并指向对应配置项。
 - 旧环境变量覆盖（`PARTVERSE_DATA_ROOT`、`PARTCRAFT_DATASET_ROOT`、`BLENDER_PATH`、`BLENDER_SCRIPT`）仅保留兼容并会给出 deprecation 提示。
 
+### 严格配置模式（2026-03-29）
+
+预渲染与管线执行改为“配置显式声明 + 启动期失败”：
+
+- 关键路径不再在运行时隐式 fallback（例如 `dataset_root`、`slat_dir`、`img_enc_dir`、`image_edit_base_url`）。
+- 缺失配置或路径无效时，直接抛出 `[CONFIG_ERROR]` 并包含 key、解析后的值、来源（config/env_override/derived）。
+- `partcraft/utils/config.py` 会在加载后打印 `[CONFIG_PATH]`，用于审计最终生效路径与来源。
+- `run_pipeline.py` / `run_streaming.py` / `prerender.py` 在 Step3/Step4 与 prerender 输入阶段执行强校验，不再“warning 后跳过步骤”。
+
 ### PartVerse 预处理链
 
 - `scripts/datasets/partverse/prerender.py`
@@ -186,6 +195,11 @@ flowchart TD
 1. `cp configs/machine/node39.env configs/machine/<新主机名>.env`
 2. 编辑路径
 3. `SHARD=01 bash scripts/tools/run_shard_batch_pipeline.sh`
+
+当前仓库已提供：
+
+- `configs/machine/node39.env`
+- `configs/machine/dedicated-developjob-saining-r0iyw.env`（本机默认模板）
 
 ### 环境初始化脚本（部署/管线分离）
 

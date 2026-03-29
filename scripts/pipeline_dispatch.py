@@ -116,7 +116,7 @@ def merge_jsonl_by_key(
                     merged[rid] = rec
     for rp in worker_paths:
         if not rp.exists():
-            continue
+            raise RuntimeError(f"Missing worker result file during merge: {rp}")
         with open(rp, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()

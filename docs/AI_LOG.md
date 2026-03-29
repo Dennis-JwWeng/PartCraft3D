@@ -1,5 +1,31 @@
 # AI_LOG
 
+## 2026-03-29 — Config 驱动与显式失败（预渲染 + 管线）
+
+### 改动
+- `partcraft/utils/config.py`：
+  - 新增关键路径来源记录：`[CONFIG_PATH] key=value source=...`
+  - 关键配置错误统一为 `[CONFIG_ERROR] ...`
+  - 移除 `ckpt_root` 的隐式机器 fallback（必须来自 config 或 env 覆盖）
+- 预渲染侧：
+  - `scripts/datasets/prerender_common.py` 禁止通过 `img_enc_dir.parent` 推导数据根，必须显式传 `dataset_root`
+  - 无 GPU 时渲染/编码直接失败（不再降级继续）
+  - `scripts/datasets/partverse/prerender.py`：`captions_json` 缺失、空 shard、空对象集均改为硬失败
+- 管线侧：
+  - Step3/Step4 统一 `2d_edits_{run_token}` 契约，并要求显式 `edit_dir`
+  - 移除 `image_edit_base_url` 的隐式回退（不再回退到 `vlm_base_url` 或 `localhost`）
+  - Step5/Step6 前置产物缺失改为硬失败；manifest/worker 结果缺失不再静默跳过
+  - `TrellisRefiner` 禁止 `slat_dir/img_enc_dir` 默认回退到 `partobjaverse_tiny`
+
+### 验证用例
+- 负向（应立即报错）：
+  - 缺 `paths.source_glb_dir` / `paths.captions_json`
+  - 缺 `phase2_5.image_edit_base_url`
+  - 缺 `data.slat_dir` 或 `data.img_enc_dir`
+- 正向（应正常启动）：
+  - 完整 config 下执行 `prerender.py --encode-only`
+  - 完整 config 下执行 `run_pipeline.py --steps 3 4`
+
 ## 2026-03-29 — 一键环境初始化脚本（分开部署/管线）
 
 ### 改动

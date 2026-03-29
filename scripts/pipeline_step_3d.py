@@ -135,7 +135,12 @@ def resolve_2d_conditioning(
     num_edit_views = p25_cfg.get("num_edit_views", 4)
     edit_strength = p25_cfg.get("edit_strength", 1.0)
     prerender_img = None
-    base_dir = cache_dir / (edit_dir or "2d_edits")
+    if not edit_dir:
+        raise ValueError(
+            "[CONFIG_ERROR] pipeline.edit_dir <missing> runtime "
+            "Step4 requires explicit 2D edit subdir"
+        )
+    base_dir = cache_dir / edit_dir
     edited_path = base_dir / f"{spec.edit_id}_edited.png"
 
     if edited_path.exists():
@@ -173,7 +178,12 @@ def resolve_2d_conditioning(
                 part_label = old_label
 
             if image_edit_backend == "local_diffusers":
-                edit_url = p25_cfg.get("image_edit_base_url", "http://localhost:8001")
+                edit_url = str(p25_cfg.get("image_edit_base_url", "")).strip()
+                if not edit_url:
+                    raise ValueError(
+                        "[CONFIG_ERROR] phase2_5.image_edit_base_url <missing> config "
+                        "local_diffusers backend requires explicit URL"
+                    )
                 edited = call_local_edit(
                     edit_url,
                     img_bytes,
@@ -243,10 +253,18 @@ def process_object_edits(
         from openai import OpenAI
 
         api_key = resolve_api_key(cfg)
-        if api_key:
-            p0 = cfg["phase0"]
-            image_edit_url = p25_cfg.get("image_edit_base_url") or p0.get("vlm_base_url", "")
-            vlm_client = OpenAI(base_url=image_edit_url, api_key=api_key)
+        if not api_key:
+            raise ValueError(
+                "[CONFIG_ERROR] phase0.vlm_api_key <missing> config "
+                "API image editing requires an API key"
+            )
+        image_edit_url = str(p25_cfg.get("image_edit_base_url", "")).strip()
+        if not image_edit_url:
+            raise ValueError(
+                "[CONFIG_ERROR] phase2_5.image_edit_base_url <missing> config "
+                "API backend requires explicit image_edit_base_url"
+            )
+        vlm_client = OpenAI(base_url=image_edit_url, api_key=api_key)
 
     refiner = None
 
@@ -255,13 +273,19 @@ def process_object_edits(
         if refiner is not None:
             return refiner
         slat_dir, img_enc_dir = resolve_data_dirs(cfg)
+        image_edit_base_url = str(p25_cfg.get("image_edit_base_url", "")).strip()
+        if image_edit_backend != "api" and not image_edit_base_url:
+            raise ValueError(
+                "[CONFIG_ERROR] phase2_5.image_edit_base_url <missing> config "
+                "must be set explicitly"
+            )
         refiner = TrellisRefiner(
             cache_dir=str(cache_dir),
             device="cuda",
             image_edit_model=p25_cfg.get("image_edit_model", "gemini-2.5-flash-image"),
             ckpt_dir=cfg.get("ckpt_root"),
             image_edit_backend=image_edit_backend,
-            image_edit_base_url=p25_cfg.get("image_edit_base_url", "http://localhost:8001"),
+            image_edit_base_url=image_edit_base_url,
             debug=debug,
             slat_dir=slat_dir,
             img_enc_dir=img_enc_dir,

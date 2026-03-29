@@ -16,15 +16,15 @@ data:
 paths:
   # Core dataset tree
   dataset_root: "data/partverse"
-  source_glb_dir: "data/partverse/source/normalized_glbs"
-  captions_json: "data/partverse/source/text_captions.json"
+  source_glb_dir: "source/normalized_glbs"
+  captions_json: "source/text_captions.json"
 
   # Prerender artifacts
-  img_enc_dir: "data/partverse/img_Enc"
-  slat_dir: "data/partverse/slat"
-  images_npz_dir: "data/partverse/images"
-  mesh_npz_dir: "data/partverse/mesh"
-  cache_root: "data/partverse/cache"
+  img_enc_dir: "img_Enc"
+  slat_dir: "slat"
+  images_npz_dir: "images"
+  mesh_npz_dir: "mesh"
+  cache_root: "cache"
 
 tools:
   # Keep executable names portable; rely on PATH by default.

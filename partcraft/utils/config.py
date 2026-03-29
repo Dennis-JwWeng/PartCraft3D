@@ -3,11 +3,95 @@
 from __future__ import annotations
 
 import os
+import logging
 import warnings
 import yaml
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_CFG_LOGGER = logging.getLogger("partcraft.config")
+
+
+def _sources(cfg: dict) -> dict:
+    return cfg.setdefault("_config_path_sources", {})
+
+
+def _mark_source(cfg: dict, key: str, source: str) -> None:
+    _sources(cfg)[key] = source
+
+
+def _get_source(cfg: dict, key: str) -> str:
+    return _sources(cfg).get(key, "config")
+
+
+def _config_error(key: str, value: str | None, source: str, reason: str) -> ValueError:
+    v = value if value is not None else "<missing>"
+    return ValueError(f"[CONFIG_ERROR] {key} {v} {source} {reason}")
+
+
+def _seed_sources_from_yaml(cfg: dict) -> None:
+    data = cfg.get("data", {})
+    paths = cfg.get("paths", {})
+    tools = cfg.get("tools", {})
+    for key, val in (
+        ("data.data_dir", data.get("data_dir")),
+        ("data.output_dir", data.get("output_dir")),
+        ("data.image_npz_dir", data.get("image_npz_dir")),
+        ("data.mesh_npz_dir", data.get("mesh_npz_dir")),
+        ("data.slat_dir", data.get("slat_dir")),
+        ("data.img_enc_dir", data.get("img_enc_dir")),
+        ("paths.dataset_root", paths.get("dataset_root")),
+        ("paths.source_glb_dir", paths.get("source_glb_dir")),
+        ("paths.source_mesh_zip", paths.get("source_mesh_zip")),
+        ("paths.captions_json", paths.get("captions_json")),
+        ("paths.img_enc_dir", paths.get("img_enc_dir")),
+        ("paths.slat_dir", paths.get("slat_dir")),
+        ("paths.images_npz_dir", paths.get("images_npz_dir")),
+        ("paths.mesh_npz_dir", paths.get("mesh_npz_dir")),
+        ("paths.cache_root", paths.get("cache_root")),
+        ("tools.blender_path", tools.get("blender_path")),
+        ("tools.blender_script", tools.get("blender_script")),
+        ("ckpt_root", cfg.get("ckpt_root")),
+    ):
+        if val is not None and str(val).strip():
+            _mark_source(cfg, key, "config")
+
+
+def _log_resolved_paths(cfg: dict, *, for_prerender: bool) -> None:
+    data = cfg.get("data", {})
+    paths = cfg.get("paths", {})
+    entries = [
+        ("data.data_dir", data.get("data_dir")),
+        ("data.output_dir", data.get("output_dir")),
+        ("data.image_npz_dir", data.get("image_npz_dir")),
+        ("data.mesh_npz_dir", data.get("mesh_npz_dir")),
+        ("data.slat_dir", data.get("slat_dir")),
+        ("data.img_enc_dir", data.get("img_enc_dir")),
+        ("ckpt_root", cfg.get("ckpt_root")),
+    ]
+    if for_prerender:
+        entries.extend([
+            ("paths.dataset_root", paths.get("dataset_root")),
+            ("paths.source_glb_dir", paths.get("source_glb_dir")),
+            ("paths.source_mesh_zip", paths.get("source_mesh_zip")),
+            ("paths.captions_json", paths.get("captions_json")),
+            ("paths.img_enc_dir", paths.get("img_enc_dir")),
+            ("paths.slat_dir", paths.get("slat_dir")),
+            ("paths.images_npz_dir", paths.get("images_npz_dir")),
+            ("paths.mesh_npz_dir", paths.get("mesh_npz_dir")),
+            ("paths.cache_root", paths.get("cache_root")),
+            ("tools.blender_path", cfg.get("tools", {}).get("blender_path")),
+            ("tools.blender_script", cfg.get("tools", {}).get("blender_script")),
+        ])
+    for key, val in entries:
+        if val is None or (isinstance(val, str) and not val.strip()):
+            continue
+        _CFG_LOGGER.info(
+            "[CONFIG_PATH] %s=%s source=%s",
+            key,
+            val,
+            _get_source(cfg, key),
+        )
 
 
 def _apply_data_roots_and_layout(cfg: dict) -> None:
@@ -30,9 +114,11 @@ def _apply_data_roots_and_layout(cfg: dict) -> None:
     env_data = os.environ.get("PARTCRAFT_DATA_ROOT", "").strip()
     if env_data:
         data["data_dir"] = env_data
+        _mark_source(cfg, "data.data_dir", "env_override")
     env_out = os.environ.get("PARTCRAFT_OUTPUT_ROOT", "").strip()
     if env_out:
         data["output_dir"] = env_out
+        _mark_source(cfg, "data.output_dir", "env_override")
 
     if not data.get("derive_dataset_subpaths"):
         return
@@ -51,6 +137,7 @@ def _apply_data_roots_and_layout(cfg: dict) -> None:
         v = data.get(key, None)
         if v is None or (isinstance(v, str) and not v.strip()):
             data[key] = str(base / sub)
+            _mark_source(cfg, f"data.{key}", "derived")
 
 
 def _resolve_path(raw: str | Path | None, *, base: Path) -> str | None:
@@ -84,9 +171,6 @@ def _apply_prerender_paths(cfg: dict) -> None:
     data = cfg.setdefault("data", {})
     paths = cfg.setdefault("paths", {})
 
-    if not paths.get("dataset_root") and data.get("data_dir"):
-        paths["dataset_root"] = data.get("data_dir")
-
     deprecated_env = os.environ.get("PARTVERSE_DATA_ROOT", "").strip()
     if deprecated_env:
         warnings.warn(
@@ -95,6 +179,7 @@ def _apply_prerender_paths(cfg: dict) -> None:
             stacklevel=2,
         )
         paths["dataset_root"] = deprecated_env
+        _mark_source(cfg, "paths.dataset_root", "env_override")
     compat_root = os.environ.get("PARTCRAFT_DATASET_ROOT", "").strip()
     if compat_root:
         warnings.warn(
@@ -104,26 +189,21 @@ def _apply_prerender_paths(cfg: dict) -> None:
             stacklevel=2,
         )
         paths["dataset_root"] = compat_root
+        _mark_source(cfg, "paths.dataset_root", "env_override")
 
     dataset_root = _resolve_path(paths.get("dataset_root"), base=_PROJECT_ROOT)
-    if dataset_root:
-        paths["dataset_root"] = dataset_root
-        data["data_dir"] = dataset_root
+    if not dataset_root:
+        raise _config_error(
+            "paths.dataset_root",
+            None,
+            _get_source(cfg, "paths.dataset_root"),
+            "must be explicitly set for prerender",
+        )
+    paths["dataset_root"] = dataset_root
+    data["data_dir"] = dataset_root
+    _mark_source(cfg, "data.data_dir", "derived")
 
-    base = Path(dataset_root) if dataset_root else _PROJECT_ROOT
-
-    def _default(key: str, rel: str):
-        if not paths.get(key):
-            paths[key] = str(base / rel)
-
-    _default("source_glb_dir", "source/normalized_glbs")
-    _default("source_mesh_zip", "source/mesh.zip")
-    _default("captions_json", "source/text_captions.json")
-    _default("img_enc_dir", "img_Enc")
-    _default("slat_dir", "slat")
-    _default("images_npz_dir", "images")
-    _default("mesh_npz_dir", "mesh")
-    _default("cache_root", "cache")
+    base = Path(dataset_root)
 
     for k in (
         "source_glb_dir",
@@ -135,22 +215,28 @@ def _apply_prerender_paths(cfg: dict) -> None:
         "mesh_npz_dir",
         "cache_root",
     ):
-        paths[k] = _resolve_path(paths.get(k), base=base)
+        raw = paths.get(k)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            continue
+        paths[k] = _resolve_path(raw, base=base)
 
     # Keep existing pipeline/data consumers working with the normalized contract.
-    data["img_enc_dir"] = paths["img_enc_dir"]
-    data["slat_dir"] = paths["slat_dir"]
-    data["image_npz_dir"] = paths["images_npz_dir"]
-    data["mesh_npz_dir"] = paths["mesh_npz_dir"]
+    if paths.get("img_enc_dir"):
+        data["img_enc_dir"] = paths["img_enc_dir"]
+        _mark_source(cfg, "data.img_enc_dir", "derived")
+    if paths.get("slat_dir"):
+        data["slat_dir"] = paths["slat_dir"]
+        _mark_source(cfg, "data.slat_dir", "derived")
+    if paths.get("images_npz_dir"):
+        data["image_npz_dir"] = paths["images_npz_dir"]
+        _mark_source(cfg, "data.image_npz_dir", "derived")
+    if paths.get("mesh_npz_dir"):
+        data["mesh_npz_dir"] = paths["mesh_npz_dir"]
+        _mark_source(cfg, "data.mesh_npz_dir", "derived")
 
 
 def _apply_tool_paths(cfg: dict) -> None:
     tools = cfg.setdefault("tools", {})
-    if not tools.get("blender_path"):
-        tools["blender_path"] = "blender"
-    if not tools.get("blender_script"):
-        tools["blender_script"] = str(_PROJECT_ROOT / "scripts" / "blender_render.py")
-
     env_blender = os.environ.get("BLENDER_PATH", "").strip()
     if env_blender:
         warnings.warn(
@@ -159,6 +245,7 @@ def _apply_tool_paths(cfg: dict) -> None:
             stacklevel=2,
         )
         tools["blender_path"] = env_blender
+        _mark_source(cfg, "tools.blender_path", "env_override")
 
     env_blender_script = os.environ.get("BLENDER_SCRIPT", "").strip()
     if env_blender_script:
@@ -168,6 +255,7 @@ def _apply_tool_paths(cfg: dict) -> None:
             stacklevel=2,
         )
         tools["blender_script"] = env_blender_script
+        _mark_source(cfg, "tools.blender_script", "env_override")
 
     tools["blender_path"] = _resolve_tool_executable(
         tools.get("blender_path"),
@@ -183,7 +271,7 @@ def _validate_prerender_config(cfg: dict, *, mode: str | None) -> None:
     paths = cfg.get("paths", {})
     tools = cfg.get("tools", {})
     missing = []
-    for key in ("dataset_root", "img_enc_dir", "slat_dir", "images_npz_dir", "mesh_npz_dir"):
+    for key in ("dataset_root", "img_enc_dir", "slat_dir", "images_npz_dir", "mesh_npz_dir", "cache_root"):
         if not paths.get(key):
             missing.append(f"paths.{key}")
     for key in ("blender_path", "blender_script"):
@@ -191,15 +279,38 @@ def _validate_prerender_config(cfg: dict, *, mode: str | None) -> None:
             missing.append(f"tools.{key}")
     if mode == "partverse" and not paths.get("source_glb_dir"):
         missing.append("paths.source_glb_dir")
+    if mode == "partverse" and not paths.get("captions_json"):
+        missing.append("paths.captions_json")
     if mode in {"partobjaverse", "partobjaverse_prepare"} and not paths.get("source_mesh_zip"):
         missing.append("paths.source_mesh_zip")
     if missing:
         msg = ", ".join(missing)
-        raise ValueError(
-            "Missing required prerender config keys: "
-            f"{msg}. See configs/prerender_partverse.yaml "
-            "or configs/prerender_partobjaverse.yaml."
-        )
+        raise _config_error("prerender.required_keys", msg, "config", "missing required keys")
+
+    dataset_root = Path(paths["dataset_root"])
+    if not dataset_root.exists():
+        raise _config_error("paths.dataset_root", str(dataset_root), _get_source(cfg, "paths.dataset_root"), "path does not exist")
+    if not dataset_root.is_dir():
+        raise _config_error("paths.dataset_root", str(dataset_root), _get_source(cfg, "paths.dataset_root"), "must be a directory")
+
+    if mode == "partverse":
+        glb_dir = Path(paths["source_glb_dir"])
+        if not glb_dir.is_dir():
+            raise _config_error("paths.source_glb_dir", str(glb_dir), _get_source(cfg, "paths.source_glb_dir"), "must be an existing directory")
+        captions = Path(paths["captions_json"])
+        if not captions.is_file():
+            raise _config_error("paths.captions_json", str(captions), _get_source(cfg, "paths.captions_json"), "must be an existing file")
+
+    if mode in {"partobjaverse", "partobjaverse_prepare"}:
+        mesh_zip = Path(paths["source_mesh_zip"])
+        if not mesh_zip.is_file():
+            raise _config_error("paths.source_mesh_zip", str(mesh_zip), _get_source(cfg, "paths.source_mesh_zip"), "must be an existing file")
+
+    blender_script = tools.get("blender_script")
+    if blender_script and ("/" in blender_script or "\\" in blender_script):
+        bsp = Path(blender_script)
+        if not bsp.is_file():
+            raise _config_error("tools.blender_script", str(bsp), _get_source(cfg, "tools.blender_script"), "must be an existing file")
 
 
 def _resolve_trellis_ckpt_path(value: str, ckpt_root: Path) -> str:
@@ -237,16 +348,17 @@ def _apply_ckpt_root(cfg: dict) -> None:
     env = os.environ.get("PARTCRAFT_CKPT_ROOT", "").strip()
     if env:
         root = Path(env).expanduser().resolve()
+        _mark_source(cfg, "ckpt_root", "env_override")
     elif cfg.get("ckpt_root"):
         raw = cfg["ckpt_root"]
         r = Path(str(raw).strip())
         root = r.resolve() if r.is_absolute() else (_PROJECT_ROOT / r).resolve()
     else:
-        mnt = Path("/mnt/zsn/ckpts")
-        local = _PROJECT_ROOT / "checkpoints"
-        root = mnt.resolve() if mnt.is_dir() else local.resolve()
+        raise _config_error("ckpt_root", None, "config", "must be explicitly set (or override PARTCRAFT_CKPT_ROOT)")
 
     cfg["ckpt_root"] = str(root)
+    if not root.is_dir():
+        raise _config_error("ckpt_root", str(root), _get_source(cfg, "ckpt_root"), "directory does not exist")
 
     p25 = cfg.setdefault("phase2_5", {})
     for key in ("trellis_text_ckpt", "trellis_image_ckpt"):
@@ -282,6 +394,7 @@ def load_config(
         raise FileNotFoundError(f"Config not found: {config_path}")
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
+    _seed_sources_from_yaml(cfg)
 
     _apply_data_roots_and_layout(cfg)
     _apply_ckpt_root(cfg)
@@ -309,5 +422,7 @@ def load_config(
     log_dir = cfg.get("logging", {}).get("log_dir", "logs")
     if not os.path.isabs(log_dir):
         cfg["logging"]["log_dir"] = os.path.join(output_dir, log_dir)
+
+    _log_resolved_paths(cfg, for_prerender=for_prerender)
 
     return cfg

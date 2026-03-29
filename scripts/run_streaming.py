@@ -138,14 +138,24 @@ def run_streaming(cfg, dataset, logger, args):
         logger.error("No API key for VLM enrichment")
         return
     vlm_model = p0.get("vlm_model", "gemini-3.1-flash-lite-preview")
-    vlm_base_url = p0.get("vlm_base_url", "")
+    vlm_base_url = str(p0.get("vlm_base_url", "")).strip()
+    if not vlm_base_url:
+        raise ValueError(
+            "[CONFIG_ERROR] phase0.vlm_base_url <missing> config "
+            "streaming requires explicit VLM endpoint"
+        )
     vlm_client = OpenAI(base_url=vlm_base_url, api_key=api_key)
 
     # ---- Image edit setup ----
     image_edit_backend = p25.get("image_edit_backend", "api")
     edit_vlm_client = None
+    image_edit_url = str(p25.get("image_edit_base_url", "")).strip()
+    if not image_edit_url:
+        raise ValueError(
+            "[CONFIG_ERROR] phase2_5.image_edit_base_url <missing> config "
+            "streaming requires explicit image edit endpoint"
+        )
     if image_edit_backend != "local_diffusers":
-        image_edit_url = p25.get("image_edit_base_url") or vlm_base_url
         edit_vlm_client = OpenAI(base_url=image_edit_url, api_key=api_key)
 
     # ---- TRELLIS setup ----
@@ -159,7 +169,7 @@ def run_streaming(cfg, dataset, logger, args):
         image_edit_model=p25.get("image_edit_model", "gemini-2.5-flash-image"),
         ckpt_dir=cfg.get("ckpt_root"),
         image_edit_backend=image_edit_backend,
-        image_edit_base_url=p25.get("image_edit_base_url", "http://localhost:8001"),
+        image_edit_base_url=image_edit_url,
         debug=args.debug,
         slat_dir=slat_dir,
         img_enc_dir=img_enc_dir,

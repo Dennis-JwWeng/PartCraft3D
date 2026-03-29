@@ -3,8 +3,8 @@
 Provides GPU discovery, Blender render orchestration, and SLAT encoding that
 are common across PartObjaverse-Tiny, PartVerse, and future datasets.
 
-encode_asset reads/writes under the dataset root via PARTCRAFT_DATASET_ROOT
-(parent of img_Enc/); prerender sets this from img_enc_dir.parent.
+encode_asset reads/writes under PARTCRAFT_DATASET_ROOT, which must be
+explicitly passed from config by the caller.
 
 Dataset-specific scripts call these helpers after providing path constants
 and GLB accessors.
@@ -14,7 +14,6 @@ import logging
 import os
 import subprocess
 import sys
-import warnings
 from pathlib import Path
 from typing import Callable
 
@@ -49,26 +48,13 @@ def _set_dataset_root_env(
     dataset_root: str | Path | None = None,
 ) -> str:
     """Set PARTCRAFT_DATASET_ROOT for encode_asset.
-
-    Compatibility fallback order:
-      1) explicit ``dataset_root`` argument
-      2) PARTCRAFT_DATASET_ROOT env (deprecated)
-      3) img_enc_dir.parent
     """
-    if dataset_root is not None and str(dataset_root).strip():
-        root = str(Path(str(dataset_root)).expanduser().resolve())
-    else:
-        compat = os.environ.get("PARTCRAFT_DATASET_ROOT", "").strip()
-        if compat:
-            warnings.warn(
-                "PARTCRAFT_DATASET_ROOT implicit usage is deprecated; pass "
-                "dataset_root explicitly from config.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            root = str(Path(compat).expanduser().resolve())
-        else:
-            root = str(img_enc_dir.parent.resolve())
+    if dataset_root is None or not str(dataset_root).strip():
+        raise ValueError(
+            "[CONFIG_ERROR] paths.dataset_root <missing> config "
+            "must be passed explicitly to prerender_common; no implicit fallback"
+        )
+    root = str(Path(str(dataset_root)).expanduser().resolve())
     os.environ["PARTCRAFT_DATASET_ROOT"] = root
     return root
 
@@ -113,7 +99,12 @@ def run_render(
                          extra_worker_args or [], resolved_dataset_root)
     else:
         gpus = get_available_gpus()
-        gpu_id = gpus[0] if gpus else None
+        if not gpus:
+            raise RuntimeError(
+                "[CONFIG_ERROR] gpu.render <missing> runtime no GPU found "
+                "(check CUDA_VISIBLE_DEVICES or nvidia-smi)"
+            )
+        gpu_id = gpus[0]
         _render_sequential(pending, glb_getter, third_party_dir, gpu_id, logger)
 
 
@@ -164,9 +155,10 @@ def _render_parallel(
     """
     gpus = get_available_gpus()
     if not gpus:
-        logger.warning("No GPUs found — Blender will attempt GPU rendering without "
-                       "CUDA_VISIBLE_DEVICES restriction.")
-        gpus = list(range(num_workers))
+        raise RuntimeError(
+            "[CONFIG_ERROR] gpu.render <missing> runtime no GPU found "
+            "(check CUDA_VISIBLE_DEVICES or nvidia-smi)"
+        )
 
     if num_workers > len(gpus):
         logger.warning(
@@ -401,12 +393,23 @@ def launch_multi_gpu_encode(
 
     logger.info(f"Multi-GPU encode: {len(pending)} objects across {num_gpus} GPUs")
 
+    available_gpus = get_available_gpus()
+    if not available_gpus:
+        raise RuntimeError(
+            "[CONFIG_ERROR] gpu.encode <missing> runtime no GPU found "
+            "(check CUDA_VISIBLE_DEVICES or nvidia-smi)"
+        )
+    if num_gpus > len(available_gpus):
+        raise RuntimeError(
+            "[CONFIG_ERROR] gpu.encode.count invalid runtime "
+            f"requested num_gpus={num_gpus} but only {len(available_gpus)} available"
+        )
+
     shards = [[] for _ in range(num_gpus)]
     for i, oid in enumerate(pending):
         shards[i % num_gpus].append(oid)
 
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    visible_gpus = [g.strip() for g in visible.split(",") if g.strip()] if visible else []
+    visible_gpus = [str(g) for g in available_gpus]
 
     processes = []
     for idx, shard in enumerate(shards):

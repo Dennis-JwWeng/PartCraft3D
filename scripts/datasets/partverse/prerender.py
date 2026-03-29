@@ -46,7 +46,6 @@ import json
 import logging
 import os
 import sys
-import warnings
 from pathlib import Path
 
 _PROJECT_ROOT  = Path(__file__).resolve().parents[3]
@@ -190,19 +189,10 @@ def main():
     logger = setup_logging(cfg, "prerender_partverse")
 
     if args.data_root:
-        warnings.warn(
-            "--data-root is deprecated; prefer paths.dataset_root in config.",
-            DeprecationWarning,
-            stacklevel=2,
+        raise ValueError(
+            "[CONFIG_ERROR] cli.--data-root disabled runtime "
+            "use config paths.dataset_root instead"
         )
-        root = Path(args.data_root).expanduser().resolve()
-        cfg.setdefault("paths", {})["dataset_root"] = str(root)
-        cfg["paths"]["source_glb_dir"] = str(root / "source" / "normalized_glbs")
-        cfg["paths"]["captions_json"] = str(root / "source" / "text_captions.json")
-        cfg["paths"]["img_enc_dir"] = str(root / "img_Enc")
-        cfg["paths"]["slat_dir"] = str(root / "slat")
-        cfg["paths"]["images_npz_dir"] = str(root / "images")
-        cfg["paths"]["mesh_npz_dir"] = str(root / "mesh")
 
     paths = cfg["paths"]
     partverse_dir = Path(paths["dataset_root"])
@@ -226,6 +216,11 @@ def main():
         logger.info(f"Explicit --obj-ids: {len(obj_ids)} objects → shard {shard}")
     else:
         all_ids = get_all_obj_ids(glb_dir)
+        if not all_ids:
+            raise RuntimeError(
+                f"[CONFIG_ERROR] paths.source_glb_dir {glb_dir} config "
+                "contains zero .glb objects"
+            )
         if args.shard is not None:
             obj_ids = select_shard(all_ids, args.shard, args.num_shards)
             shard = args.shard
@@ -237,10 +232,9 @@ def main():
             logger.info(f"Shard {shard}/{args.num_shards}: "
                         f"{len(obj_ids)}/{len(all_ids)} objects {span}")
             if not obj_ids:
-                logger.warning(
-                    "This shard has no objects — often caused by fewer GLBs under "
-                    "normalized_glbs/ than a full PartVerse drop, or --num-shards "
-                    "larger than needed. Nothing to render/encode/pack for this shard."
+                raise RuntimeError(
+                    f"[CONFIG_ERROR] shard.{shard} empty runtime "
+                    f"num_shards={args.num_shards} produces zero objects"
                 )
         else:
             obj_ids = all_ids
@@ -272,13 +266,14 @@ def main():
 
     # ---- Load part captions (needed by pack step) ----
     captions: dict = {}
-    if not args.encode_only:
-        if captions_path.exists():
-            with open(captions_path) as f:
-                captions = json.load(f)
-            logger.info(f"Loaded captions for {len(captions)} objects")
-        else:
-            logger.warning(f"text_captions.json not found — using generic part names")
+    if captions_path.exists():
+        with open(captions_path) as f:
+            captions = json.load(f)
+        logger.info(f"Loaded captions for {len(captions)} objects")
+    else:
+        raise FileNotFoundError(
+            f"[CONFIG_ERROR] paths.captions_json {captions_path} config missing file"
+        )
 
     do_render = not args.pack_only and not args.encode_only
     do_encode = not args.render_only and not args.pack_only

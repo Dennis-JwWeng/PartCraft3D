@@ -15,17 +15,25 @@ def normalize_shard(shard: str | None) -> str | None:
 
 
 def run_token(tag: str | None, shard: str | None) -> str:
-    """Build output token. Prefer explicit tag, fallback to shard token."""
+    """Build output token from explicit tag or shard token."""
     if tag:
         return str(tag)
     if shard:
         return f"shard{shard}"
-    return ""
+    raise ValueError(
+        "[CONFIG_ERROR] run_token <missing> runtime "
+        "either --tag or data.shards must provide a run token"
+    )
 
 
 def shard_output_root(cfg: dict, shard: str | None) -> Path:
+    if not shard:
+        raise ValueError(
+            "[CONFIG_ERROR] data.shards <missing> runtime "
+            "shard-specific output requires explicit shard"
+        )
     out = Path(cfg["data"]["output_dir"])
-    shard_leaf = f"shard_{shard}" if shard else "shard_unknown"
+    shard_leaf = f"shard_{shard}"
     return out if out.name == shard_leaf else (out / shard_leaf)
 
 
@@ -48,7 +56,9 @@ def pipeline_manifest_dir(cfg: dict, shard: str | None, phase: str) -> Path:
 
 def sync_manifest_link(cfg: dict, shard: str | None, phase: str, filename: str, src: Path):
     if not src or not src.exists():
-        return
+        raise FileNotFoundError(
+            f"[CONFIG_ERROR] manifest.{phase}.{filename} {src} runtime source artifact missing"
+        )
     mdir = pipeline_manifest_dir(cfg, shard, phase)
     dst = mdir / filename
     if dst.exists() or dst.is_symlink():

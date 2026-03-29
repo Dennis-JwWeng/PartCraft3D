@@ -12,15 +12,15 @@ data:
 
 paths:
   dataset_root: "data/partobjaverse_tiny"
-  source_mesh_zip: "data/partobjaverse_tiny/source/mesh.zip"
-  source_glb_dir: "data/partobjaverse_tiny/source/normalized_glbs"
-  captions_json: "data/partobjaverse_tiny/source/text_captions.json"
+  source_mesh_zip: "source/mesh.zip"
+  source_glb_dir: "source/normalized_glbs"
+  captions_json: "source/text_captions.json"
 
-  img_enc_dir: "data/partobjaverse_tiny/img_Enc"
-  slat_dir: "data/partobjaverse_tiny/slat"
-  images_npz_dir: "data/partobjaverse_tiny/images"
-  mesh_npz_dir: "data/partobjaverse_tiny/mesh"
-  cache_root: "data/partobjaverse_tiny/cache"
+  img_enc_dir: "img_Enc"
+  slat_dir: "slat"
+  images_npz_dir: "images"
+  mesh_npz_dir: "mesh"
+  cache_root: "cache"
 
 tools:
   blender_path: "blender"

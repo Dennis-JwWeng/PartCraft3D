@@ -207,15 +207,32 @@ class TrellisRefiner:
         self.image_edit_backend = image_edit_backend
         self.image_edit_base_url = image_edit_base_url
 
-        # Checkpoint directory: default to PartCraft3D/checkpoints
         if ckpt_dir is None:
-            ckpt_dir = str(self._project_root / "checkpoints")
+            raise ValueError(
+                "[CONFIG_ERROR] ckpt_root <missing> config "
+                "must be explicitly provided to TrellisRefiner"
+            )
         self.ckpt_dir = Path(ckpt_dir)
+        if not self.ckpt_dir.is_dir():
+            raise ValueError(
+                f"[CONFIG_ERROR] ckpt_root {self.ckpt_dir} config directory does not exist"
+            )
 
-        # Data directories (SLAT, img_Enc) — config-driven, fallback to partobjaverse_tiny
-        _default_data = self._project_root / "data" / "partobjaverse_tiny"
-        self.slat_dir = Path(slat_dir) if slat_dir else _default_data / "slat"
-        self.img_enc_dir = Path(img_enc_dir) if img_enc_dir else _default_data / "img_Enc"
+        if not slat_dir or not img_enc_dir:
+            raise ValueError(
+                "[CONFIG_ERROR] data.slat_dir/data.img_enc_dir <missing> config "
+                "must be explicitly provided to TrellisRefiner"
+            )
+        self.slat_dir = Path(slat_dir)
+        self.img_enc_dir = Path(img_enc_dir)
+        if not self.slat_dir.exists():
+            raise ValueError(
+                f"[CONFIG_ERROR] data.slat_dir {self.slat_dir} config path does not exist"
+            )
+        if not self.img_enc_dir.exists():
+            raise ValueError(
+                f"[CONFIG_ERROR] data.img_enc_dir {self.img_enc_dir} config path does not exist"
+            )
 
         self.debug = debug or os.environ.get("PARTCRAFT_DEBUG", "").lower() in ("1", "true")
 
@@ -954,7 +971,12 @@ class TrellisRefiner:
 
     def _get_edit_server_url(self) -> str:
         """Return the base URL of the image edit HTTP server."""
-        return self.image_edit_base_url or "http://localhost:8001"
+        if not self.image_edit_base_url:
+            raise ValueError(
+                "[CONFIG_ERROR] phase2_5.image_edit_base_url <missing> config "
+                "local_diffusers backend requires explicit URL"
+            )
+        return self.image_edit_base_url
 
     def _call_vlm_edit(
         self, client, img_pil: Image.Image,

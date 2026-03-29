@@ -64,6 +64,15 @@ def run_streaming_with_lookahead(
     from collections import Counter
     import tempfile
 
+    local_edit_url = ""
+    if args.use_2d and image_edit_backend == "local_diffusers":
+        local_edit_url = str(p25.get("image_edit_base_url", "")).strip()
+        if not local_edit_url:
+            raise ValueError(
+                "[CONFIG_ERROR] phase2_5.image_edit_base_url <missing> config "
+                "local_diffusers backend requires explicit URL"
+            )
+
     glb_tmp_dir = tempfile.mkdtemp(prefix="partcraft_stream_")
     total_specs = 0
     total_success = 0
@@ -200,11 +209,8 @@ def run_streaming_with_lookahead(
                                     part_label = old_label
 
                                 if image_edit_backend == "local_diffusers":
-                                    edit_url = p25.get(
-                                        "image_edit_base_url",
-                                        "http://localhost:8001")
                                     edited = call_local_edit(
-                                        edit_url, img_bytes,
+                                        local_edit_url, img_bytes,
                                         spec.edit_prompt, after_desc,
                                         old_part_label=part_label,
                                         before_part_desc=before_desc,
@@ -398,11 +404,8 @@ def run_streaming_with_lookahead(
                                     part_label = old_label
 
                                 if image_edit_backend == "local_diffusers":
-                                    edit_url = p25.get(
-                                        "image_edit_base_url",
-                                        "http://localhost:8001")
                                     edited = call_local_edit(
-                                        edit_url, img_bytes,
+                                        local_edit_url, img_bytes,
                                         spec.edit_prompt, after_desc,
                                         old_part_label=part_label,
                                         before_part_desc=before_desc,

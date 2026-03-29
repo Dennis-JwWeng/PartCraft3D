@@ -166,7 +166,11 @@ def run_step_semantic(cfg, dataset, logger, limit=None, force=False, tag=None,
     labels_path = cache_dir / (labels_name or f"semantic_labels{tag_suffix}.jsonl")
 
     image_npz_dir = cfg["data"].get("image_npz_dir")
-    shards = cfg["data"].get("shards", ["00"])
+    shards = cfg["data"].get("shards")
+    if not shards:
+        raise ValueError(
+            "[CONFIG_ERROR] data.shards <missing> config must be set explicitly"
+        )
     max_workers = cfg["phase0"].get("max_workers", 4)
 
     if force and labels_path.exists():
@@ -179,7 +183,7 @@ def run_step_semantic(cfg, dataset, logger, limit=None, force=False, tag=None,
         semantic_json_path=None,
         output_path=str(labels_path),
         image_npz_dir=image_npz_dir,
-        shard=shards[0] if shards else "00",
+        shard=shards[0],
         limit=limit or 0,
         max_workers=max_workers,
         visual_grounding=cfg.get("phase0", {}).get("visual_grounding", True),
@@ -226,8 +230,12 @@ def run_step_semantic_multi_gpu(
 
     if dataset._index is None:
         dataset._build_index()
-    shards = cfg["data"].get("shards", ["00"])
-    target_shard = shards[0] if shards else "00"
+    shards = cfg["data"].get("shards")
+    if not shards:
+        raise ValueError(
+            "[CONFIG_ERROR] data.shards <missing> config must be set explicitly"
+        )
+    target_shard = shards[0]
     all_uids = sorted([obj_id for shard, obj_id in dataset._index if shard == target_shard])
     if limit:
         all_uids = all_uids[:limit]
@@ -443,7 +451,13 @@ def run_step_2d_edit(cfg, specs_path, dataset, logger,
         elif cfg_urls:
             urls = [str(u).strip() for u in cfg_urls if str(u).strip()]
         else:
-            urls = [p25.get("image_edit_base_url", "http://localhost:8001")]
+            single_url = str(p25.get("image_edit_base_url", "")).strip()
+            if not single_url:
+                raise ValueError(
+                    "[CONFIG_ERROR] phase2_5.image_edit_base_url <missing> config "
+                    "must be set explicitly for local_diffusers backend"
+                )
+            urls = [single_url]
 
         live_urls = []
         for u in urls:
@@ -452,8 +466,10 @@ def run_step_2d_edit(cfg, specs_path, dataset, logger,
             else:
                 logger.warning(f"Image edit server not reachable at {u}")
         if not live_urls:
-            logger.warning("No image edit server reachable, skipping 2D editing")
-            return None
+            raise RuntimeError(
+                "[CONFIG_ERROR] phase2_5.image_edit_base_url unreachable runtime "
+                "all configured image edit servers are unreachable"
+            )
         edit_server_urls = live_urls
         edit_server_url = edit_server_urls[0]
         logger.info(f"Image edit servers OK: {', '.join(edit_server_urls)}")
@@ -477,10 +493,17 @@ def run_step_2d_edit(cfg, specs_path, dataset, logger,
         from openai import OpenAI
         api_key = resolve_api_key(cfg)
         if not api_key:
-            logger.warning("No API key — skipping 2D editing")
-            return None
+            raise ValueError(
+                "[CONFIG_ERROR] phase0.vlm_api_key <missing> config "
+                "API backend requires an API key"
+            )
 
-        image_edit_url = p25.get("image_edit_base_url") or p0.get("vlm_base_url", "")
+        image_edit_url = str(p25.get("image_edit_base_url", "")).strip()
+        if not image_edit_url:
+            raise ValueError(
+                "[CONFIG_ERROR] phase2_5.image_edit_base_url <missing> config "
+                "API backend requires explicit image_edit_base_url"
+            )
         client = OpenAI(
             base_url=image_edit_url,
             api_key=api_key,
@@ -507,8 +530,18 @@ def run_step_2d_edit(cfg, specs_path, dataset, logger,
     specs = _dedupe_specs_by_edit_id(specs, logger, "Step3")
 
     # Output directory
-    cache_dir = Path(p25.get("cache_dir", "outputs/cache/phase2_5"))
-    edit_subdir = f"2d_edits_{tag}" if tag else "2d_edits"
+    cache_dir_raw = p25.get("cache_dir")
+    if not cache_dir_raw:
+        raise ValueError(
+            "[CONFIG_ERROR] phase2_5.cache_dir <missing> config must be set explicitly"
+        )
+    if not tag:
+        raise ValueError(
+            "[CONFIG_ERROR] run_token <missing> runtime "
+            "Step3 requires a non-empty run token (tag or shard token)"
+        )
+    cache_dir = Path(cache_dir_raw)
+    edit_subdir = f"2d_edits_{tag}"
     output_dir = cache_dir / edit_subdir
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -643,6 +676,11 @@ def run_step_3d_edit_multi_gpu(
     logger.info("=" * 60)
     if len(gpus) <= 1:
         raise ValueError("run_step_3d_edit_multi_gpu requires >=2 GPUs")
+    if not edit_dir:
+        raise ValueError(
+            "[CONFIG_ERROR] pipeline.edit_dir <missing> runtime "
+            "Step4 multi-GPU requires explicit 2D edit subdir"
+        )
 
     # Load specs with same filter semantics as run_step_3d_edit
     accepted = {"deletion", "addition", "modification", "scale",
@@ -766,7 +804,7 @@ def run_step_3d_edit_multi_gpu(
             cmd.extend(["--config", config_path])
         cmd.extend(["--steps", "4"])
         cmd.extend(["--seed", str(seed)])
-        cmd.extend(["--edit-dir", edit_dir or "2d_edits"])
+        cmd.extend(["--edit-dir", edit_dir])
         cmd.extend(["--results-name", res_name])
         cmd.extend(["--edit-ids-file", str(ids_path)])
         if tag:
@@ -800,7 +838,7 @@ def run_step_3d_edit_multi_gpu(
             cpu_cmd.extend(["--config", config_path])
         cpu_cmd.extend(["--steps", "4"])
         cpu_cmd.extend(["--seed", str(seed)])
-        cpu_cmd.extend(["--edit-dir", edit_dir or "2d_edits"])
+        cpu_cmd.extend(["--edit-dir", edit_dir])
         cpu_cmd.extend(["--results-name", cpu_res_name])
         cpu_cmd.extend(["--edit-ids-file", str(cpu_ids_path)])
         cpu_cmd.append("--no-2d-edit")
@@ -1098,8 +1136,12 @@ def main():
     target_shard = _normalize_shard(
         args.shard or ((cfg.get("data", {}).get("shards") or [None])[0])
     )
-    if target_shard:
-        cfg.setdefault("data", {})["shards"] = [target_shard]
+    if not target_shard:
+        raise ValueError(
+            "[CONFIG_ERROR] data.shards <missing> config "
+            "batch pipeline requires explicit shard (config or --shard)"
+        )
+    cfg.setdefault("data", {})["shards"] = [target_shard]
 
     normalize_cache_dirs(cfg)
     set_attn_backend(cfg)

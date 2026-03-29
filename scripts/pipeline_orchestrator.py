@@ -101,17 +101,28 @@ def run_selected_steps(ctx: dict, *, args, cfg, logger, dataset, callbacks: dict
             edit_server_urls=image_edit_urls,
             auto_max_parallel=args.max_parallel,
         )
-        if edit_2d_dir:
-            manifest = Path(edit_2d_dir) / "manifest.jsonl"
-            stage_diagnostics["step3"] = callbacks["diagnose_step3"](manifest)
-            callbacks["write_stage_diag"](report_dir, "step3_2d_edit", stage_diagnostics["step3"])
-            callbacks["sync_manifest_link"](cfg, target_shard, "phase2_5", "2d_manifest.jsonl", manifest)
+        if not edit_2d_dir:
+            raise FileNotFoundError(
+                "[CONFIG_ERROR] phase2_5.manifest <missing> runtime "
+                "Step3 did not produce an output directory"
+            )
+        manifest = Path(edit_2d_dir) / "manifest.jsonl"
+        if not manifest.exists():
+            raise FileNotFoundError(
+                f"[CONFIG_ERROR] phase2_5.manifest {manifest} runtime missing after Step3"
+            )
+        stage_diagnostics["step3"] = callbacks["diagnose_step3"](manifest)
+        callbacks["write_stage_diag"](report_dir, "step3_2d_edit", stage_diagnostics["step3"])
+        callbacks["sync_manifest_link"](cfg, target_shard, "phase2_5", "2d_manifest.jsonl", manifest)
 
     edit_subdir = args.edit_dir
-    if not edit_subdir and run_token:
+    if not edit_subdir:
+        if not run_token:
+            raise ValueError(
+                "[CONFIG_ERROR] run_token <missing> runtime "
+                "Step4 requires non-empty run token (tag or shard token)"
+            )
         edit_subdir = f"2d_edits_{run_token}"
-    elif not edit_subdir:
-        edit_subdir = "2d_edits"
 
     results_path = None
     if 4 in steps:
@@ -164,9 +175,11 @@ def run_selected_steps(ctx: dict, *, args, cfg, logger, dataset, callbacks: dict
             callbacks["write_stage_diag"](report_dir, "step4_3d_edit", stage_diagnostics["step4"])
             callbacks["sync_manifest_link"](cfg, target_shard, "phase2_5", "edit_results.jsonl", Path(results_path))
 
-    if results_path is None:
-        p25_cfg = cfg.get("phase2_5", {})
-        results_path = Path(p25_cfg["cache_dir"]) / f"edit_results{ctx['token_suffix']}.jsonl"
+    if 5 in steps and (not results_path or not Path(results_path).exists()):
+        raise FileNotFoundError(
+            f"[CONFIG_ERROR] phase2_5.edit_results {results_path} runtime "
+            "Step5 requested but Step4 results are missing"
+        )
 
     scores_path = None
     if 5 in steps and results_path and Path(results_path).exists():
@@ -176,15 +189,11 @@ def run_selected_steps(ctx: dict, *, args, cfg, logger, dataset, callbacks: dict
             callbacks["write_stage_diag"](report_dir, "step5_quality", stage_diagnostics["step5"])
             callbacks["sync_manifest_link"](cfg, target_shard, "phase3", "vlm_scores.jsonl", Path(scores_path))
 
-    if scores_path is None and run_token:
-        p25_cfg = cfg.get("phase2_5", {})
-        cand = Path(p25_cfg["cache_dir"]) / f"phase3_{run_token}" / "vlm_scores.jsonl"
-        if cand.is_file():
-            scores_path = str(cand)
-            logger.info("Using existing quality scores: %s", scores_path)
-            stage_diagnostics["step5"] = callbacks["diagnose_step5"](cand)
-            callbacks["write_stage_diag"](report_dir, "step5_quality", stage_diagnostics["step5"])
-            callbacks["sync_manifest_link"](cfg, target_shard, "phase3", "vlm_scores.jsonl", cand)
+    if 6 in steps and (not scores_path or not Path(scores_path).exists()):
+        raise FileNotFoundError(
+            f"[CONFIG_ERROR] phase3.vlm_scores {scores_path} runtime "
+            "Step6 requested but quality scores are missing"
+        )
 
     export_path = None
     if 6 in steps:

@@ -55,17 +55,9 @@ COST = {
 # =========================================================================
 
 def resolve_api_key(cfg: dict) -> str:
-    """Resolve VLM API key from config, default.yaml, or env."""
-    import yaml
+    """Resolve VLM API key from current config or configured env var."""
     p0 = cfg.get("phase0", {})
     api_key = p0.get("vlm_api_key", "")
-
-    if not api_key:
-        default_path = PROJECT_ROOT / "configs" / "default.yaml"
-        if default_path.exists():
-            with open(default_path) as f:
-                dcfg = yaml.safe_load(f)
-            api_key = dcfg.get("phase0", {}).get("vlm_api_key", "")
 
     if not api_key:
         env_var = p0.get("vlm_api_key_env", "")
@@ -86,29 +78,20 @@ def apply_output_shard_layout(cfg: dict) -> None:
     If ``shards`` is empty or lists multiple shards, nesting is skipped and a
     warning is issued — use one shard per config run for per-shard outputs.
     """
-    import warnings
-
     data = cfg.get("data", {})
     if not data.get("output_by_shard"):
         return
     shards = data.get("shards")
     if not shards:
-        warnings.warn(
-            "output_by_shard is true but data.shards is empty; "
-            "skipping shard output subdirectory.",
-            UserWarning,
-            stacklevel=2,
+        raise ValueError(
+            "[CONFIG_ERROR] data.shards <missing> config "
+            "output_by_shard=true requires exactly one shard"
         )
-        return
     if len(shards) > 1:
-        warnings.warn(
-            "output_by_shard is true but data.shards has multiple entries; "
-            "skipping shard subdirectory. Use one shard per config run, or "
-            "set output_by_shard: false.",
-            UserWarning,
-            stacklevel=2,
+        raise ValueError(
+            "[CONFIG_ERROR] data.shards multiple config "
+            "output_by_shard=true requires exactly one shard"
         )
-        return
     shard = str(shards[0]).strip()
     if not shard:
         return
@@ -172,15 +155,25 @@ def create_dataset(cfg: dict) -> PartCraftDataset:
 
 
 def resolve_data_dirs(cfg: dict) -> tuple[str | None, str | None]:
-    """Return (slat_dir, img_enc_dir) from config data section.
+    """Return strict (slat_dir, img_enc_dir) from config data section.
 
     Reads optional fields:
         data.slat_dir     — pre-encoded SLAT ({obj_id}_feats.pt / _coords.pt)
         data.img_enc_dir  — Blender render outputs ({obj_id}/000.png .. voxels.ply)
 
-    Both default to None (TrellisRefiner falls back to partobjaverse_tiny paths).
+    Both keys are required; missing keys raise ValueError.
     """
     data_cfg = cfg.get("data", {})
-    slat_dir    = data_cfg.get("slat_dir", None)
+    slat_dir = data_cfg.get("slat_dir", None)
     img_enc_dir = data_cfg.get("img_enc_dir", None)
+    if not slat_dir:
+        raise ValueError(
+            "[CONFIG_ERROR] data.slat_dir <missing> config "
+            "must be set explicitly; no runtime fallback is allowed"
+        )
+    if not img_enc_dir:
+        raise ValueError(
+            "[CONFIG_ERROR] data.img_enc_dir <missing> config "
+            "must be set explicitly; no runtime fallback is allowed"
+        )
     return slat_dir, img_enc_dir
