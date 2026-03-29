@@ -196,7 +196,6 @@ flowchart TD
 2. 编辑路径
 3. `SHARD=01 bash scripts/tools/run_shard_batch_pipeline.sh`
 
-<<<<<<< HEAD
 当前仓库已提供：
 
 - `configs/machine/node39.env`
@@ -223,12 +222,11 @@ bash scripts/tools/setup_pipeline_env.sh
 bash scripts/tools/setup_deploy_env.sh --check
 bash scripts/tools/setup_pipeline_env.sh --check
 ```
-=======
+
 本机适配示例：
 
-- `configs/machine/aibox-rd3996bf91f9-5df5c6c589-c2zct.env`
+- `configs/machine/wm1A800.env`
 - 路径根统一到 `/mnt/cfs/vffey4/3dedit`（`ckpts` / `data/partverse` / `outputs/partverse`）
->>>>>>> b09b561 (commit downlaod)
 
 ### 环境变量
 

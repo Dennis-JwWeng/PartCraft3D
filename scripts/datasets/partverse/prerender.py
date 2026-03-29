@@ -46,6 +46,7 @@ import json
 import logging
 import os
 import sys
+import uuid
 from pathlib import Path
 
 _PROJECT_ROOT  = Path(__file__).resolve().parents[3]
@@ -63,6 +64,26 @@ from scripts.datasets.prerender_common import (
     run_render,
     select_shard,
 )
+
+DEBUG_LOG_PATH = Path("/root/workspace/zsn/PartCraft3D/.cursor/debug-094e23.log")
+DEBUG_SESSION_ID = "094e23"
+DEBUG_RUN_ID = os.environ.get("PARTCRAFT_DEBUG_RUN_ID", "prerender-run")
+
+
+def _debug_log(hypothesis_id: str, location: str, message: str, data: dict):
+    payload = {
+        "sessionId": DEBUG_SESSION_ID,
+        "runId": DEBUG_RUN_ID,
+        "hypothesisId": hypothesis_id,
+        "id": f"log_{uuid.uuid4().hex[:12]}",
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(__import__("time").time() * 1000),
+    }
+    DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with DEBUG_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +206,14 @@ def main():
                              "Should not exceed the number of available GPUs.")
     args = parser.parse_args()
 
+    # region agent log
+    _debug_log(
+        "H1",
+        "scripts/datasets/partverse/prerender.py:main:pre-load-config",
+        "starting prerender config load",
+        {"config": args.config, "shard": args.shard, "num_shards": args.num_shards},
+    )
+    # endregion
     cfg = load_config(args.config, for_prerender=True, prerender_mode="partverse")
     logger = setup_logging(cfg, "prerender_partverse")
 
@@ -202,6 +231,21 @@ def main():
     slat_root_dir = Path(paths["slat_dir"])
     images_dir = Path(paths["images_npz_dir"])
     mesh_dir = Path(paths["mesh_npz_dir"])
+    # region agent log
+    _debug_log(
+        "H1",
+        "scripts/datasets/partverse/prerender.py:main:post-load-config",
+        "resolved key paths",
+        {
+            "ckpt_root": str(cfg.get("ckpt_root", "")),
+            "dataset_root": str(partverse_dir),
+            "source_glb_dir": str(glb_dir),
+            "captions_json": str(captions_path),
+            "img_enc_dir": str(img_enc_dir),
+            "slat_dir": str(slat_root_dir),
+        },
+    )
+    # endregion
 
     if not glb_dir.exists():
         raise FileNotFoundError(f"Missing paths.source_glb_dir: {glb_dir}")
@@ -236,6 +280,14 @@ def main():
                     f"[CONFIG_ERROR] shard.{shard} empty runtime "
                     f"num_shards={args.num_shards} produces zero objects"
                 )
+            # region agent log
+            _debug_log(
+                "H2",
+                "scripts/datasets/partverse/prerender.py:main:shard-selection",
+                "selected shard objects",
+                {"shard": shard, "num_shards": args.num_shards, "selected_count": len(obj_ids)},
+            )
+            # endregion
         else:
             obj_ids = all_ids
             shard = "00"
@@ -281,8 +333,38 @@ def main():
 
     # ---- Multi-GPU encode shortcut ----
     if args.num_gpus > 1 and do_encode:
-        extra_shard_args = ["--shard", shard, "--num-shards", str(args.num_shards)]
+        # region agent log
+        _debug_log(
+            "H3",
+            "scripts/datasets/partverse/prerender.py:main:multi-gpu-entry",
+            "entering multi-gpu encode path",
+            {
+                "num_gpus": args.num_gpus,
+                "render_workers": args.render_workers,
+                "do_render": do_render,
+                "do_encode": do_encode,
+                "do_pack": do_pack,
+                "obj_count": len(obj_ids),
+            },
+        )
+        # endregion
+        extra_shard_args = [
+            "--config",
+            args.config,
+            "--shard",
+            shard,
+            "--num-shards",
+            str(args.num_shards),
+        ]
         if do_render:
+            # region agent log
+            _debug_log(
+                "H4",
+                "scripts/datasets/partverse/prerender.py:main:before-run-render",
+                "about to launch render workers",
+                {"render_workers": args.render_workers, "obj_count": len(obj_ids)},
+            )
+            # endregion
             run_render(
                 obj_ids,
                 lambda oid: _glb_getter(glb_dir, oid),
@@ -295,11 +377,35 @@ def main():
                 extra_worker_args=extra_shard_args,
                 dataset_root=partverse_dir,
             )
+            # region agent log
+            _debug_log(
+                "H4",
+                "scripts/datasets/partverse/prerender.py:main:after-run-render",
+                "render stage returned",
+                {"render_workers": args.render_workers, "obj_count": len(obj_ids)},
+            )
+            # endregion
+        # region agent log
+        _debug_log(
+            "H5",
+            "scripts/datasets/partverse/prerender.py:main:before-launch-multi-gpu-encode",
+            "about to launch multi-gpu encode",
+            {"num_gpus": args.num_gpus, "obj_count": len(obj_ids)},
+        )
+        # endregion
         launch_multi_gpu_encode(obj_ids, slat_shard_dir,
                                 Path(__file__).resolve(),
                                 args.num_gpus, args.force, logger,
                                 extra_args=extra_shard_args,
                                 dataset_root=partverse_dir)
+        # region agent log
+        _debug_log(
+            "H5",
+            "scripts/datasets/partverse/prerender.py:main:after-launch-multi-gpu-encode",
+            "multi-gpu encode returned",
+            {"num_gpus": args.num_gpus, "obj_count": len(obj_ids)},
+        )
+        # endregion
         if do_pack:
             _run_pack(
                 obj_ids,
@@ -316,7 +422,14 @@ def main():
 
     # ---- Step 1: Render ----
     if do_render:
-        extra_worker_args = ["--shard", shard, "--num-shards", str(args.num_shards)]
+        extra_worker_args = [
+            "--config",
+            args.config,
+            "--shard",
+            shard,
+            "--num-shards",
+            str(args.num_shards),
+        ]
         run_render(
             obj_ids,
             lambda oid: _glb_getter(glb_dir, oid),

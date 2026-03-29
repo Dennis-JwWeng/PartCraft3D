@@ -87,7 +87,7 @@ init_conda() {
 ensure_env_exists() {
   local env_name="$1"
   local python_version="${2:-3.10}"
-  if conda env list | awk '{print $1}' | rg -xq "${env_name}"; then
+  if conda env list | awk -v env="${env_name}" '$1 == env { found=1 } END { exit(found ? 0 : 1) }'; then
     echo "[INFO] Conda env exists: ${env_name}"
   else
     echo "[INFO] Creating conda env: ${env_name} (python=${python_version})"

@@ -518,14 +518,20 @@ def main(arg):
             # Blender 4.x: disable non-geometry data to avoid PLY header tokens
             # (custom attribute names like 'pm0017_00_01') that break Open3D's
             # RPly parser.
-            bpy.ops.wm.ply_export(
-                filepath=ply_path,
-                export_selected_objects=False,
-                export_uv=False,
-                export_normals=False,
-                export_colors='NONE',
-                export_attributes=False,
-            )
+            try:
+                bpy.ops.wm.ply_export(
+                    filepath=ply_path,
+                    export_selected_objects=False,
+                    export_uv=False,
+                    export_normals=False,
+                    export_colors='NONE',
+                    export_attributes=False,
+                )
+            except Exception as e:
+                # Some builds expose bpy.ops.wm.ply_export symbol but do not
+                # register the operator at runtime. Fall back to legacy export.
+                print(f"[WARN] wm.ply_export unavailable ({e}), fallback to export_mesh.ply")
+                bpy.ops.export_mesh.ply(filepath=ply_path)
         else:
             bpy.ops.export_mesh.ply(filepath=ply_path)
 

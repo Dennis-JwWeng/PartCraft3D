@@ -1,6 +1,5 @@
 # AI_LOG
 
-<<<<<<< HEAD
 ## 2026-03-29 — Config 驱动与显式失败（预渲染 + 管线）
 
 ### 改动
@@ -45,18 +44,18 @@ bash scripts/tools/setup_pipeline_env.sh
 
 ### 边界
 - 当前版本只做 conda/python 依赖安装与校验，不包含 checkpoint/权重下载。
-=======
+
 ## 2026-03-29 — PartVerse 本机预渲染与管线适配（/mnt/cfs）
 
 ### 改动
-- 新增 `configs/machine/aibox-rd3996bf91f9-5df5c6c589-c2zct.env`，将 batch 运行器所需路径统一切到本机：
+- 新增 `configs/machine/wm1A800.env`，将 batch 运行器所需路径统一切到本机：
   - `VLM_CKPT=/mnt/cfs/vffey4/3dedit/ckpts/Qwen3.5-27B`
   - `EDIT_CKPT=/mnt/cfs/vffey4/3dedit/ckpts/FLUX.2-klein-9B`
   - `TRELLIS_CKPT_ROOT=/mnt/cfs/vffey4/3dedit/ckpts`
   - `DATA_DIR=/mnt/cfs/vffey4/3dedit/data/partverse`
   - `OUTPUT_ROOT=/mnt/cfs/vffey4/3dedit/outputs/partverse`
-- 新增 `configs/partverse_aibox_shard00.yaml`，作为本机 shard00 的 batch 配置模板（ckpt/data/output 全部指向 `/mnt/cfs/vffey4/3dedit`）。
-- 新增 `configs/prerender_partverse_aibox.yaml`，用于本机 PartVerse 预渲染，显式绑定：
+- 新增 `configs/partverse_wm1A800_shard00.yaml`，作为本机 shard00 的 batch 配置模板（ckpt/data/output 全部指向 `/mnt/cfs/vffey4/3dedit`）。
+- 新增 `configs/prerender_partverse_wm1A800.yaml`，用于本机 PartVerse 预渲染，显式绑定：
   - `paths.source_glb_dir=/mnt/cfs/vffey4/3dedit/data/partverse/source/normalized_glbs`
   - `paths.captions_json=/mnt/cfs/vffey4/3dedit/data/partverse/source/text_captions.json`
 - 新增 `scripts/tools/download_local_missing_weights.sh`：
@@ -68,7 +67,6 @@ bash scripts/tools/setup_pipeline_env.sh
 ### 目的
 - 将 node39 历史路径（`/Node11_nvme/...`）从本机运行路径中剥离，保证当前机器开箱可跑。
 - 为“缺 VLM + 图像编辑权重”的场景提供统一下载入口，减少手工操作和路径不一致问题。
->>>>>>> b09b561 (commit downlaod)
 
 ## 2026-03-28 — Batch 管线配置化 & node39 适配
 
