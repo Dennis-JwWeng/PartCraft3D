@@ -168,11 +168,14 @@ def _write_merged_jsonl(
 
 
 def _mesh_pair_stats(mesh_pairs_dir: Path) -> tuple[int, int]:
-    """Return (dirs_with_after_ply, total_subdirs)."""
+    """Return (dirs_with_after_artifact, total_subdirs)."""
     if not mesh_pairs_dir.is_dir():
         return 0, 0
     subdirs = [d for d in mesh_pairs_dir.iterdir() if d.is_dir()]
-    with_after = sum(1 for d in subdirs if (d / "after.ply").is_file())
+    with_after = sum(
+        1 for d in subdirs
+        if (d / "after.ply").is_file() or (d / "after_slat").is_dir()
+    )
     return with_after, len(subdirs)
 
 

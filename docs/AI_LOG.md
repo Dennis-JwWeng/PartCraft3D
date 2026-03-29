@@ -1,5 +1,24 @@
 # AI_LOG
 
+## 2026-03-30 — Step4 默认不落盘 PLY（保留可选导出）
+
+### 改动
+- `phase2_5` 新增导出开关：
+  - `export_ply: false`（默认关闭 GPU 编辑的 `before.ply/after.ply` 落盘）
+  - `export_ply_for_deletion: true`（默认保留 deletion 的 GT mesh PLY，保证兼容链路）
+- `partcraft/phase2_assembly/trellis_refine.py`：
+  - `export_pair()` / `export_pair_shared_before()` 改为始终写 `before_slat/after_slat`，仅在 `export_ply=true` 时写 PLY
+  - `direct_delete_mesh()` 增加 `export_ply` 参数（支持按配置关闭 deletion PLY）
+- `scripts/pipeline_step_3d.py` 与 `partcraft/streaming_lookahead.py`：
+  - 透传 `export_ply` / `export_ply_for_deletion`
+  - identity 逻辑从“必须有 before.ply”调整为“before_slat 或 before.ply 均可”
+- `scripts/merge_streaming_workers.py`：
+  - mesh pair 完成统计从仅检测 `after.ply` 扩展为 `after.ply` 或 `after_slat`
+
+### 目的
+- 将 `mesh_pairs` 的磁盘占用从“PLY 主导”切换为“SLAT 主导”，默认显著降低单 shard 存储压力；
+- 同时保留显式开关，便于在需要 mesh 预筛/可视化时恢复 PLY 导出。
+
 ## 2026-03-29 — Config 驱动与显式失败（预渲染 + 管线）
 
 ### 改动

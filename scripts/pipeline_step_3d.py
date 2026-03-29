@@ -298,6 +298,13 @@ def process_object_edits(
     for spec in pending:
         obj_groups.setdefault(spec.obj_id, []).append(spec)
 
+    export_ply = bool(p25_cfg.get("export_ply", False))
+    export_ply_for_deletion = bool(p25_cfg.get("export_ply_for_deletion", True))
+    logger.info(
+        "Step4 export_ply=%s, export_ply_for_deletion=%s",
+        export_ply,
+        export_ply_for_deletion,
+    )
     success, fail = 0, 0
     glb_tmp_dir = tempfile.mkdtemp(prefix="partcraft_glb_")
     with open(output_path, "a", encoding="utf-8") as out_fp:
@@ -361,7 +368,12 @@ def process_object_edits(
                 logger.info('\n[%d/%d] %s (%s): "%s"', success + fail + 1, len(pending), spec.edit_id, spec.edit_type, spec.edit_prompt[:80])
                 try:
                     pair_dir = mesh_pairs_dir / spec.edit_id
-                    export_paths = TrellisRefiner.direct_delete_mesh(obj_record, spec.remove_part_ids, pair_dir)
+                    export_paths = TrellisRefiner.direct_delete_mesh(
+                        obj_record,
+                        spec.remove_part_ids,
+                        pair_dir,
+                        export_ply=export_ply_for_deletion,
+                    )
                     write_step4_record(out_fp, {
                         "edit_id": spec.edit_id,
                         "edit_type": spec.edit_type,
@@ -428,7 +440,27 @@ def process_object_edits(
                         continue
 
                     step_refiner = ensure_refiner()
-                    mask, effective_type = step_refiner.build_part_mask(obj_id, obj_record, edit_part_ids, ori_slat, edit_type)
+                    large_part_threshold = float(
+                        p25_cfg.get("large_part_threshold", 0.35)
+                    )
+                    scale_large_part_threshold_cfg = p25_cfg.get("scale_large_part_threshold")
+                    scale_large_part_threshold = (
+                        float(scale_large_part_threshold_cfg)
+                        if scale_large_part_threshold_cfg is not None
+                        else None
+                    )
+                    mask, effective_type = step_refiner.build_part_mask(
+                        obj_id,
+                        obj_record,
+                        edit_part_ids,
+                        ori_slat,
+                        edit_type,
+                        large_part_threshold=large_part_threshold,
+                        promote_scale_to_global=bool(
+                            p25_cfg.get("promote_scale_to_global", False)
+                        ),
+                        scale_large_part_threshold=scale_large_part_threshold,
+                    )
                     if effective_type != edit_type:
                         logger.info("  Auto-promoted %s -> %s (large part)", edit_type, effective_type)
                         edit_type = effective_type
@@ -472,7 +504,12 @@ def process_object_edits(
                         raise RuntimeError("No edited SLATs produced")
                     best_slat = slats_edited[0]
                     pair_dir = mesh_pairs_dir / spec.edit_id
-                    export_paths = step_refiner.export_pair(ori_slat, best_slat, pair_dir)
+                    export_paths = step_refiner.export_pair(
+                        ori_slat,
+                        best_slat,
+                        pair_dir,
+                        export_ply=export_ply,
+                    )
                     write_step4_record(out_fp, {
                         "edit_id": spec.edit_id,
                         "edit_type": spec.edit_type,
@@ -499,13 +536,16 @@ def process_object_edits(
 
             for spec in idt_specs:
                 idt_pair = mesh_pairs_dir / spec.edit_id
-                if first_pair_dir and (first_pair_dir / "before.ply").exists():
+                has_before_ply = bool(first_pair_dir and (first_pair_dir / "before.ply").exists())
+                has_before_slat = bool(first_pair_dir and (first_pair_dir / "before_slat").exists())
+                if has_before_ply or has_before_slat:
                     idt_pair.mkdir(parents=True, exist_ok=True)
-                    before_ply = first_pair_dir / "before.ply"
-                    shutil.copy2(str(before_ply), str(idt_pair / "before.ply"))
-                    shutil.copy2(str(before_ply), str(idt_pair / "after.ply"))
-                    before_slat = first_pair_dir / "before_slat"
-                    if before_slat.exists():
+                    if has_before_ply:
+                        before_ply = first_pair_dir / "before.ply"
+                        shutil.copy2(str(before_ply), str(idt_pair / "before.ply"))
+                        shutil.copy2(str(before_ply), str(idt_pair / "after.ply"))
+                    if has_before_slat:
+                        before_slat = first_pair_dir / "before_slat"
                         for slat_name in ("before_slat", "after_slat"):
                             dst = idt_pair / slat_name
                             if dst.exists():
@@ -524,7 +564,7 @@ def process_object_edits(
                     write_step4_record(out_fp, {
                         "edit_id": spec.edit_id,
                         "status": "failed",
-                        "reason": "No before mesh available for identity",
+                        "reason": "No before artifact available for identity",
                     })
                     fail += 1
             if obj_record is not None:

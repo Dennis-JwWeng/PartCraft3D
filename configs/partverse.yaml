@@ -75,6 +75,8 @@ phase2_5:
   enabled: true
   trellis_text_ckpt: "checkpoints/TRELLIS-text-xlarge"
   trellis_image_ckpt: "checkpoints/TRELLIS-image-large"
+  export_ply: false
+  export_ply_for_deletion: true
   num_combinations: 2
   seed: 42
   cache_dir: "cache/phase2_5"

@@ -65,6 +65,8 @@ def run_streaming_with_lookahead(
     import tempfile
 
     local_edit_url = ""
+    export_ply = bool(p25.get("export_ply", False))
+    export_ply_for_deletion = bool(p25.get("export_ply_for_deletion", True))
     if args.use_2d and image_edit_backend == "local_diffusers":
         local_edit_url = str(p25.get("image_edit_base_url", "")).strip()
         if not local_edit_url:
@@ -305,7 +307,11 @@ def run_streaming_with_lookahead(
                             TrellisRefiner)
                         pair_dir = mesh_pairs_dir / spec.edit_id
                         export_paths = TrellisRefiner.direct_delete_mesh(
-                            obj_record, spec.remove_part_ids, pair_dir)
+                            obj_record,
+                            spec.remove_part_ids,
+                            pair_dir,
+                            export_ply=export_ply_for_deletion,
+                        )
                         rec = {
                             "edit_id": spec.edit_id,
                             "edit_type": spec.edit_type,
@@ -460,7 +466,9 @@ def run_streaming_with_lookahead(
                     pair_dir = mesh_pairs_dir / spec.edit_id
                     export_paths = refiner.export_pair_shared_before(
                         ori_slat, slats_edited[0], pair_dir,
-                        shared_before_dir=first_pair_dir)
+                        shared_before_dir=first_pair_dir,
+                        export_ply=export_ply,
+                    )
 
                     rec = {
                         "edit_id": spec.edit_id,
@@ -534,15 +542,18 @@ def run_streaming_with_lookahead(
                 if spec.edit_id in done_edits:
                     continue
                 idt_pair = mesh_pairs_dir / spec.edit_id
-                if first_pair_dir and (first_pair_dir / "before.ply").exists():
+                has_before_ply = bool(first_pair_dir and (first_pair_dir / "before.ply").exists())
+                has_before_slat = bool(first_pair_dir and (first_pair_dir / "before_slat").exists())
+                if has_before_ply or has_before_slat:
                     idt_pair.mkdir(parents=True, exist_ok=True)
-                    before_ply = first_pair_dir / "before.ply"
-                    shutil.copy2(str(before_ply),
-                                 str(idt_pair / "before.ply"))
-                    shutil.copy2(str(before_ply),
-                                 str(idt_pair / "after.ply"))
-                    before_slat = first_pair_dir / "before_slat"
-                    if before_slat.exists():
+                    if has_before_ply:
+                        before_ply = first_pair_dir / "before.ply"
+                        shutil.copy2(str(before_ply),
+                                     str(idt_pair / "before.ply"))
+                        shutil.copy2(str(before_ply),
+                                     str(idt_pair / "after.ply"))
+                    if has_before_slat:
+                        before_slat = first_pair_dir / "before_slat"
                         for _slat_name in ("before_slat", "after_slat"):
                             _dst = idt_pair / _slat_name
                             if _dst.exists():
@@ -564,7 +575,7 @@ def run_streaming_with_lookahead(
                 else:
                     res_fp.write(json.dumps({
                         "edit_id": spec.edit_id, "status": "failed",
-                        "reason": "No before mesh available for identity",
+                        "reason": "No before artifact available for identity",
                     }, ensure_ascii=False) + "\n")
                     res_fp.flush()
                     total_fail += 1

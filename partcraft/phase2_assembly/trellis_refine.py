@@ -349,6 +349,8 @@ class TrellisRefiner:
         slat,
         edit_type: str = "Modification",
         large_part_threshold: float = 0.35,
+        promote_scale_to_global: bool = False,
+        scale_large_part_threshold: float | None = None,
     ) -> tuple[torch.Tensor, str]:
         """Build 64x64x64 voxel mask from HY3D-Part ground-truth parts.
 
@@ -490,19 +492,37 @@ class TrellisRefiner:
                 f"reliable editing at 64³ resolution.")
 
         # ---- Large part auto-promotion to Global ----
-        # If the edit part covers >threshold of SLAT voxels, part-level
-        # del/mod will cause severe artifacts (too much geometry removed).
-        # Promote to Global: full mask + Inverse Flow preserves structure,
-        # TRELLIS regenerates the whole object guided by the edit prompt.
+        # Modification keeps the historical behavior: very large local edits
+        # are promoted to global to avoid severe artifacts.
+        # Scale is handled separately because auto-promotion often suppresses
+        # part-level resize intent; disabled by default, opt-in via config.
         n_slat_total = slat.coords.shape[0]
         if n_slat_total > 0 and edit_type in ("Modification", "Scale"):
             part_ratio = n_edit_slat / n_slat_total
-            if part_ratio > large_part_threshold:
+            if edit_type == "Modification" and part_ratio > large_part_threshold:
                 logger.warning(
                     f"Large part detected: edit covers {part_ratio:.1%} of "
                     f"SLAT voxels (>{large_part_threshold:.0%} threshold). "
                     f"Promoting {edit_type} → Global to avoid severe artifacts.")
                 edit_type = "Global"
+            elif edit_type == "Scale":
+                scale_threshold = (
+                    scale_large_part_threshold
+                    if scale_large_part_threshold is not None
+                    else max(large_part_threshold, 0.60)
+                )
+                if promote_scale_to_global and part_ratio > scale_threshold:
+                    logger.warning(
+                        f"Large scale region: edit covers {part_ratio:.1%} of "
+                        f"SLAT voxels (>{scale_threshold:.0%} threshold). "
+                        "Promoting Scale → Global by configuration.")
+                    edit_type = "Global"
+                elif (not promote_scale_to_global) and part_ratio > large_part_threshold:
+                    logger.info(
+                        "Large scale region detected (%.1f%% of SLAT voxels) "
+                        "but keeping Scale local (promote_scale_to_global=false).",
+                        part_ratio * 100.0,
+                    )
 
         # ---- Build final mask per edit type ----
         # Strategy: keep the hard mask tight (just the edit part itself),
@@ -1104,12 +1124,13 @@ class TrellisRefiner:
         obj_record,
         remove_part_ids: list[int],
         output_dir: str | Path,
+        *,
+        export_ply: bool = True,
     ) -> dict:
         """Delete parts by assembling remaining GT meshes directly.
 
         No SLAT encoding, no generation — just removes the target parts
-        from the ground-truth mesh and exports before/after PLY with
-        original vertex colors preserved.
+        from the ground-truth mesh. PLY export is optional.
 
         Returns dict of exported file paths.
         """
@@ -1130,26 +1151,29 @@ class TrellisRefiner:
                     f"{remove_part_ids} ({n_remove}/{n_all}), "
                     f"keeping {n_keep} parts")
 
-        # Before: full mesh with all parts
-        before_mesh = obj_record.get_assembled_mesh(
-            all_part_ids, colored=True)
-        before_path = output_dir / "before.ply"
-        before_mesh.export(str(before_path))
-        paths['before_ply'] = str(before_path)
+        if export_ply:
+            # Before: full mesh with all parts
+            before_mesh = obj_record.get_assembled_mesh(
+                all_part_ids, colored=True)
+            before_path = output_dir / "before.ply"
+            before_mesh.export(str(before_path))
+            paths['before_ply'] = str(before_path)
 
-        # After: remaining parts only
-        if keep_ids:
-            after_mesh = obj_record.get_assembled_mesh(
-                keep_ids, colored=True)
+            # After: remaining parts only
+            if keep_ids:
+                after_mesh = obj_record.get_assembled_mesh(
+                    keep_ids, colored=True)
+            else:
+                logger.warning("DirectDeletion: all parts removed!")
+                after_mesh = _trimesh.Trimesh()
+            after_path = output_dir / "after.ply"
+            after_mesh.export(str(after_path))
+            paths['after_ply'] = str(after_path)
+
+            logger.info(f"Exported GT mesh pair: before={before_path}, "
+                        f"after={after_path}")
         else:
-            logger.warning("DirectDeletion: all parts removed!")
-            after_mesh = _trimesh.Trimesh()
-        after_path = output_dir / "after.ply"
-        after_mesh.export(str(after_path))
-        paths['after_ply'] = str(after_path)
-
-        logger.info(f"Exported GT mesh pair: before={before_path}, "
-                    f"after={after_path}")
+            logger.info("Skipping GT mesh PLY export")
         return paths
 
     def edit(
@@ -1258,8 +1282,10 @@ class TrellisRefiner:
         slat_before,
         slat_edited,
         output_dir: str | Path,
+        *,
+        export_ply: bool = False,
     ) -> dict:
-        """Export before/after pair as Gaussian PLY only.
+        """Export before/after pair as SLAT, optionally PLY.
 
         Multiview rendering and video generation are decoupled into
         scripts/vis/render_gs_pairs.py for faster editing throughput.
@@ -1269,21 +1295,20 @@ class TrellisRefiner:
         paths = {}
 
         for tag, slat in [('before', slat_before), ('after', slat_edited)]:
-            gaussian = self.decode_to_gaussian(slat)
-
-            # Save Gaussian PLY
-            ply_path = output_dir / f"{tag}.ply"
-            gaussian.save_ply(str(ply_path))
-            paths[f'{tag}_ply'] = str(ply_path)
-
-            # Save SLAT for visualization tool
             slat_path = output_dir / f"{tag}_slat"
             slat_path.mkdir(parents=True, exist_ok=True)
             torch.save(slat.feats, slat_path / "feats.pt")
             torch.save(slat.coords, slat_path / "coords.pt")
             paths[f'{tag}_slat'] = str(slat_path)
 
-            logger.info(f"Exported {tag}: {ply_path}")
+            if export_ply:
+                gaussian = self.decode_to_gaussian(slat)
+                ply_path = output_dir / f"{tag}.ply"
+                gaussian.save_ply(str(ply_path))
+                paths[f'{tag}_ply'] = str(ply_path)
+                logger.info(f"Exported {tag}: slat + {ply_path}")
+            else:
+                logger.info(f"Exported {tag}: slat only")
 
         return paths
 
@@ -1293,6 +1318,8 @@ class TrellisRefiner:
         slat_edited,
         output_dir: str | Path,
         shared_before_dir: str | Path | None = None,
+        *,
+        export_ply: bool = False,
     ) -> dict:
         """Export before/after pair, reusing a shared 'before' directory.
 
@@ -1311,58 +1338,64 @@ class TrellisRefiner:
             src_has_slat = (src / "before_slat").exists()
 
             if src_has_slat:
-                # Source has GS before — symlink both PLY and SLAT
-                before_ply = output_dir / "before.ply"
-                if not before_ply.exists():
-                    src_ply = src / "before.ply"
-                    if src_ply.exists():
-                        rel = os.path.relpath(src_ply, output_dir)
-                        before_ply.symlink_to(rel)
-                paths['before_ply'] = str(before_ply)
-
+                # Source has GS before — always reuse SLAT, optional PLY.
                 before_slat = output_dir / "before_slat"
                 if not before_slat.exists():
                     rel = os.path.relpath(src / "before_slat", output_dir)
                     before_slat.symlink_to(rel)
                 paths['before_slat'] = str(before_slat)
+                if export_ply:
+                    before_ply = output_dir / "before.ply"
+                    if not before_ply.exists():
+                        src_ply = src / "before.ply"
+                        if src_ply.exists():
+                            rel = os.path.relpath(src_ply, output_dir)
+                            before_ply.symlink_to(rel)
+                    if before_ply.exists():
+                        paths['before_ply'] = str(before_ply)
             else:
                 # Source has no SLAT (e.g. deletion used direct mesh
-                # removal).  Export GS before PLY + SLAT from scratch.
-                gaussian = self.decode_to_gaussian(slat_before)
-                ply_path = output_dir / "before.ply"
-                gaussian.save_ply(str(ply_path))
-                paths['before_ply'] = str(ply_path)
-
+                # removal). Export GS before SLAT and optional PLY.
                 before_slat = output_dir / "before_slat"
                 before_slat.mkdir(parents=True, exist_ok=True)
                 torch.save(slat_before.feats, before_slat / "feats.pt")
                 torch.save(slat_before.coords, before_slat / "coords.pt")
                 paths['before_slat'] = str(before_slat)
+                if export_ply:
+                    gaussian = self.decode_to_gaussian(slat_before)
+                    ply_path = output_dir / "before.ply"
+                    gaussian.save_ply(str(ply_path))
+                    paths['before_ply'] = str(ply_path)
         else:
-            # First edit for this object: export before
-            gaussian = self.decode_to_gaussian(slat_before)
-            ply_path = output_dir / "before.ply"
-            gaussian.save_ply(str(ply_path))
-            paths['before_ply'] = str(ply_path)
+            # First edit for this object: export before SLAT and optional PLY.
             slat_path = output_dir / "before_slat"
             slat_path.mkdir(parents=True, exist_ok=True)
             torch.save(slat_before.feats, slat_path / "feats.pt")
             torch.save(slat_before.coords, slat_path / "coords.pt")
             paths['before_slat'] = str(slat_path)
+            if export_ply:
+                gaussian = self.decode_to_gaussian(slat_before)
+                ply_path = output_dir / "before.ply"
+                gaussian.save_ply(str(ply_path))
+                paths['before_ply'] = str(ply_path)
 
-        # ---- After: always export ----
-        gaussian = self.decode_to_gaussian(slat_edited)
-        ply_path = output_dir / "after.ply"
-        gaussian.save_ply(str(ply_path))
-        paths['after_ply'] = str(ply_path)
+        # ---- After: always export SLAT, optional PLY ----
         slat_path = output_dir / "after_slat"
         slat_path.mkdir(parents=True, exist_ok=True)
         torch.save(slat_edited.feats, slat_path / "feats.pt")
         torch.save(slat_edited.coords, slat_path / "coords.pt")
         paths['after_slat'] = str(slat_path)
+        if export_ply:
+            gaussian = self.decode_to_gaussian(slat_edited)
+            ply_path = output_dir / "after.ply"
+            gaussian.save_ply(str(ply_path))
+            paths['after_ply'] = str(ply_path)
 
-        logger.info(f"Exported: after={ply_path}, "
-                    f"before={'shared' if shared_before_dir else 'new'}")
+        logger.info(
+            "Exported pair (%s before): slat%s",
+            "shared" if shared_before_dir else "new",
+            " + ply" if export_ply else "",
+        )
         return paths
 
     # ---- Utility ----
