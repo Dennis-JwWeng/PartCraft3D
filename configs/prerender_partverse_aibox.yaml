@@ -1,0 +1,29 @@
+# Portable prerender config (PartVerse) for aibox local paths.
+
+ckpt_root: "/mnt/cfs/vffey4/3dedit/ckpts"
+
+data:
+  data_dir: "/mnt/cfs/vffey4/3dedit/data/partverse"
+  derive_dataset_subpaths: true
+  output_dir: "/mnt/cfs/vffey4/3dedit/outputs/partverse"
+  shards: ["00"]
+  output_by_shard: false
+
+paths:
+  dataset_root: "/mnt/cfs/vffey4/3dedit/data/partverse"
+  source_glb_dir: "/mnt/cfs/vffey4/3dedit/data/partverse/source/normalized_glbs"
+  captions_json: "/mnt/cfs/vffey4/3dedit/data/partverse/source/text_captions.json"
+
+  img_enc_dir: "/mnt/cfs/vffey4/3dedit/data/partverse/img_Enc"
+  slat_dir: "/mnt/cfs/vffey4/3dedit/data/partverse/slat"
+  images_npz_dir: "/mnt/cfs/vffey4/3dedit/data/partverse/images"
+  mesh_npz_dir: "/mnt/cfs/vffey4/3dedit/data/partverse/mesh"
+  cache_root: "/mnt/cfs/vffey4/3dedit/data/partverse/cache"
+
+tools:
+  blender_path: "blender"
+  blender_script: "scripts/blender_render.py"
+
+logging:
+  level: "INFO"
+  log_dir: "logs/prerender_partverse"

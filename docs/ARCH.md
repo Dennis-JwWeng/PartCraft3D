@@ -196,6 +196,7 @@ flowchart TD
 2. 编辑路径
 3. `SHARD=01 bash scripts/tools/run_shard_batch_pipeline.sh`
 
+<<<<<<< HEAD
 当前仓库已提供：
 
 - `configs/machine/node39.env`
@@ -222,6 +223,12 @@ bash scripts/tools/setup_pipeline_env.sh
 bash scripts/tools/setup_deploy_env.sh --check
 bash scripts/tools/setup_pipeline_env.sh --check
 ```
+=======
+本机适配示例：
+
+- `configs/machine/aibox-rd3996bf91f9-5df5c6c589-c2zct.env`
+- 路径根统一到 `/mnt/cfs/vffey4/3dedit`（`ckpts` / `data/partverse` / `outputs/partverse`）
+>>>>>>> b09b561 (commit downlaod)
 
 ### 环境变量
 
@@ -251,6 +258,16 @@ CONDA_INIT, CONDA_ENV_SERVER, CONDA_ENV_PIPELINE
 VLM_CKPT, EDIT_CKPT, TRELLIS_CKPT_ROOT
 DATA_DIR, OUTPUT_ROOT
 ```
+
+### 权重下载与目录规范（本机）
+
+- 权重根目录建议固定为：`/mnt/cfs/vffey4/3dedit/ckpts`
+- 缺失本地推理权重时，使用：
+  - `bash scripts/tools/download_local_missing_weights.sh`
+- 脚本默认下载目录名与 machine env 对齐：
+  - `Qwen3.5-27B`
+  - `FLUX.2-klein-9B`
+- 可通过环境变量覆盖仓库与目标目录（`VLM_REPO_ID` / `EDIT_REPO_ID` / `PARTCRAFT_CKPT_ROOT`），无需修改代码。
 
 ## 后续演进规则
 
