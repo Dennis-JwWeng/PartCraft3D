@@ -1,5 +1,24 @@
 # AI_LOG
 
+## 2026-03-29 — 一键环境初始化脚本（分开部署/管线）
+
+### 改动
+- 新增 `scripts/tools/setup_deploy_env.sh`：初始化 `CONDA_ENV_SERVER`（VLM + image edit 服务依赖）
+- 新增 `scripts/tools/setup_pipeline_env.sh`：初始化 `CONDA_ENV_PIPELINE`（pipeline 依赖）
+- 新增 `scripts/tools/setup_env_common.sh`：统一参数解析与 machine env 加载逻辑，支持：
+  - `--machine-env <path>`
+  - `--check`（只校验不安装）
+  - `--reinstall`（强制重装 pip 依赖）
+
+### 使用方式
+```bash
+bash scripts/tools/setup_deploy_env.sh
+bash scripts/tools/setup_pipeline_env.sh
+```
+
+### 边界
+- 当前版本只做 conda/python 依赖安装与校验，不包含 checkpoint/权重下载。
+
 ## 2026-03-28 — Batch 管线配置化 & node39 适配
 
 ### 改动

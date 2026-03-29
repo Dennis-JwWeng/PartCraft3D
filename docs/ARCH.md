@@ -187,6 +187,28 @@ flowchart TD
 2. 编辑路径
 3. `SHARD=01 bash scripts/tools/run_shard_batch_pipeline.sh`
 
+### 环境初始化脚本（部署/管线分离）
+
+推荐先执行环境初始化，再运行 batch 管线：
+
+- `scripts/tools/setup_deploy_env.sh`
+  - 配置并校验 `CONDA_ENV_SERVER`（VLM + image edit 服务环境）
+  - 默认读取 `configs/machine/$(hostname).env`，可用 `--machine-env` 覆盖
+- `scripts/tools/setup_pipeline_env.sh`
+  - 配置并校验 `CONDA_ENV_PIPELINE`（`run_pipeline.py` / `run_streaming.py` 运行环境）
+  - 默认读取 `configs/machine/$(hostname).env`，可用 `--machine-env` 覆盖
+
+常用命令：
+
+```bash
+bash scripts/tools/setup_deploy_env.sh
+bash scripts/tools/setup_pipeline_env.sh
+
+# 仅检查 machine env 与 conda 激活，不安装依赖
+bash scripts/tools/setup_deploy_env.sh --check
+bash scripts/tools/setup_pipeline_env.sh --check
+```
+
 ### 环境变量
 
 | 变量 | 说明 | 示例 |
