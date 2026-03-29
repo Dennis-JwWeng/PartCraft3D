@@ -29,6 +29,26 @@
 
 输出遵循 shard 目录下 `pipeline/reports` 与 `pipeline/manifests`，保持 JSONL/resume 兼容。
 
+### Step1/Step4 中断恢复协议（2026-03-29 对齐）
+
+Step1 与 Step4 的多 worker 执行统一采用“先合并、再失败”的恢复语义，避免 worker crash 时已完成结果丢失：
+
+- `scripts/pipeline_dispatch.py`
+  - `wait_for_workers(..., fail_fast=False)` 支持返回失败 worker 列表，交由调用方先做 merge/reconcile 再决定是否中断。
+  - `discover_step1_worker_results()` 用于发现历史 `semantic_labels*_w*.jsonl` worker 产物。
+  - `reconcile_worker_results(...)` 作为 Step1/Step4 通用合并校验入口（`reconcile_step4_results` 保留兼容包装）。
+- `scripts/run_pipeline.py`
+  - `run_step_semantic_multi_gpu` 在分发前先合并历史 worker 产物并计算 pending；worker crash 时先 merge 再 raise。
+  - `run_step_3d_edit_multi_gpu` 同样改为 crash 时先 merge 再 raise。
+  - worker 子进程日志落盘到 `cache/phase0/worker_w{i}.log`（Step1）用于定位 crash 原因。
+
+### Step1 Prompt 生成职责（2026-03-29 对齐）
+
+Step1 的 prompt 生成分为“VLM 主生成 + 模板兜底”两层：
+
+- `partcraft/phase1_planning/enricher.py`：扩展 VLM 输出字段，新增 per-part `scale_edits`，并增强 `materials` 与 `global_edits` 的多样性指令。
+- `partcraft/phase1_planning/planner.py`：接入 `type=="scale"` 与 VLM material/scale 结果，仅对未覆盖 part 应用模板 fallback。
+
 ## Streaming 流程职责
 
 `scripts/run_streaming.py` 负责对象级流式处理，面向吞吐优先场景。与 batch 共用核心 phase 模块与 Step4 TRELLIS 能力。

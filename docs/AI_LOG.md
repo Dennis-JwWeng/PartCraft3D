@@ -71,3 +71,7 @@ w0-w3 已完成的 960 条结果散落在 worker 文件中，重启时会被 unl
 - VLM 发挥创造力生成 material/scale/global prompt，不再受限于固定模板
 - 模板仅作为 VLM 未覆盖 part 的兜底
 - 需重跑 Phase 0（Step 1）使新 prompt 格式生效
+
+### 架构对齐说明
+- `docs/ARCH.md` 已同步补充 Step1/Step4 的中断恢复协议（`wait_for_workers` / `reconcile_worker_results` / 先 merge 再 raise）
+- `docs/ARCH.md` 已同步补充 Step1 Prompt 责任边界：`enricher.py` 负责 VLM 生成，`planner.py` 负责接入与模板兜底
