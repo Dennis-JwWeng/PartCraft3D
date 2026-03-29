@@ -182,6 +182,10 @@ def plan_edits_for_record(record: dict, cfg: dict,
 
     has_group_edits = bool(record.get("group_edits"))
 
+    # Track which parts already have VLM-generated material/scale edits
+    vlm_material_pids: set[int] = set()
+    vlm_scale_pids: set[int] = set()
+
     # --- Group edits (if present, skip per-part for those parts) ---
     group_part_ids: set[int] = set()
     for grp in record.get("group_edits", []):
@@ -270,6 +274,25 @@ def plan_edits_for_record(record: dict, cfg: dict,
                     best_view=grp_best_view,
                 ))
                 _counters["mat"] += 1
+                vlm_material_pids.update(grp_pids)
+            elif etype == "scale":
+                specs.append(EditSpec(
+                    edit_id=_make_edit_id("scl", obj_id, _counters["scl"]),
+                    edit_type=SCALE,
+                    obj_id=obj_id, shard=shard,
+                    object_desc=obj_desc, before_desc=obj_desc,
+                    old_part_id=grp_pids[0] if grp_pids else -1,
+                    old_label=grp_labels[0] if grp_labels else "",
+                    keep_part_ids=keep_pids,
+                    edit_prompt=edit.get("prompt", ""),
+                    after_desc=obj_desc,
+                    before_part_desc=edit.get("before_part_desc", grp_desc),
+                    after_part_desc=edit.get("after_part_desc", ""),
+                    mod_type="scale",
+                    best_view=grp_best_view,
+                ))
+                _counters["scl"] += 1
+                vlm_scale_pids.update(grp_pids)
 
     # --- Per-part edits (deletion / addition / modification) ---
     for part in parts:
@@ -345,6 +368,50 @@ def plan_edits_for_record(record: dict, cfg: dict,
             ))
             _counters["mod"] += 1
 
+        # Per-part VLM-generated material edits
+        mat_edits = [e for e in part_edits
+                     if e.get("type") == "material" and e.get("prompt")]
+        for mat_edit in mat_edits:
+            part_phrase = _record_part_prompt_name(part)
+            specs.append(EditSpec(
+                edit_id=_make_edit_id("mat", obj_id, _counters["mat"]),
+                edit_type=MATERIAL,
+                obj_id=obj_id, shard=shard,
+                object_desc=obj_desc, before_desc=obj_desc,
+                old_part_id=pid, old_label=part_phrase,
+                keep_part_ids=keep_pids,
+                edit_prompt=mat_edit.get("prompt", ""),
+                after_desc=mat_edit.get("after_desc", ""),
+                before_part_desc=mat_edit.get("before_part_desc", desc),
+                after_part_desc=mat_edit.get("after_part_desc", ""),
+                mod_type="material",
+                best_view=obj_best_view,
+            ))
+            _counters["mat"] += 1
+            vlm_material_pids.add(pid)
+
+        # Per-part VLM-generated scale edits
+        scl_edits = [e for e in part_edits
+                     if e.get("type") == "scale" and e.get("prompt")]
+        for scl_edit in scl_edits:
+            part_phrase = _record_part_prompt_name(part)
+            specs.append(EditSpec(
+                edit_id=_make_edit_id("scl", obj_id, _counters["scl"]),
+                edit_type=SCALE,
+                obj_id=obj_id, shard=shard,
+                object_desc=obj_desc, before_desc=obj_desc,
+                old_part_id=pid, old_label=part_phrase,
+                keep_part_ids=keep_pids,
+                edit_prompt=scl_edit.get("prompt", ""),
+                after_desc=obj_desc,
+                before_part_desc=scl_edit.get("before_part_desc", desc),
+                after_part_desc=scl_edit.get("after_part_desc", ""),
+                mod_type="scale",
+                best_view=obj_best_view,
+            ))
+            _counters["scl"] += 1
+            vlm_scale_pids.add(pid)
+
     # --- Global edits ---
     for ge in record.get("global_edits", [])[:max_global]:
         prompt = ge.get("prompt", "")
@@ -361,11 +428,13 @@ def plan_edits_for_record(record: dict, cfg: dict,
         ))
         _counters["glb"] += 1
 
-    # --- Scale edits (anisotropic part scaling) ---
+    # --- Scale edits (template fallback for parts without VLM scale) ---
     max_scale = cfg["phase1"].get("max_scale_edits_per_part", 1)
     rng = random.Random(hash(obj_id))
     for part in parts:
         pid = part["part_id"]
+        if pid in vlm_scale_pids:
+            continue  # VLM already generated scale edits for this part
         label = part.get("label", f"part_{pid}")
         is_core = part.get("core", False) or label in core_cats
 
@@ -393,10 +462,12 @@ def plan_edits_for_record(record: dict, cfg: dict,
             ))
             _counters["scl"] += 1
 
-    # --- Material edits (part-level texture change) ---
+    # --- Material edits (template fallback for parts without VLM material) ---
     max_material = cfg["phase1"].get("max_material_edits_per_part", 1)
     for part in parts:
         pid = part["part_id"]
+        if pid in vlm_material_pids:
+            continue  # VLM already generated material edits for this part
 
         keep_pids = [p for p in all_pids if p != pid]
         if not keep_pids:

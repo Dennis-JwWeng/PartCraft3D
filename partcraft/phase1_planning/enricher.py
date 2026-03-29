@@ -125,16 +125,19 @@ Return JSON only, no fences:
     "desc":"small monkey riding on back","desc_without":"warrior without monkey",
     "best_view_idx":2,
     "deletion":{{"prompt":"Remove the monkey from the warrior's back","after_desc":"warrior standing alone"}},
-    "swaps":[{{"prompt":"Replace the monkey with a parrot","before_desc":"small gray monkey","after_desc":"colorful parrot"}}]}},
+    "swaps":[{{"prompt":"Replace the monkey with a parrot","before_desc":"small gray monkey","after_desc":"colorful parrot"}}],
+    "materials":[{{"prompt":"Make the monkey fur look like worn leather","after_desc":"leather-textured monkey"}},{{"prompt":"Turn the monkey into translucent jade","after_desc":"jade carved monkey"}}],
+    "scale_edits":[{{"prompt":"Shrink the monkey to half its size","before_desc":"normal sized monkey","after_desc":"tiny monkey on back"}}]}},
   {{"group_name":"weapon","part_ids":[3],"is_core":false,
     "desc":"curved metallic knife","desc_without":"warrior with empty hand",
     "best_view_idx":0,
     "deletion":{{"prompt":"Remove the knife from the hand","after_desc":"warrior with empty hand"}},
     "swaps":[{{"prompt":"Replace the knife with a battle axe","before_desc":"curved knife","after_desc":"heavy battle axe"}}],
-    "materials":[{{"prompt":"Change the knife to rusty iron","after_desc":"rusty iron knife"}}]}},
+    "materials":[{{"prompt":"Forge the blade from obsidian glass","after_desc":"glossy black obsidian blade"}},{{"prompt":"Change the knife to corroded bronze","after_desc":"green patina bronze knife"}}],
+    "scale_edits":[{{"prompt":"Elongate the blade to greatsword length","before_desc":"short curved knife","after_desc":"long curved greatsword"}}]}},
   {{"group_name":"accessories","part_ids":[1,9,10,11],"is_core":false,"desc":"clothing and straps"}}
 ],
-"global_edits":[{{"prompt":"Make the entire object wooden","after_desc":"wooden carved version","best_view_idx":0}},{{"prompt":"Transform into sci-fi style","after_desc":"metallic sci-fi version","best_view_idx":1}}]}}
+"global_edits":[{{"prompt":"Carve the whole figure from driftwood","after_desc":"weathered driftwood sculpture","best_view_idx":0}},{{"prompt":"Reimagine as an art deco bronze statue","after_desc":"geometric bronze art deco figure","best_view_idx":1}},{{"prompt":"Coat everything in cracked desert clay","after_desc":"dry cracked clay warrior figure","best_view_idx":2}}]}}
 
 RULES:
 - part_groups: Group parts by semantic relatedness (e.g. monkey_body + monkey_head + monkey_tail → "monkey"). A single part can be its own group.
@@ -152,11 +155,21 @@ RULES:
   before_desc / after_desc: part appearance before/after (under 8 words each).
   BAD: "Make the blade golden"
   GOOD: "Replace the blade with an axe head"
-- materials: 0-1 MATERIAL/TEXTURE changes for this group (shape stays the same).
-  prompt: "Change the X to Y material" (under 15 words).
+- materials: 2-3 MATERIAL/TEXTURE changes for this group (shape stays the same).
+  IMPORTANT: Be CREATIVE and DIVERSE — do NOT repeat common materials like "wooden", "metallic", "chrome" across groups. Think of unexpected, visually striking materials that fit the object: e.g. volcanic basalt, woven rattan, cracked porcelain, iridescent beetle shell, sun-bleached bone, hammered copper with verdigris, frosted acrylic, charred oak, living moss, rusted cast iron, smoked amber resin, raw concrete, brushed titanium, hand-painted ceramic, liquid mercury.
+  prompt: describe the material change vividly (under 15 words).
   after_desc: what the part looks like after material change (under 8 words).
-  GOOD: "Change the knife to rusty iron", "Make the legs wooden"
-- global_edits: 2-3 whole-object style/material/theme changes (no add/remove parts). Include best_view_idx (0-3) for the view that best represents the object for this edit.
+- scale_edits: 1-2 SIZE/PROPORTION changes for this group.
+  Describe a specific, visually meaningful resize — not just "bigger"/"smaller".
+  GOOD: "Elongate the blade to greatsword length", "Flatten the wheels into thin discs", "Inflate the belly to twice its girth"
+  BAD: "Make it bigger" (too vague)
+  prompt: vivid resize description (under 15 words).
+  before_desc / after_desc: part appearance before/after (under 8 words each).
+- global_edits: 3-4 whole-object style/material/theme transformations (no add/remove parts).
+  IMPORTANT: Be HIGHLY CREATIVE and DIVERSE. Each edit should feel completely different from the others. Go beyond common styles — think of specific art movements, historical periods, cultural aesthetics, natural phenomena, or fantastical themes. Avoid generic words like "futuristic" or "sci-fi" — be specific.
+  BAD examples (too generic, overused): "Make it wooden", "Transform into sci-fi style", "Make it metallic"
+  GOOD examples: "Reimagine as a Meiji-era lacquerware piece", "Transform into bioluminescent deep-sea creature", "Rebuild as Soviet constructivist propaganda art", "Cast in molten lava with glowing cracks", "Render as a Ming dynasty blue-and-white porcelain", "Overgrow with arctic lichen and frost crystals"
+  Include best_view_idx (0-3) for the view that best represents the object for this edit.
 - object_desc: 1 sentence, under 15 words."""
 
 
@@ -365,13 +378,13 @@ def _build_prompt_action(category: str, parts_str: str) -> str:
     Core parts get 0 modifications (structural, cannot swap).
     The whole object gets 2-3 global style/theme edits.
     """
-    return f"""Look at this 3D object image. Given its category and part list, generate JSON with descriptions, per-part edits (deletion, addition, swap), and global style edits.
+    return f"""Look at this 3D object image. Given its category and part list, generate JSON with descriptions, per-part edits (deletion, addition, swap, materials, scale), and global style edits.
 
 Category: {category}
 Parts: {parts_str}
 
 Return JSON only, no fences:
-{{"object_desc":"1-sentence description","parts":[{{"part_id":0,"label":"blade","is_core":false,"desc":"a long sharp steel blade","desc_without":"a sword hilt without a blade, showing only the handle and crossguard","deletion":{{"prompt":"Remove the steel blade from the sword","after_desc":"a sword hilt without a blade"}},"addition":{{"prompt":"Attach a long steel blade to the hilt","after_desc":"a complete sword with a sharp steel blade"}},"swaps":[{{"prompt":"Replace the blade with an axe head","after_desc":"a weapon with an axe head on the hilt","before_part_desc":"a long sharp steel blade","after_part_desc":"a heavy axe head"}},{{"prompt":"Replace the blade with a wooden club","after_desc":"a weapon with a thick wooden club","before_part_desc":"a long sharp steel blade","after_part_desc":"a thick wooden club"}}]}},{{"part_id":1,"label":"hilt","is_core":true,"desc":"leather-wrapped sword hilt with crossguard","desc_without":"","deletion":null,"addition":null,"swaps":[]}}],"global_edits":[{{"prompt":"Make the entire object wooden","after_desc":"a wooden version with natural wood grain"}},{{"prompt":"Transform into a futuristic sci-fi style","after_desc":"a sleek metallic sci-fi version with glowing accents"}},{{"prompt":"Make the object look ancient and weathered","after_desc":"an aged version with rust, cracks and patina"}}]}}
+{{"object_desc":"1-sentence description","parts":[{{"part_id":0,"label":"blade","is_core":false,"desc":"a long sharp steel blade","desc_without":"a sword hilt without a blade, showing only the handle and crossguard","deletion":{{"prompt":"Remove the steel blade from the sword","after_desc":"a sword hilt without a blade"}},"addition":{{"prompt":"Attach a long steel blade to the hilt","after_desc":"a complete sword with a sharp steel blade"}},"swaps":[{{"prompt":"Replace the blade with an axe head","after_desc":"a weapon with an axe head on the hilt","before_part_desc":"a long sharp steel blade","after_part_desc":"a heavy axe head"}}],"materials":[{{"prompt":"Forge the blade from volcanic obsidian","after_desc":"glossy black obsidian blade","after_part_desc":"obsidian glass blade"}},{{"prompt":"Cast the blade in corroded verdigris bronze","after_desc":"green patina bronze blade","after_part_desc":"verdigris bronze blade"}}],"scale_edits":[{{"prompt":"Elongate the blade to greatsword length","before_part_desc":"short steel blade","after_part_desc":"long greatsword blade"}}]}},{{"part_id":1,"label":"hilt","is_core":true,"desc":"leather-wrapped sword hilt with crossguard","desc_without":"","deletion":null,"addition":null,"swaps":[],"materials":[],"scale_edits":[]}}],"global_edits":[{{"prompt":"Carve the whole weapon from sun-bleached driftwood","after_desc":"weathered driftwood sculpture"}},{{"prompt":"Reimagine as a Murano blown-glass art piece","after_desc":"translucent colorful glass sculpture"}},{{"prompt":"Encase in cracked volcanic basalt with lava veins","after_desc":"volcanic rock weapon with glowing cracks"}}]}}
 
 CRITICAL RULES FOR ALL PROMPTS:
 - Each prompt MUST be specific and visual — describe WHAT is being done
@@ -391,8 +404,10 @@ For NON-CORE parts (is_core=false):
     Describe adding this part. Assume the reader sees the object WITHOUT this part.
     after_desc = what object looks like WITH this part added back (≈ the original).
   - "swaps": 1-2 shape replacements (see below)
+  - "materials": 2-3 material/texture changes (see below)
+  - "scale_edits": 1-2 size/proportion changes (see below)
 For CORE parts (is_core=true):
-  - "deletion": null, "addition": null, "swaps": []
+  - "deletion": null, "addition": null, "swaps": [], "materials": [], "scale_edits": []
   - desc_without = ""
 
 SHAPE SWAPS (swaps array):
@@ -405,10 +420,27 @@ SHAPE SWAPS (swaps array):
   BAD: "Make the blade golden" (color change, not shape swap)
   BAD: "Replace with nothing" (that's deletion)
 
+MATERIALS (materials array):
+- 2-3 MATERIAL/TEXTURE changes for this part (shape stays the same).
+  IMPORTANT: Be CREATIVE and DIVERSE — avoid repeating common materials (wooden, metallic, chrome, glass) across parts. Think of unexpected, visually striking materials: e.g. volcanic basalt, woven rattan, cracked porcelain, iridescent beetle shell, sun-bleached bone, hammered copper with verdigris, frosted acrylic, charred oak, living moss, rusted cast iron, smoked amber resin, raw concrete, brushed titanium, hand-painted ceramic.
+  prompt: describe the material change vividly (under 15 words).
+  after_desc: what the part looks like after (under 8 words).
+  after_part_desc: material-changed part appearance (under 8 words).
+
+SCALE EDITS (scale_edits array):
+- 1-2 SIZE/PROPORTION changes for this part.
+  Describe a specific, visually meaningful resize — not just "bigger"/"smaller".
+  GOOD: "Elongate the blade to greatsword length", "Flatten the wheels into thin discs"
+  BAD: "Make it bigger" (too vague)
+  prompt: vivid resize description (under 15 words).
+  before_part_desc / after_part_desc: part appearance before/after (under 8 words each).
+
 GLOBAL EDITS (whole-object style/theme changes):
-- 2-3 diverse edits that change the ENTIRE object's style, material theme, or era
+- 3-4 diverse edits that change the ENTIRE object's style, material theme, or era
 - Do NOT add or remove parts — only change the overall look
-- Examples: "Make the entire object wooden", "Transform into steampunk style"
+- IMPORTANT: Be HIGHLY CREATIVE. Each edit must feel completely different. Go beyond common styles — think of specific art movements, historical periods, cultural aesthetics, natural phenomena, or fantastical themes.
+  BAD (too generic): "Make it wooden", "Transform into sci-fi style", "Make it metallic"
+  GOOD: "Reimagine as Meiji-era gold lacquerware", "Transform into bioluminescent deep-sea creature form", "Rebuild as Soviet constructivist propaganda art", "Cast in molten lava with glowing cracks"
 - Each needs: prompt (under 12 words), after_desc (1 sentence)
 
 OUTPUT RULES:
@@ -546,10 +578,14 @@ def _fallback_enrichment(category: str, labels: list[str]) -> dict:
                 "before_part_desc": lbl,
                 "after_part_desc": f"a different style {lbl}",
             }]
+            part["materials"] = []
+            part["scale_edits"] = []
         else:
             part["deletion"] = None
             part["addition"] = None
             part["swaps"] = []
+            part["materials"] = []
+            part["scale_edits"] = []
         parts.append(part)
     return {
         "object_desc": f"A 3D {cat_clean} object",
@@ -647,8 +683,9 @@ def _result_groups_to_record(result: dict, uid: str, category: str,
         deletion = group.get("deletion")
         swaps = group.get("swaps", [])
         materials = group.get("materials", [])
+        scale_edits = group.get("scale_edits", [])
 
-        if not deletion and not swaps and not materials:
+        if not deletion and not swaps and not materials and not scale_edits:
             continue  # No edits for groups without clear semantics
 
         edits: list[dict] = []
@@ -686,7 +723,17 @@ def _result_groups_to_record(result: dict, uid: str, category: str,
                 "prompt": mat.get("prompt", ""),
                 "after_desc": mat.get("after_desc", ""),
                 "before_part_desc": gdesc,
-                "after_part_desc": mat.get("after_desc", ""),
+                "after_part_desc": mat.get("after_part_desc", mat.get("after_desc", "")),
+            })
+
+        for se in scale_edits:
+            edits.append({
+                "type": "scale",
+                "mod_type": "scale",
+                "prompt": se.get("prompt", ""),
+                "after_desc": obj_desc,
+                "before_part_desc": se.get("before_part_desc", se.get("before_desc", gdesc)),
+                "after_part_desc": se.get("after_part_desc", se.get("after_desc", "")),
             })
 
         group_edits_out.append({
@@ -805,6 +852,34 @@ def _result_to_phase0_record(result: dict, uid: str, category: str,
                 "after_desc": mod.get("after_desc", ""),
                 "before_part_desc": mod.get("before_part_desc", desc),
                 "after_part_desc": mod.get("after_part_desc", ""),
+            })
+
+        # --- Material edits (VLM-generated) ---
+        for mat in p.get("materials", []):
+            prompt = mat.get("prompt", "")
+            if not prompt:
+                continue
+            edits.append({
+                "type": "material",
+                "mod_type": "material",
+                "prompt": prompt,
+                "after_desc": mat.get("after_desc", ""),
+                "before_part_desc": desc,
+                "after_part_desc": mat.get("after_part_desc", mat.get("after_desc", "")),
+            })
+
+        # --- Scale edits (VLM-generated) ---
+        for se in p.get("scale_edits", []):
+            prompt = se.get("prompt", "")
+            if not prompt:
+                continue
+            edits.append({
+                "type": "scale",
+                "mod_type": "scale",
+                "prompt": prompt,
+                "after_desc": obj_desc,
+                "before_part_desc": se.get("before_part_desc", se.get("before_desc", desc)),
+                "after_part_desc": se.get("after_part_desc", se.get("after_desc", "")),
             })
 
         phase0_parts.append({
