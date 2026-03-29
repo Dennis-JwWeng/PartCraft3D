@@ -200,7 +200,7 @@ flowchart TD
 当前仓库已提供：
 
 - `configs/machine/node39.env`
-- `configs/machine/dedicated-developjob-saining-r0iyw.env`（本机默认模板）
+- `configs/machine/H200.env`（本机命名模板）
 
 ### 环境初始化脚本（部署/管线分离）
 
