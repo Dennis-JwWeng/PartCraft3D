@@ -1,5 +1,24 @@
 # AI_LOG
 
+## 2026-03-30 — node39 配置整理 & 管线/预渲染配置可读性改进
+
+### 改动
+- 重写 `configs/partverse_node39_shard01.yaml`：
+  - 所有路径与 `configs/machine/node39.env` 对齐（ckpt_root、blender_path 等）
+  - 补充 `export_ply: false` / `export_ply_for_deletion: true`（默认不写 PLY）
+  - `phase2_5` 多服务端口与实际运行一致（5 GPU × 5 端口 8004-8008）
+  - `pipeline.attn_backend` 改为 `flash_attn`
+  - 各 section 加中文注释分隔 + 字段对齐，提升可读性
+  - 顶部注释更新一键和手动两种启动方式
+- 新建 `configs/prerender_partverse_node39.yaml`：
+  - 所有路径绑定 node39 绝对路径（data_dir、dataset_root、blender_path）
+  - 顶部注释包含渲染、编码、打包三种用法
+  - 与 `prerender_partverse.yaml` 结构一致，仅路径具体化
+
+### 目的
+- 消除配置与实际环境的路径不一致（如 ckpt_root 为空、blender_path 用默认 "blender"）
+- 管线和预渲染各有独立的 node39 配置，开箱可用
+
 ## 2026-03-30 — Step4 默认不落盘 PLY（保留可选导出）
 
 ### 改动
