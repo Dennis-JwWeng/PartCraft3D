@@ -1,0 +1,53 @@
+# PartVerse 预渲染 — H200 (8× NVIDIA L20X 48GB)
+# Machine env: configs/machine/H200.env
+#
+# ── 使用方式 ────────────────────────────────────────────────────────
+# 渲染 + SLAT 编码（GPU 0-7）：
+#   conda activate vinedresser3d
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+#       python scripts/datasets/partverse/prerender.py \
+#       --config configs/prerender_partverse_H200.yaml \
+#       --shard 00 --num-shards 10 --render-workers 8
+#
+# 仅编码 SLAT：
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+#       python scripts/datasets/partverse/prerender.py \
+#       --config configs/prerender_partverse_H200.yaml \
+#       --shard 00 --num-shards 10 --encode-only
+#
+# 仅打包 NPZ：
+#   python scripts/datasets/partverse/pack_npz.py \
+#       --shard 00 --num-shards 10 \
+#       --data-root /root/workspace/PartCraft3D/data/partverse
+
+# ── Checkpoints ─────────────────────────────────────────────────────
+ckpt_root: "/root/workspace/PartCraft3D/checkpoints"
+
+# ── Data ────────────────────────────────────────────────────────────
+data:
+  data_dir:                "/root/workspace/PartCraft3D/data/partverse"
+  derive_dataset_subpaths: true
+  output_dir:              "/mnt/zsn/data/partverse/outputs/partverse"
+  shards:                  ["00"]
+  output_by_shard:         false
+
+# ── Paths: 预渲染产物 ──────────────────────────────────────────────
+paths:
+  dataset_root:            "/root/workspace/PartCraft3D/data/partverse"
+  source_glb_dir:          "source/normalized_glbs"
+  captions_json:           "source/text_captions.json"
+  img_enc_dir:             "img_Enc"
+  slat_dir:                "slat"
+  images_npz_dir:          "images"
+  mesh_npz_dir:            "mesh"
+  cache_root:              "cache"
+
+# ── Tools ───────────────────────────────────────────────────────────
+tools:
+  blender_path:            "/usr/local/bin/blender"
+  blender_script:          "scripts/blender_render.py"
+
+# ── Logging ─────────────────────────────────────────────────────────
+logging:
+  level:    "INFO"
+  log_dir:  "logs/prerender_partverse"
