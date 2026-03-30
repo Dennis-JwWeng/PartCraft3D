@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""Migrate legacy pipeline outputs to the unified NPZ format (SLAT + SS).
+
+Converts all edit pair artifacts produced by the old pipeline into the new
+``before.npz`` / ``after.npz`` format with keys ``slat_feats``, ``slat_coords``,
+``ss`` (sparse-structure VAE latent).
+
+Four processing phases (run in order):
+
+  Phase 1 — **Simple conversion** (modification / scale / material / global)
+      Pairs that already have ``*_slat/`` directories: load feats.pt + coords.pt,
+      compute SS via the sparse-structure encoder, write ``*.npz``.
+
+  Phase 2 — **Deletion backfill**
+      Pairs that only have PLY output (no SLAT): load the pre-encoded source SLAT
+      from ``slat_dir``, build the part mask (mesh voxelization), filter the SLAT
+      to obtain before/after, compute SS, write ``*.npz``.
+
+  Phase 3 — **Addition backfill**
+      Addition is the reverse of its source deletion: swap the source deletion
+      pair's ``before.npz`` / ``after.npz``.
+
+  Phase 4 — **Identity backfill**
+      Identity copies ``before.npz`` as both before *and* after for the same
+      object.  Finds the first migrated pair of that object.
+
+Existing ``*.npz`` files are never overwritten (idempotent).
+
+Usage
+-----
+Full migration (needs GPU, loads SS encoder + dataset):
+
+    python scripts/tools/migrate_slat_to_npz.py \\
+        --config  configs/partverse_H200_shard00.yaml \\
+        --mesh-pairs /mnt/zsn/data/partverse/outputs/partverse/mesh_pairs_shard00 \\
+        --specs-jsonl /mnt/zsn/data/partverse/outputs/partverse/cache/phase1/edit_specs_shard00.jsonl
+
+Dry run (no GPU, no writes):
+
+    python scripts/tools/migrate_slat_to_npz.py \\
+        --config  configs/partverse_H200_shard00.yaml \\
+        --mesh-pairs /path/to/mesh_pairs \\
+        --specs-jsonl /path/to/edit_specs.jsonl \\
+        --dry-run
+
+Phase 1 only (no dataset or specs needed — just has *_slat/ dirs):
+
+    python scripts/tools/migrate_slat_to_npz.py \\
+        --ckpt-root /path/to/checkpoints \\
+        --mesh-pairs /path/to/mesh_pairs \\
+        --phase 1
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import shutil
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+import torch
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_PROJECT_ROOT))
+sys.path.insert(0, str(_PROJECT_ROOT / "third_party"))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("migrate")
+
+
+# ───────────────────────────── data structures ──────────────────────────────
+
+@dataclass
+class SpecInfo:
+    """Minimal fields extracted from EditSpec JSONL for migration."""
+    edit_id: str
+    edit_type: str
+    obj_id: str
+    shard: str
+    remove_part_ids: list[int] = field(default_factory=list)
+    source_del_id: str = ""
+
+
+# ──────────────────────────── SS encoder loader ─────────────────────────────
+
+def _load_ss_encoder(ckpt_root: Path, device: str = "cuda"):
+    """Load only the sparse-structure VAE encoder (lightweight)."""
+    from trellis.pipelines import TrellisTextTo3DPipeline
+    import trellis.models as trellis_models
+
+    text_ckpt = str(ckpt_root / "TRELLIS-text-xlarge")
+    log.info("Loading TRELLIS text pipeline from %s …", text_ckpt)
+    pipeline = TrellisTextTo3DPipeline.from_pretrained(text_ckpt)
+
+    if "sparse_structure_encoder" not in pipeline.models:
+        ss_enc_path = str(
+            ckpt_root / "TRELLIS-text-xlarge" / "ckpts" / "ss_enc_conv3d_16l8_fp16"
+        )
+        ss_encoder = trellis_models.from_pretrained(ss_enc_path)
+        pipeline.models["sparse_structure_encoder"] = ss_encoder
+
+    pipeline.cuda() if device == "cuda" else pipeline.cpu()
+    encoder = pipeline.models["sparse_structure_encoder"]
+    log.info("SS encoder ready on %s", device)
+    return encoder
+
+
+@torch.no_grad()
+def encode_ss(encoder, coords: torch.Tensor, device: str = "cuda") -> torch.Tensor:
+    """coords [N,4] → z_s [C, R, R, R]."""
+    occ = torch.zeros(1, 1, 64, 64, 64, device=device)
+    occ[0, 0, coords[:, 1], coords[:, 2], coords[:, 3]] = 1
+    z_s = encoder(occ)
+    return z_s.squeeze(0)
+
+
+def _save_npz(path: Path, feats, coords, z_s):
+    data = {
+        "slat_feats": feats.cpu().float().numpy(),
+        "slat_coords": coords.cpu().int().numpy(),
+        "ss": z_s.cpu().float().numpy(),
+    }
+    np.savez(path, **data)
+
+
+# ──────────────────────────── Phase 1: simple conversion ────────────────────
+
+def phase1_convert(
+    pair_dirs: list[Path],
+    encoder,
+    device: str,
+    *,
+    dry_run: bool,
+) -> dict[str, int]:
+    """Convert existing ``*_slat/`` directories to ``*.npz`` + SS."""
+    stats = {"converted": 0, "skipped": 0, "no_src": 0, "error": 0}
+
+    for i, d in enumerate(pair_dirs):
+        for tag in ("before", "after"):
+            npz_path = d / f"{tag}.npz"
+            if npz_path.exists():
+                stats["skipped"] += 1
+                continue
+
+            legacy = d / f"{tag}_slat"
+            if not legacy.exists():
+                stats["no_src"] += 1
+                continue
+
+            resolved = legacy.resolve()
+            feats_f = resolved / "feats.pt"
+            coords_f = resolved / "coords.pt"
+            if not feats_f.exists() or not coords_f.exists():
+                stats["no_src"] += 1
+                continue
+
+            if dry_run:
+                stats["converted"] += 1
+                continue
+
+            try:
+                feats = torch.load(feats_f, weights_only=True).to(device)
+                coords = torch.load(coords_f, weights_only=True).to(device)
+                z_s = encode_ss(encoder, coords, device)
+                _save_npz(npz_path, feats, coords, z_s)
+                stats["converted"] += 1
+            except Exception as e:
+                log.warning("Phase1 error %s/%s: %s", d.name, tag, e)
+                stats["error"] += 1
+
+        if (i + 1) % 200 == 0:
+            log.info("  Phase1 progress: %d / %d dirs", i + 1, len(pair_dirs))
+
+    return stats
+
+
+# ──────────────────────────── Phase 2: deletion backfill ────────────────────
+
+def phase2_deletion(
+    specs_by_type: dict[str, list[SpecInfo]],
+    mesh_pairs: Path,
+    refiner,
+    dataset,
+    device: str,
+    *,
+    dry_run: bool,
+) -> dict[str, int]:
+    """Backfill SLAT + SS for deletion pairs that only have PLY."""
+    from interweave_Trellis import get_coords_mask
+    from trellis.modules import sparse as sp
+
+    del_specs = specs_by_type.get("deletion", [])
+    stats = {"converted": 0, "skipped": 0, "no_dir": 0, "error": 0}
+
+    obj_groups: dict[str, list[SpecInfo]] = defaultdict(list)
+    for s in del_specs:
+        obj_groups[s.obj_id].append(s)
+
+    for obj_id, obj_specs in obj_groups.items():
+        pair_dirs_need_work = []
+        for s in obj_specs:
+            d = mesh_pairs / s.edit_id
+            if not d.is_dir():
+                stats["no_dir"] += 1
+                continue
+            if (d / "before.npz").exists() and (d / "after.npz").exists():
+                stats["skipped"] += 1
+                continue
+            pair_dirs_need_work.append(s)
+
+        if not pair_dirs_need_work:
+            continue
+
+        if dry_run:
+            stats["converted"] += len(pair_dirs_need_work)
+            continue
+
+        try:
+            ori_slat = refiner.encode_object(None, obj_id)
+            shard = pair_dirs_need_work[0].shard
+            obj_record = dataset.load_object(shard, obj_id)
+        except Exception as e:
+            log.warning("Phase2: cannot load object %s: %s", obj_id, e)
+            stats["error"] += len(pair_dirs_need_work)
+            continue
+
+        for s in pair_dirs_need_work:
+            d = mesh_pairs / s.edit_id
+            try:
+                mask, _ = refiner.build_part_mask(
+                    obj_id, obj_record,
+                    s.remove_part_ids, ori_slat, "Deletion",
+                )
+                keep = get_coords_mask(ori_slat.coords, mask)
+                after_feats = ori_slat.feats[keep]
+                after_coords = ori_slat.coords[keep]
+
+                z_s_before = encode_ss(
+                    refiner.trellis_text.models["sparse_structure_encoder"],
+                    ori_slat.coords, device,
+                )
+                z_s_after = encode_ss(
+                    refiner.trellis_text.models["sparse_structure_encoder"],
+                    after_coords, device,
+                )
+
+                d.mkdir(parents=True, exist_ok=True)
+                b = d / "before.npz"
+                a = d / "after.npz"
+                if not b.exists():
+                    _save_npz(b, ori_slat.feats, ori_slat.coords, z_s_before)
+                if not a.exists():
+                    _save_npz(a, after_feats, after_coords, z_s_after)
+                stats["converted"] += 1
+            except Exception as e:
+                log.warning("Phase2 error %s: %s", s.edit_id, e)
+                stats["error"] += 1
+
+        try:
+            obj_record.close()
+        except Exception:
+            pass
+
+    return stats
+
+
+# ──────────────────────────── Phase 3: addition backfill ────────────────────
+
+def phase3_addition(
+    specs_by_type: dict[str, list[SpecInfo]],
+    mesh_pairs: Path,
+    *,
+    dry_run: bool,
+) -> dict[str, int]:
+    """Backfill addition pairs by swapping the source deletion pair's npz."""
+    add_specs = specs_by_type.get("addition", [])
+    stats = {"converted": 0, "skipped": 0, "no_source": 0}
+
+    for s in add_specs:
+        add_dir = mesh_pairs / s.edit_id
+        if (add_dir / "before.npz").exists() and (add_dir / "after.npz").exists():
+            stats["skipped"] += 1
+            continue
+
+        del_dir = mesh_pairs / s.source_del_id
+        if not (del_dir / "before.npz").exists() or not (del_dir / "after.npz").exists():
+            stats["no_source"] += 1
+            continue
+
+        if dry_run:
+            stats["converted"] += 1
+            continue
+
+        add_dir.mkdir(parents=True, exist_ok=True)
+        # Addition is the reverse of deletion: before↔after swapped
+        for src_name, dst_name in [
+            ("before.npz", "after.npz"),
+            ("after.npz", "before.npz"),
+        ]:
+            dst = add_dir / dst_name
+            if not dst.exists():
+                shutil.copy2(str(del_dir / src_name), str(dst))
+        stats["converted"] += 1
+
+    return stats
+
+
+# ──────────────────────────── Phase 4: identity backfill ────────────────────
+
+def phase4_identity(
+    specs_by_type: dict[str, list[SpecInfo]],
+    all_specs: list[SpecInfo],
+    mesh_pairs: Path,
+    *,
+    dry_run: bool,
+) -> dict[str, int]:
+    """Backfill identity pairs: same before.npz used as both before and after."""
+    idt_specs = specs_by_type.get("identity", [])
+    stats = {"converted": 0, "skipped": 0, "no_source": 0}
+
+    obj_to_first_pair: dict[str, Path | None] = {}
+    for s in all_specs:
+        if s.edit_type == "identity":
+            continue
+        if s.obj_id in obj_to_first_pair:
+            continue
+        d = mesh_pairs / s.edit_id
+        if (d / "before.npz").exists():
+            obj_to_first_pair[s.obj_id] = d
+
+    for s in idt_specs:
+        idt_dir = mesh_pairs / s.edit_id
+        if (idt_dir / "before.npz").exists() and (idt_dir / "after.npz").exists():
+            stats["skipped"] += 1
+            continue
+
+        src_dir = obj_to_first_pair.get(s.obj_id)
+        if src_dir is None or not (src_dir / "before.npz").exists():
+            stats["no_source"] += 1
+            continue
+
+        if dry_run:
+            stats["converted"] += 1
+            continue
+
+        idt_dir.mkdir(parents=True, exist_ok=True)
+        src_npz = src_dir / "before.npz"
+        for tag in ("before.npz", "after.npz"):
+            dst = idt_dir / tag
+            if not dst.exists():
+                shutil.copy2(str(src_npz), str(dst))
+        stats["converted"] += 1
+
+    return stats
+
+
+# ──────────────────────────── spec loading ──────────────────────────────────
+
+def _load_specs(specs_path: Path) -> list[SpecInfo]:
+    specs: list[SpecInfo] = []
+    with open(specs_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            d = json.loads(line)
+            specs.append(SpecInfo(
+                edit_id=d["edit_id"],
+                edit_type=d.get("edit_type", ""),
+                obj_id=d.get("obj_id", ""),
+                shard=d.get("shard", ""),
+                remove_part_ids=d.get("remove_part_ids", []),
+                source_del_id=d.get("source_del_id", ""),
+            ))
+    return specs
+
+
+def _group_by_type(specs: list[SpecInfo]) -> dict[str, list[SpecInfo]]:
+    groups: dict[str, list[SpecInfo]] = defaultdict(list)
+    for s in specs:
+        groups[s.edit_type].append(s)
+    return groups
+
+
+# ──────────────────────────── refiner setup ─────────────────────────────────
+
+def _create_refiner(cfg: dict, ckpt_root: str, device: str):
+    """Create a TrellisRefiner with only the SS encoder loaded (lightweight).
+
+    The full text/image pipeline is NOT loaded — ``load_models()`` is not
+    called.  Instead we load only the SS encoder and attach it as a minimal
+    ``trellis_text`` object so that ``encode_ss()``, ``encode_object()``, and
+    ``build_part_mask()`` work.
+    """
+    from partcraft.phase2_assembly.trellis_refine import TrellisRefiner
+    from scripts.pipeline_common import resolve_data_dirs
+
+    slat_dir, img_enc_dir = resolve_data_dirs(cfg)
+    cache_dir = cfg.get("phase2_5", {}).get("cache_dir", "/tmp/migrate_cache")
+
+    refiner = TrellisRefiner(
+        cache_dir=cache_dir,
+        device=device,
+        ckpt_dir=ckpt_root,
+        slat_dir=slat_dir,
+        img_enc_dir=img_enc_dir,
+    )
+
+    encoder = _load_ss_encoder(Path(ckpt_root), device)
+
+    class _MinimalPipeline:
+        def __init__(self, enc):
+            self.models = {"sparse_structure_encoder": enc}
+
+    refiner.trellis_text = _MinimalPipeline(encoder)
+    return refiner
+
+
+# ──────────────────────────── main ──────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Migrate legacy pipeline outputs to NPZ format",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="Pipeline YAML config (derives ckpt_root, slat_dir, dataset paths)",
+    )
+    parser.add_argument(
+        "--mesh-pairs", required=True,
+        help="Root mesh_pairs directory to migrate",
+    )
+    parser.add_argument(
+        "--specs-jsonl", type=str, default=None,
+        help="edit_specs JSONL (needed for Phase 2–4; "
+             "can be omitted for Phase 1 only)",
+    )
+    parser.add_argument(
+        "--ckpt-root", type=str, default=None,
+        help="Checkpoint root (overrides config; contains TRELLIS-text-xlarge)",
+    )
+    parser.add_argument(
+        "--phase", type=str, default="all",
+        help="Comma-separated phases to run: 1,2,3,4 or 'all' (default: all)",
+    )
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Count only, do not write files or load models")
+    parser.add_argument("--device", default="cuda")
+    args = parser.parse_args()
+
+    mesh_pairs = Path(args.mesh_pairs)
+    if not mesh_pairs.is_dir():
+        log.error("%s is not a directory", mesh_pairs)
+        sys.exit(1)
+
+    phases = (
+        {1, 2, 3, 4} if args.phase == "all"
+        else {int(p) for p in args.phase.split(",")}
+    )
+    log.info("Phases to run: %s  dry_run=%s", sorted(phases), args.dry_run)
+
+    # ── Resolve config and paths ──
+    cfg = None
+    ckpt_root = args.ckpt_root
+    if args.config:
+        from partcraft.utils.config import load_config
+        cfg = load_config(args.config)
+        if ckpt_root is None:
+            ckpt_root = cfg.get("ckpt_root")
+
+    if ckpt_root is None and not args.dry_run:
+        log.error("--ckpt-root is required (or provide --config)")
+        sys.exit(1)
+
+    # ── Collect pair dirs ──
+    pair_dirs = sorted(d for d in mesh_pairs.iterdir() if d.is_dir())
+    log.info("Found %d pair directories under %s", len(pair_dirs), mesh_pairs)
+
+    # ── Load specs (Phase 2–4) ──
+    specs: list[SpecInfo] = []
+    specs_by_type: dict[str, list[SpecInfo]] = {}
+    if phases & {2, 3, 4}:
+        if not args.specs_jsonl:
+            log.error("--specs-jsonl is required for Phase 2/3/4")
+            sys.exit(1)
+        specs_path = Path(args.specs_jsonl)
+        if not specs_path.exists():
+            log.error("Specs file not found: %s", specs_path)
+            sys.exit(1)
+        specs = _load_specs(specs_path)
+        specs_by_type = _group_by_type(specs)
+        log.info(
+            "Loaded %d specs: %s",
+            len(specs),
+            {k: len(v) for k, v in specs_by_type.items()},
+        )
+
+    # ────────── Phase 1 ──────────
+    if 1 in phases:
+        log.info("=" * 60)
+        log.info("Phase 1: Simple *_slat/ → npz conversion")
+        encoder = None
+        if not args.dry_run:
+            encoder = _load_ss_encoder(Path(ckpt_root), args.device)
+        s = phase1_convert(pair_dirs, encoder, args.device, dry_run=args.dry_run)
+        log.info("Phase 1 done: %s", s)
+
+    # ────────── Phase 2 ──────────
+    if 2 in phases:
+        log.info("=" * 60)
+        log.info("Phase 2: Deletion backfill (SLAT + SS from source)")
+        refiner = None
+        dataset = None
+        if not args.dry_run:
+            if cfg is None:
+                log.error("--config is required for Phase 2")
+                sys.exit(1)
+            from scripts.pipeline_common import create_dataset
+            refiner = _create_refiner(cfg, ckpt_root, args.device)
+            dataset = create_dataset(cfg)
+        s = phase2_deletion(
+            specs_by_type, mesh_pairs, refiner, dataset,
+            args.device, dry_run=args.dry_run,
+        )
+        log.info("Phase 2 done: %s", s)
+
+    # ────────── Phase 3 ──────────
+    if 3 in phases:
+        log.info("=" * 60)
+        log.info("Phase 3: Addition backfill (swap from deletion)")
+        s = phase3_addition(specs_by_type, mesh_pairs, dry_run=args.dry_run)
+        log.info("Phase 3 done: %s", s)
+
+    # ────────── Phase 4 ──────────
+    if 4 in phases:
+        log.info("=" * 60)
+        log.info("Phase 4: Identity backfill")
+        s = phase4_identity(
+            specs_by_type, specs, mesh_pairs, dry_run=args.dry_run,
+        )
+        log.info("Phase 4 done: %s", s)
+
+    log.info("=" * 60)
+    log.info("Migration complete.")
+
+
+if __name__ == "__main__":
+    main()
