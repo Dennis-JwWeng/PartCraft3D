@@ -110,6 +110,7 @@ def _build_edit_prompt(edit_prompt: str, after_part_desc: str,
 
     Adapts prompt structure to the edit type:
       - deletion: instruct removal, generate clean closure
+      - scale: instruct part-only size/proportion change
       - modification: instruct part replacement, preserve others
       - global: instruct whole-object style change
     """
@@ -152,6 +153,29 @@ def _build_edit_prompt(edit_prompt: str, after_part_desc: str,
             "\n- Keep the white background completely unchanged."
             "\n- Keep the overall shape, pose, and position unchanged."
             "\n- Only change the style, texture, or color as instructed."
+        )
+    elif et == "scale":
+        # Scale: resize target part while preserving all other parts.
+        if old_part_label:
+            target = f"the '{old_part_label}' part"
+        else:
+            target = "the specified part"
+        text = (
+            f"This is a 3D rendered object on a white background. "
+            f"Resize ONLY {target} of this object. "
+            f"Editing instruction: {edit_prompt}"
+        )
+        if before_part_desc:
+            text += f"\nThe part currently looks like: {before_part_desc}"
+        if after_part_desc:
+            text += f"\nAfter resizing, it should look like: {after_part_desc}"
+        text += (
+            "\nIMPORTANT constraints:"
+            "\n- Keep the exact same camera viewpoint and angle."
+            "\n- Keep the white background completely unchanged."
+            "\n- Keep ALL non-target parts of the object exactly as they are."
+            "\n- Keep the target part identity and style, but change only its size/proportions."
+            "\n- Do NOT move or rotate the object."
         )
     else:
         # Modification: edit specific part(s)

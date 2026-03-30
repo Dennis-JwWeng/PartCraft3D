@@ -18,14 +18,14 @@
 # 仅打包 NPZ：
 #   python scripts/datasets/partverse/pack_npz.py \
 #       --shard 00 --num-shards 10 \
-#       --data-root /root/workspace/PartCraft3D/data/partverse
+#       --data-root /mnt/zsn/data/partverse
 
 # ── Checkpoints ─────────────────────────────────────────────────────
 ckpt_root: "/root/workspace/PartCraft3D/checkpoints"
 
 # ── Data ────────────────────────────────────────────────────────────
 data:
-  data_dir:                "/root/workspace/PartCraft3D/data/partverse"
+  data_dir:                "/mnt/zsn/data/partverse"
   derive_dataset_subpaths: true
   output_dir:              "/mnt/zsn/data/partverse/outputs/partverse"
   shards:                  ["00"]
@@ -33,9 +33,9 @@ data:
 
 # ── Paths: 预渲染产物 ──────────────────────────────────────────────
 paths:
-  dataset_root:            "/root/workspace/PartCraft3D/data/partverse"
+  dataset_root:            "/mnt/zsn/data/partverse"
   source_glb_dir:          "source/normalized_glbs"
-  captions_json:           "source/text_captions.json"
+  captions_json:           "text_captions.json"      # 在 dataset_root 根目录
   img_enc_dir:             "img_Enc"
   slat_dir:                "slat"
   images_npz_dir:          "images"

@@ -23,6 +23,7 @@
   - `coords`: `[N, 4]`，格式 `[batch_idx, x, y, z]`
 
 代码定义：
+
 - `third_party/trellis/modules/sparse/basic.py` (`class SparseTensor`)
 
 ### 2.2 `encode_into_SLAT.py` 的输出形状
@@ -36,6 +37,7 @@
   - coord dim = 4
 
 代码：
+
 - `third_party/encode_asset/encode_into_SLAT.py`
 
 ### 2.3 sparse structure 和 structured latent 的关系
@@ -44,11 +46,13 @@
 - stage2 在这些坐标上生成 `structured latent` 特征
 
 pipeline 中耦合方式：
+
 1. `sample_sparse_structure` 得到 `coords`
 2. `sample_slat` 用同一 `coords` 初始化 sparse noise 并采样 `slat`
 3. `decode_slat` 将 `slat` 解码成 `mesh/gaussian/radiance_field`
 
 代码：
+
 - `third_party/trellis/pipelines/trellis_image_to_3d.py`
 - `third_party/trellis/pipelines/trellis_text_to_3d.py`
 
@@ -67,6 +71,7 @@ pipeline 中耦合方式：
 - 损失：BCE/L1/Dice + KL
 
 代码：
+
 - 模型：`third_party/trellis/models/sparse_structure_vae.py`
 - 训练：`third_party/trellis/trainers/vae/sparse_structure_vae.py`
 - 数据：`third_party/trellis/datasets/sparse_structure.py`
@@ -78,6 +83,7 @@ pipeline 中耦合方式：
 - 损失（主线）：重建图像（L1/SSIM/LPIPS）+ KL
 
 代码：
+
 - 编码器：`third_party/trellis/models/structured_latent_vae/encoder.py`
 - 解码器：
   - `decoder_gs.py`
@@ -98,6 +104,7 @@ pipeline 中耦合方式：
 - block：`ModulatedTransformerCrossBlock`（self-attn + cross-attn + FFN + AdaLN）
 
 相关模块：
+
 - `third_party/trellis/modules/transformer/modulated.py`
 - `third_party/trellis/modules/transformer/blocks.py`
 
@@ -109,6 +116,7 @@ pipeline 中耦合方式：
 - block：`ModulatedSparseTransformerCrossBlock`
 
 相关模块：
+
 - `third_party/trellis/modules/sparse/transformer/modulated.py`
 - `third_party/trellis/modules/sparse/transformer/blocks.py`
 - `third_party/trellis/modules/sparse/attention/modules.py`
@@ -124,23 +132,29 @@ pipeline 中耦合方式：
 5. MSE 对齐：`MSE(pred_v, target_v)`
 
 代码：
+
 - 通用 flow trainer：`third_party/trellis/trainers/flow_matching/flow_matching.py`
 - sparse flow trainer：`third_party/trellis/trainers/flow_matching/sparse_flow_matching.py`
 - 采样器（Euler ODE）：`third_party/trellis/pipelines/samplers/flow_euler.py`
 
 结论：
+
 - 训练时是“单步监督速度场”（每次一个 t 的前向）
 - 推理时是“多步积分速度场”（Euler 多步更新）
 
 ## 5) `ss dataset` 来源
 
 `SparseStructure` 数据集是离线数据读取，不是在线构建：
+
 - `root/metadata.csv`（含 `voxelized` 标记）
 - `root/voxels/<sha256>.ply`
 
 代码：
+
 - `third_party/trellis/datasets/components.py`
 - `third_party/trellis/datasets/sparse_structure.py`
 
 补充：
+
 - 当前 `encode_asset/render_img_for_enc.py` 也会做 voxelize，但输出目录是 `img_Enc/<name>/voxels.ply`，与 `SparseStructure` 训练目录组织不同（概念一致，组织格式不同）。
+

@@ -276,6 +276,11 @@ def plan_edits_for_record(record: dict, cfg: dict,
                 _counters["mat"] += 1
                 vlm_material_pids.update(grp_pids)
             elif etype == "scale":
+                scale_after_desc = (
+                    edit.get("after_desc", "")
+                    or edit.get("after_part_desc", "")
+                    or obj_desc
+                )
                 specs.append(EditSpec(
                     edit_id=_make_edit_id("scl", obj_id, _counters["scl"]),
                     edit_type=SCALE,
@@ -283,9 +288,10 @@ def plan_edits_for_record(record: dict, cfg: dict,
                     object_desc=obj_desc, before_desc=obj_desc,
                     old_part_id=grp_pids[0] if grp_pids else -1,
                     old_label=grp_labels[0] if grp_labels else "",
+                    remove_part_ids=grp_pids, remove_labels=grp_labels,
                     keep_part_ids=keep_pids,
                     edit_prompt=edit.get("prompt", ""),
-                    after_desc=obj_desc,
+                    after_desc=scale_after_desc,
                     before_part_desc=edit.get("before_part_desc", grp_desc),
                     after_part_desc=edit.get("after_part_desc", ""),
                     mod_type="scale",
@@ -395,6 +401,11 @@ def plan_edits_for_record(record: dict, cfg: dict,
                      if e.get("type") == "scale" and e.get("prompt")]
         for scl_edit in scl_edits:
             part_phrase = _record_part_prompt_name(part)
+            scale_after_desc = (
+                scl_edit.get("after_desc", "")
+                or scl_edit.get("after_part_desc", "")
+                or obj_desc
+            )
             specs.append(EditSpec(
                 edit_id=_make_edit_id("scl", obj_id, _counters["scl"]),
                 edit_type=SCALE,
@@ -403,7 +414,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
                 old_part_id=pid, old_label=part_phrase,
                 keep_part_ids=keep_pids,
                 edit_prompt=scl_edit.get("prompt", ""),
-                after_desc=obj_desc,
+                after_desc=scale_after_desc,
                 before_part_desc=scl_edit.get("before_part_desc", desc),
                 after_part_desc=scl_edit.get("after_part_desc", ""),
                 mod_type="scale",
@@ -446,6 +457,7 @@ def plan_edits_for_record(record: dict, cfg: dict,
         templates = rng.sample(SCALE_TEMPLATES,
                                min(max_scale, len(SCALE_TEMPLATES)))
         for tmpl_prompt, tmpl_before, tmpl_after in templates:
+            tmpl_after_desc = tmpl_after.format(part=part_phrase)
             specs.append(EditSpec(
                 edit_id=_make_edit_id("scl", obj_id, _counters["scl"]),
                 edit_type=SCALE,
@@ -454,9 +466,9 @@ def plan_edits_for_record(record: dict, cfg: dict,
                 old_part_id=pid, old_label=part_phrase,
                 keep_part_ids=keep_pids,
                 edit_prompt=tmpl_prompt.format(part=part_phrase),
-                after_desc=obj_desc,
+                after_desc=tmpl_after_desc,
                 before_part_desc=tmpl_before.format(part=part_phrase),
-                after_part_desc=tmpl_after.format(part=part_phrase),
+                after_part_desc=tmpl_after_desc,
                 mod_type="scale",
                 best_view=obj_best_view,
             ))

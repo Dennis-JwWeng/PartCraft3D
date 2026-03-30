@@ -37,7 +37,7 @@ ckpt_root: "/root/workspace/PartCraft3D/checkpoints"
 
 # ── Data & Output ───────────────────────────────────────────────────
 data:
-  data_dir:                "/root/workspace/PartCraft3D/data/partverse"
+  data_dir:                "/mnt/zsn/data/partverse"
   derive_dataset_subpaths: true
   shards:                  ["00"]
   output_by_shard:         true
