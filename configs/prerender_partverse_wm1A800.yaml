@@ -1,24 +1,26 @@
 # Portable prerender config (PartVerse) for wm1A800 local paths.
+# Outputs → PFS (aligned with pipeline DATA_DIR / OUTPUT_ROOT in wm1A800.env)
+# Source GLBs + captions remain on CFS (read-only)
 
 ckpt_root: "/mnt/cfs/vffey4/3dedit/ckpts"
 
 data:
-  data_dir: "/mnt/cfs/vffey4/3dedit/data/partverse"
+  data_dir: "/mnt/pfs/ca41bi/omni3d/partverse"
   derive_dataset_subpaths: true
-  output_dir: "/mnt/cfs/vffey4/3dedit/outputs/partverse"
+  output_dir: "/mnt/pfs/ca41bi/omni3d/partverse"
   shards: ["00"]
   output_by_shard: false
 
 paths:
-  dataset_root: "/mnt/cfs/vffey4/3dedit/data/partverse"
+  dataset_root: "/mnt/pfs/ca41bi/omni3d/partverse"
   source_glb_dir: "/mnt/cfs/vffey4/3dedit/data/partverse/source/normalized_glbs"
   captions_json: "/mnt/cfs/vffey4/3dedit/data/partverse/source/text_captions.json"
 
-  img_enc_dir: "/mnt/cfs/vffey4/3dedit/data/partverse/img_Enc"
-  slat_dir: "/mnt/cfs/vffey4/3dedit/data/partverse/slat"
-  images_npz_dir: "/mnt/cfs/vffey4/3dedit/data/partverse/images"
-  mesh_npz_dir: "/mnt/cfs/vffey4/3dedit/data/partverse/mesh"
-  cache_root: "/mnt/cfs/vffey4/3dedit/data/partverse/cache"
+  img_enc_dir: "/mnt/pfs/ca41bi/omni3d/partverse/img_Enc"
+  slat_dir: "/mnt/pfs/ca41bi/omni3d/partverse/slat"
+  images_npz_dir: "/mnt/pfs/ca41bi/omni3d/partverse/images"
+  mesh_npz_dir: "/mnt/pfs/ca41bi/omni3d/partverse/mesh"
+  cache_root: "/mnt/pfs/ca41bi/omni3d/partverse/cache"
 
 tools:
   blender_path: "blender"

@@ -7,6 +7,7 @@ Examples: ``python scripts/run_pipeline.py`` | ``--steps 3 4 5`` | ``--tag v1``
 | ``--dry-run``. Per-object mode: ``scripts/run_streaming.py``."""
 
 import argparse
+import faulthandler
 import json
 import os
 import subprocess
@@ -16,6 +17,8 @@ import tempfile
 import time
 from collections import Counter, OrderedDict
 from pathlib import Path
+
+faulthandler.enable(all_threads=True)
 
 # Ensure project root is on sys.path before any project imports
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -818,9 +821,13 @@ def run_step_3d_edit_multi_gpu(
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
-        logger.info("Launch worker %d on GPU %s with %d edits",
-                    wi, gpu, len(bucket))
-        procs.append((gpu, subprocess.Popen(cmd, env=env)))
+        env["PYTHONFAULTHANDLER"] = "1"
+        worker_log = cache_dir / f"worker_gpu{gpu}.log"
+        worker_log_fp = open(worker_log, "w")
+        logger.info("Launch worker %d on GPU %s with %d edits (log: %s)",
+                    wi, gpu, len(bucket), worker_log)
+        procs.append((gpu, subprocess.Popen(
+            cmd, env=env, stdout=worker_log_fp, stderr=subprocess.STDOUT)))
 
     if nongpu_pending:
         cpu_ids_path = dispatch_dir / "edit_ids_nongpu.txt"

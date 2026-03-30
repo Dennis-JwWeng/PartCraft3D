@@ -1,5 +1,179 @@
 # AI_LOG
 
+## 2026-03-30 — 环境配置脚本完善（跨机器一键部署）
+
+### 背景
+在当前机器调试过程中积累了大量环境级修复（spconv CUDA 版本、flash_attn、diffusers、warp-lang），换机器时需要重新手动操作。将这些修复固化到 `setup_pipeline_env.sh` 和 `setup_deploy_env.sh` 中，实现跨机器一键配置。
+
+### 改动
+
+**`scripts/tools/setup_env_common.sh`**
+- 新增 `detect_cuda_suffix()`：从 nvcc / nvidia-smi / torch.version.cuda 自动检测 CUDA 版本后缀（如 `cu124`）
+- 新增 `check_flash_attn()` / `check_xformers()`：实际执行 GPU 算子验证可用性（不仅仅检查 import）
+- 新增 `resolve_attn_backend()`：优先 flash_attn，fallback 到 xformers
+
+**`scripts/tools/setup_pipeline_env.sh`**（5 阶段流程）
+1. 核心依赖（requirements.txt + editable install）
+2. spconv + cumm 自动匹配 CUDA 版本（`spconv-cu{CUDA_SUFFIX}`），检测已安装版本是否匹配当前 CUDA
+3. warp-lang 安装
+4. Attention backend 智能选择：
+   - 优先 `pip install flash-attn --no-build-isolation`
+   - 失败则扫描同机器其他 conda 环境拷贝已编译的 flash_attn
+   - 均失败则 fallback 到 xformers
+   - 自动更新 `machine.env` 的 `ATTN_BACKEND` 和 YAML 配置的 `attn_backend`
+5. 最终验证（所有模块 import + GPU 可用性）
+
+**`scripts/tools/setup_deploy_env.sh`**
+- `diffusers` 版本约束从无约束改为 `>=0.37.1`（FLUX.2-klein-9B 的 `Flux2KleinPipeline` 需要）
+- 新增 `Flux2KleinPipeline` import 验证
+- `--check` 模式增加版本和 API 可用性报告
+
+**`requirements.txt`**
+- 新增 `warp-lang>=1.0`
+- spconv 注释更新为 CUDA 版本自适应说明
+- 新增 `setup_pipeline_env.sh` 引导说明
+
+### 跨机器部署流程
+```bash
+# 1. 创建 machine env（从模板复制，修改路径和 GPU 配置）
+cp configs/machine/wm1A800.env configs/machine/$(hostname).env
+vi configs/machine/$(hostname).env
+
+# 2. 一键配置 pipeline 环境（自动处理 spconv/flash_attn/xformers）
+bash scripts/tools/setup_pipeline_env.sh
+
+# 3. 一键配置 deploy 环境（VLM + image edit 服务）
+bash scripts/tools/setup_deploy_env.sh
+```
+
+### attention backend 决策逻辑
+| 优先级 | 条件 | 选择 |
+|--------|------|------|
+| 1 | flash_attn import 成功且 GPU 算子可执行 | `flash_attn` |
+| 2 | xformers import 成功且 memory_efficient_attention 可执行 | `xformers` |
+| 3 | 均不可用 | 报错退出，给出手动安装指引 |
+
+选择结果自动写入 `configs/machine/*.env` 和 `configs/partverse_*.yaml`。
+
+## 2026-03-30 — 本机管线配置修复（存储迁移 + diffusers 升级 + attn_backend）
+
+### 背景
+shard09 运行到 Step3 时，4 个图像编辑服务器全部启动失败，报错 `AttributeError: module diffusers has no attribute Flux2KleinPipeline`。同时发现 vffey4 存储占用 99%，以及 YAML 配置中存在多处与本机不符的参数。
+
+### 问题诊断
+
+| 问题 | 根因 |
+|------|------|
+| Step3 edit server 启动失败 | `diffusers==0.36.0` 缺少 `Flux2KleinPipeline`，模型 `model_index.json` 要求 `>=0.37.0.dev0` |
+| Step4 TRELLIS 会 crash | `pipeline.attn_backend: flash_attn`，但本机 `vinedresser3d` 环境未安装 `flash_attn` |
+| 存储空间不足 | `/mnt/cfs/vffey4`（20T）已用 99%，仅剩 392G；`/mnt/cfs/8o00i7`（256T）空闲 |
+| 无本机 hostname machine env | `run_shard_batch_pipeline.sh` 无法按 `$(hostname).env` 自动加载 |
+| image_edit_base_urls 多一条 | 原配置 5 条（端口 8004-8008），本机只有 4 GPU，第 5 条永远不健康 |
+
+### 改动
+
+**`qwen_test` conda 环境**
+- `diffusers 0.36.0` → `0.37.1`（从 PyPI main 安装）
+- 验证：`from diffusers import Flux2KleinPipeline` 可正常导入
+
+**新增 `configs/machine/aibox-rd3996bf91f9-7fb898c998-6kmcq.env`**
+- 本机 hostname 对应的 machine env，`run_shard_batch_pipeline.sh` 启动时自动加载
+- GPU 分配：4× A800-SXM4-80GB，`VLM_TP=1`（单卡 80GB 可容纳 Qwen3.5-27B ~54GB BF16）
+- `VLM_GPUS=0,1,2,3` → 4 个 VLM 实例并行（端口 8003-8006），Step1/2 吞吐 ×4
+- `EDIT_GPUS=0,1,2,3` → 4 个 FLUX edit server（端口 8004-8007）
+- `ATTN_BACKEND=xformers`
+- `OUTPUT_ROOT=/mnt/cfs/8o00i7/3dedit/outputs/partverse`（vffey4 已满，改写 8o00i7）
+- `DATA_DIR`/`TRELLIS_CKPT_ROOT`/`VLM_CKPT`/`EDIT_CKPT` 保留在 vffey4（只读，已有数据）
+
+**`configs/partverse_wm1A800_shard00.yaml`**
+- `pipeline.attn_backend: flash_attn` → `xformers`
+- `image_edit_base_urls`: 5 条 → 4 条（端口 8004-8007，匹配 4 GPU）
+- `image_edit_workers: 10` → `8`（4 servers × 2 workers）
+- `data.output_dir` → `/mnt/cfs/8o00i7/3dedit/outputs/partverse`
+
+### 存储格局（修复后）
+
+| 挂载点 | 容量 | 用途 |
+|--------|------|------|
+| `/mnt/cfs/vffey4` | 20T，99% 占用 | ckpts + data（只读） |
+| `/mnt/cfs/8o00i7` | 256T，0% 占用 | **新输出根目录** |
+| `/mnt/pfs/ca41bi` | 201T，35% 占用 | 备用 |
+
+### shard09 续跑说明
+shard09 的 phase0/phase1 cache 已迁移到 pfs（`/mnt/pfs/ca41bi/omni3d/partverse/shard_09/`），直接使用新配置续跑即可：
+```bash
+SHARD=09 STEPS=3,4,5,6 bash scripts/tools/run_shard_batch_pipeline.sh
+```
+
+### 存储格局（最终）
+
+| 挂载点 | 容量 | 用途 |
+|--------|------|------|
+| `/mnt/cfs/vffey4` | 20T，99% 占用 | ckpts 只读（Qwen/FLUX/TRELLIS） |
+| `/mnt/pfs/ca41bi/omni3d/partverse` | 201T，33% 占用 | **主数据目录 + 输出根目录** |
+| `/mnt/cfs/8o00i7` | 256T，空闲 | 备用 |
+
+`DATA_DIR` 与 `OUTPUT_ROOT` 均指向 pfs，shard_XX 输出产物直接写入数据目录下。
+
+## 2026-03-30 — Step4 Sampling 后保存崩溃修复（detach + 多 GPU 启动参数）
+
+### 问题
+Step4 的 4 个 GPU worker Sampling 全部正常完成（`Sampling: 100%` × 25 steps），但每条编辑在保存 NPZ 时全部失败：
+```
+partcraft.pipeline ERROR: Failed xxx: Can't call numpy() on Tensor that requires grad.
+Use tensor.detach().numpy() instead.
+```
+所有 per-GPU 结果 `edit_results_shard09_gpu{N}.jsonl` 中 ok=0、fail=全部。
+
+### 根因
+`trellis_refine.py` 的 `_save_npz()` 方法在将 Sampling 产出的 SLAT tensor 和 SS latent 保存为 `.npz` 时，直接调用 `.cpu().float().numpy()`。Sampling 返回的 `slat.feats` 和 `z_s` 带有 `requires_grad=True`（因 diffusion 反向采样中的梯度追踪），PyTorch 禁止对需要梯度的 tensor 调用 `.numpy()`。
+
+此外首次重启时启动命令缺少 `--gpus 0 1 2 3`，导致 `pipeline_orchestrator.py` 走了单 GPU 分支（`run_step_3d_edit` 而非 `run_step_3d_edit_multi_gpu`），只用 1 卡串行处理 29732 条编辑。
+
+### 改动
+
+| 文件 | 改动 |
+|------|------|
+| `partcraft/phase2_assembly/trellis_refine.py` | `_save_npz()` 中 `slat.feats` / `slat.coords` / `z_s` 在 `.cpu()` 前加 `.detach()` |
+
+启动命令修正：
+```bash
+python scripts/run_pipeline.py --config ... --steps 4 --shard 09 --gpus 0 1 2 3
+```
+
+### 验证
+修复后 4 卡 GPU worker 全部正常产出成功结果（gpu0: 2 ok, gpu1: 2 ok, gpu2: 1 ok, gpu3: 1 ok），显存 16-27 GB/卡，GPU 利用率 100%。
+
+## 2026-03-30 — Step4 GPU worker SIGFPE 修复（spconv 升级 + flash_attn 安装）
+
+### 问题
+Step4 的 4 个 GPU worker（处理 modification/scale/material 类型）在 TRELLIS Sampling 第一步全部被 SIGFPE (signal 8) 杀死，非 GPU worker（deletion/addition/identity）正常完成。
+
+### 诊断过程
+
+1. 初始怀疑 `xformers.ops.fmha.BlockDiagonalMask` 在 0.0.28 中被移到了 `attn_bias` 子模块 → 修复了 import 但 SIGFPE 依旧
+2. 安装 `flash_attn` 切换 attention backend → SIGFPE 依旧，排除 attention 层
+3. 在 `run_pipeline.py` 添加 `faulthandler.enable()` + GPU worker stdout 重定向到独立日志 → 捕获到 C 级崩溃堆栈
+4. 堆栈定位：`interweave_Trellis_TI → RF_sample_once → inference_model → structured_latent_flow.forward → SparseConv3d → spconv.implicit_gemm → cumm.tensorview.from_numpy → SIGFPE`
+
+### 根因
+`spconv-cu120` 2.3.6 + `cumm-cu120` 0.4.11 在 CUDA 12.4 运行时的 `implicit_gemm` 内核触发浮点异常。cu120 编译的算子与 cu124 驱动不完全兼容。
+
+### 改动
+
+| 操作 | 说明 |
+|------|------|
+| `spconv-cu120` 2.3.6 → `spconv-cu124` 2.3.8 | 匹配 CUDA 12.4，修复 `implicit_gemm` SIGFPE |
+| `cumm-cu120` 0.4.11 → `cumm-cu124` 0.7.11 | spconv-cu124 的依赖 |
+| 安装 `flash_attn` 2.7.3 | 从 `trellis2` 环境拷贝（torch 2.6+cu124 编译，兼容 torch 2.5） |
+| `ATTN_BACKEND` → `flash_attn` | `wm1A800.env` + `partverse_wm1A800_shard00.yaml` |
+| `run_pipeline.py` 添加 `faulthandler` | GPU worker 崩溃时输出 C 级堆栈 |
+| GPU worker stdout 重定向 | 写入 `cache/phase2_5/worker_gpu{N}.log`，不再混入主日志 |
+| `xformers` BlockDiagonalMask 兼容 | `full_attn.py` / `windowed_attn.py` / `serialized_attn.py` fallback 到 `attn_bias` 子模块 |
+
+### 验证
+Step4 4 卡 GPU worker 全部完成首次 Sampling (25 steps)，显存占用 18-26 GB/卡，正常写入 `edit_results_shard09_gpu{N}.jsonl`。
+
 ## 2026-03-30 — Save SS + SLAT as NPZ for all edit types
 
 ### 改动

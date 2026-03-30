@@ -175,6 +175,16 @@ def run_selected_steps(ctx: dict, *, args, cfg, logger, dataset, callbacks: dict
             callbacks["write_stage_diag"](report_dir, "step4_3d_edit", stage_diagnostics["step4"])
             callbacks["sync_manifest_link"](cfg, target_shard, "phase2_5", "edit_results.jsonl", Path(results_path))
 
+    # Fallback: if Step4 was not in this invocation but Step5/6 is requested,
+    # try to discover edit_results from the cache directory (resume-friendly).
+    if (5 in steps or 6 in steps) and (not results_path or not Path(results_path).exists()):
+        _p25_cache = cfg.get("phase2_5", {}).get("cache_dir", "")
+        if _p25_cache and run_token:
+            _candidate = Path(_p25_cache) / f"edit_results_{run_token}.jsonl"
+            if _candidate.exists():
+                results_path = str(_candidate)
+                logger.info(f"[resume] Discovered Step4 results from cache: {results_path}")
+
     if 5 in steps and (not results_path or not Path(results_path).exists()):
         raise FileNotFoundError(
             f"[CONFIG_ERROR] phase2_5.edit_results {results_path} runtime "
@@ -188,6 +198,15 @@ def run_selected_steps(ctx: dict, *, args, cfg, logger, dataset, callbacks: dict
             stage_diagnostics["step5"] = callbacks["diagnose_step5"](Path(scores_path))
             callbacks["write_stage_diag"](report_dir, "step5_quality", stage_diagnostics["step5"])
             callbacks["sync_manifest_link"](cfg, target_shard, "phase3", "vlm_scores.jsonl", Path(scores_path))
+
+    # Fallback: discover vlm_scores from cache if Step5 was not in this invocation.
+    if 6 in steps and (not scores_path or not Path(scores_path).exists()):
+        _p3_cache = cfg.get("phase3", {}).get("cache_dir", "")
+        if _p3_cache and run_token:
+            _candidate = Path(_p3_cache) / f"vlm_scores_{run_token}.jsonl"
+            if _candidate.exists():
+                scores_path = str(_candidate)
+                logger.info(f"[resume] Discovered Step5 scores from cache: {scores_path}")
 
     if 6 in steps and (not scores_path or not Path(scores_path).exists()):
         raise FileNotFoundError(

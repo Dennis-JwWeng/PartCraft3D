@@ -118,3 +118,73 @@ print_runtime_info() {
   python --version
   python -m pip --version
 }
+
+# ── CUDA helpers ────────────────────────────────────────────────
+
+detect_cuda_suffix() {
+  # Detect CUDA runtime version and output the pip suffix (e.g. "cu124").
+  # Falls back to "cu121" if detection fails.
+  python - <<'PY'
+import re, subprocess, sys
+for cmd in (["nvcc", "--version"], ["nvidia-smi"]):
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        m = re.search(r"(?:release |CUDA Version: )(\d+)\.(\d+)", out)
+        if m:
+            print(f"cu{m.group(1)}{m.group(2)}")
+            sys.exit(0)
+    except Exception:
+        pass
+try:
+    import torch
+    cv = torch.version.cuda
+    if cv:
+        parts = cv.split(".")
+        print(f"cu{parts[0]}{parts[1]}")
+        sys.exit(0)
+except Exception:
+    pass
+print("cu121")
+PY
+}
+
+check_flash_attn() {
+  # Returns 0 if flash_attn is importable and functional, 1 otherwise.
+  python - <<'PY' 2>/dev/null
+import torch, flash_attn
+q = torch.randn(1, 1, 2, 64, dtype=torch.float16, device="cuda")
+k = torch.randn(1, 1, 2, 64, dtype=torch.float16, device="cuda")
+v = torch.randn(1, 1, 2, 64, dtype=torch.float16, device="cuda")
+flash_attn.flash_attn_func(q, k, v)
+print(f"flash_attn {flash_attn.__version__} ok")
+PY
+}
+
+check_xformers() {
+  # Returns 0 if xformers memory_efficient_attention works, 1 otherwise.
+  python - <<'PY' 2>/dev/null
+import torch, xformers.ops
+q = torch.randn(1, 2, 64, dtype=torch.float16, device="cuda")
+k = torch.randn(1, 2, 64, dtype=torch.float16, device="cuda")
+v = torch.randn(1, 2, 64, dtype=torch.float16, device="cuda")
+xformers.ops.memory_efficient_attention(q, k, v)
+import xformers
+print(f"xformers {xformers.__version__} ok")
+PY
+}
+
+resolve_attn_backend() {
+  # Determine the best attention backend. Priority: flash_attn > xformers.
+  # Prints the chosen backend name and returns 0.
+  # If neither works, prints "xformers" (safest default) and returns 1.
+  if check_flash_attn; then
+    echo "flash_attn"
+    return 0
+  fi
+  if check_xformers; then
+    echo "xformers"
+    return 0
+  fi
+  echo "xformers"
+  return 1
+}

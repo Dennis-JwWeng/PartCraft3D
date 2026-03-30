@@ -1310,11 +1310,11 @@ class TrellisRefiner:
     def _save_npz(path: Path, slat, z_s: torch.Tensor | None) -> None:
         """Write a single ``{tag}.npz`` containing SLAT + SS."""
         data = {
-            "slat_feats": slat.feats.cpu().float().numpy(),
-            "slat_coords": slat.coords.cpu().int().numpy(),
+            "slat_feats": slat.feats.detach().cpu().float().numpy(),
+            "slat_coords": slat.coords.detach().cpu().int().numpy(),
         }
         if z_s is not None:
-            data["ss"] = z_s.cpu().float().numpy()
+            data["ss"] = z_s.detach().cpu().float().numpy()
         np.savez(path, **data)
 
     def export_pair(

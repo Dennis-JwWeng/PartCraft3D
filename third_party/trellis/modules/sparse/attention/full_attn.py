@@ -194,7 +194,8 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
         q = q.unsqueeze(0)
         k = k.unsqueeze(0)
         v = v.unsqueeze(0)
-        mask = xops.fmha.BlockDiagonalMask.from_seqlens(q_seqlen, kv_seqlen)
+        _BlockDiagonalMask = getattr(xops.fmha, 'BlockDiagonalMask', None) or xops.fmha.attn_bias.BlockDiagonalMask
+        mask = _BlockDiagonalMask.from_seqlens(q_seqlen, kv_seqlen)
         out = xops.memory_efficient_attention(q, k, v, mask)[0]
     elif ATTN == 'flash_attn':
         cu_seqlens_q = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(q_seqlen), dim=0)]).int().to(device)

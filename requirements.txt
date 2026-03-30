@@ -2,8 +2,10 @@
 # Install: pip install -r requirements.txt
 #
 # Prerequisites (install separately, version must match your CUDA):
-#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
-#   pip install spconv-cu121>=2.3
+#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+#   pip install spconv-cu124>=2.3   (replace cu124 with your CUDA version suffix)
+#
+# Or run: bash scripts/tools/setup_pipeline_env.sh  (auto-detects CUDA)
 
 # ============================================================
 # Core scientific
@@ -40,11 +42,12 @@ matplotlib>=3.7
 # ============================================================
 # torch>=2.1              # see Prerequisites above
 # torchvision>=0.16       # see Prerequisites above
+warp-lang>=1.0
 transformers>=4.36
 easydict>=1.10
 rembg>=2.0
 utils3d>=0.6
-# spconv-cu121>=2.3       # see Prerequisites above
+# spconv-cu{CUDA}>=2.3    # auto-installed by setup_pipeline_env.sh
 igraph>=0.11
 xatlas>=0.0.7
 pymeshfix>=0.16
