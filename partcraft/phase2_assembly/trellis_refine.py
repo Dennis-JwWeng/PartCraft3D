@@ -218,21 +218,20 @@ class TrellisRefiner:
                 f"[CONFIG_ERROR] ckpt_root {self.ckpt_dir} config directory does not exist"
             )
 
-        if not slat_dir or not img_enc_dir:
+        if not slat_dir:
             raise ValueError(
-                "[CONFIG_ERROR] data.slat_dir/data.img_enc_dir <missing> config "
+                "[CONFIG_ERROR] data.slat_dir <missing> config "
                 "must be explicitly provided to TrellisRefiner"
             )
         self.slat_dir = Path(slat_dir)
-        self.img_enc_dir = Path(img_enc_dir)
+        self.img_enc_dir = Path(img_enc_dir) if img_enc_dir else None
         if not self.slat_dir.exists():
             raise ValueError(
                 f"[CONFIG_ERROR] data.slat_dir {self.slat_dir} config path does not exist"
             )
-        if not self.img_enc_dir.exists():
-            raise ValueError(
-                f"[CONFIG_ERROR] data.img_enc_dir {self.img_enc_dir} config path does not exist"
-            )
+        if self.img_enc_dir and not self.img_enc_dir.exists():
+            logger.warning("data.img_enc_dir %s does not exist; will use mesh NPZ fallback", self.img_enc_dir)
+            self.img_enc_dir = None
 
         self.debug = debug or os.environ.get("PARTCRAFT_DEBUG", "").lower() in ("1", "true")
 
@@ -379,8 +378,8 @@ class TrellisRefiner:
         # Load VD's normalized mesh for reference frame.
         # Prefer img_Enc/mesh.ply; fall back to full.ply packed in mesh NPZ
         # (mesh.ply is deleted after packing, but full.ply is equivalent).
-        vd_mesh_path = str(self.img_enc_dir / obj_id / "mesh.ply")
-        if os.path.exists(vd_mesh_path):
+        vd_mesh_path = str(self.img_enc_dir / obj_id / "mesh.ply") if self.img_enc_dir else None
+        if vd_mesh_path and os.path.exists(vd_mesh_path):
             vd_mesh = o3d.io.read_triangle_mesh(vd_mesh_path)
         else:
             npz = np.load(obj_record.mesh_npz_path, allow_pickle=False)

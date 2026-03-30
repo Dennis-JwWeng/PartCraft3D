@@ -155,13 +155,13 @@ def create_dataset(cfg: dict) -> PartCraftDataset:
 
 
 def resolve_data_dirs(cfg: dict) -> tuple[str | None, str | None]:
-    """Return strict (slat_dir, img_enc_dir) from config data section.
+    """Return (slat_dir, img_enc_dir) from config data section.
 
-    Reads optional fields:
-        data.slat_dir     — pre-encoded SLAT ({obj_id}_feats.pt / _coords.pt)
-        data.img_enc_dir  — Blender render outputs ({obj_id}/000.png .. voxels.ply)
+    Reads fields:
+        data.slat_dir     — pre-encoded SLAT ({obj_id}_feats.pt / _coords.pt)  [required]
+        data.img_enc_dir  — Blender render outputs ({obj_id}/000.png .. voxels.ply)  [optional]
 
-    Both keys are required; missing keys raise ValueError.
+    slat_dir is required; img_enc_dir may be None (mesh NPZ fallback used).
     """
     data_cfg = cfg.get("data", {})
     slat_dir = data_cfg.get("slat_dir", None)
@@ -169,11 +169,6 @@ def resolve_data_dirs(cfg: dict) -> tuple[str | None, str | None]:
     if not slat_dir:
         raise ValueError(
             "[CONFIG_ERROR] data.slat_dir <missing> config "
-            "must be set explicitly; no runtime fallback is allowed"
-        )
-    if not img_enc_dir:
-        raise ValueError(
-            "[CONFIG_ERROR] data.img_enc_dir <missing> config "
             "must be set explicitly; no runtime fallback is allowed"
         )
     return slat_dir, img_enc_dir

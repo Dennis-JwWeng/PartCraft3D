@@ -1,23 +1,31 @@
 # AI_LOG
 
-## 2026-03-30 — node39 配置整理 & 管线/预渲染配置可读性改进
+## 2026-03-30 — node39 配置整理 & 管线启动修复
 
 ### 改动
+
+**配置文件**
 - 重写 `configs/partverse_node39_shard01.yaml`：
   - 所有路径与 `configs/machine/node39.env` 对齐（ckpt_root、blender_path 等）
   - 补充 `export_ply: false` / `export_ply_for_deletion: true`（默认不写 PLY）
   - `phase2_5` 多服务端口与实际运行一致（5 GPU × 5 端口 8004-8008）
-  - `pipeline.attn_backend` 改为 `flash_attn`
+  - `pipeline.attn_backend` 改为 `xformers`（node39 无 flash_attn）
   - 各 section 加中文注释分隔 + 字段对齐，提升可读性
-  - 顶部注释更新一键和手动两种启动方式
 - 新建 `configs/prerender_partverse_node39.yaml`：
-  - 所有路径绑定 node39 绝对路径（data_dir、dataset_root、blender_path）
-  - 顶部注释包含渲染、编码、打包三种用法
-  - 与 `prerender_partverse.yaml` 结构一致，仅路径具体化
+  - 所有路径绑定 node39 绝对路径
+- `configs/machine/node39.env`：新增 `ATTN_BACKEND=xformers`
+- `scripts/tools/run_shard_batch_pipeline.sh`：`ATTN_BACKEND` 从硬编码 `flash_attn` 改为 `${ATTN_BACKEND:-xformers}`
 
-### 目的
-- 消除配置与实际环境的路径不一致（如 ckpt_root 为空、blender_path 用默认 "blender"）
-- 管线和预渲染各有独立的 node39 配置，开箱可用
+**管线数据路径修复**（`img_enc_dir` 不应被管线要求）
+- 问题：`derive_dataset_subpaths` 会自动派生 `img_enc_dir = data_dir/img_Enc`，但编辑管线只需要打包后的 `images/*.npz` + `slat/`，不需要预渲染原始输出 `img_Enc/`。之前跑通是因为旧代码没有对 `img_enc_dir` 做存在性校验，"Config 驱动与显式失败"改动加了强校验后导致启动报错。
+- `partcraft/utils/config.py`：`derive_dataset_subpaths` 不再自动派生 `img_enc_dir`（只派生 `image_npz_dir`、`mesh_npz_dir`、`slat_dir`）。预渲染链路仍通过 `paths.img_enc_dir` 显式配置。
+- `scripts/pipeline_common.py`：`resolve_data_dirs()` 的 `img_enc_dir` 从必需改为可选（返回 `None` 时由 TrellisRefiner 走 mesh NPZ fallback）
+- `partcraft/phase2_assembly/trellis_refine.py`：`img_enc_dir` 初始化校验改为 warning + fallback（`None` 时从 `mesh.npz` 读 `full.ply`）
+
+### 数据路径职责边界
+- **预渲染**需要 `img_enc_dir`（`paths.img_enc_dir`）：产出原始渲染图和 `mesh.ply`
+- **编辑管线**只需要打包后的产物：`images/*.npz`（`image_npz_dir`）、`mesh/*.npz`（`mesh_npz_dir`）、`slat/`（`slat_dir`）
+- `img_enc_dir` 在管线中唯一的消费点是 `trellis_refine.py` 加载 VD mesh.ply 的 fallback 路径，而 `mesh.npz` 中的 `full.ply` 已经是等价替代
 
 ## 2026-03-30 — Step4 默认不落盘 PLY（保留可选导出）
 

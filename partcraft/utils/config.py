@@ -131,7 +131,6 @@ def _apply_data_roots_and_layout(cfg: dict) -> None:
         ("image_npz_dir", "images"),
         ("mesh_npz_dir", "mesh"),
         ("slat_dir", "slat"),
-        ("img_enc_dir", "img_Enc"),
     )
     for key, sub in mapping:
         v = data.get(key, None)

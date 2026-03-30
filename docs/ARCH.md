@@ -57,9 +57,16 @@ Step1 的 prompt 生成分为“VLM 主生成 + 模板兜底”两层：
 
 数据预处理的目标是把原始数据统一转换成 batch/streaming 可消费的数据契约：
 
-- `data/*/images/{shard}/{obj_id}.npz`
-- `data/*/mesh/{shard}/{obj_id}.npz`
-- （可选）`data/*/slat/{shard}/{obj_id}_feats.pt`、`{obj_id}_coords.pt`
+- `data/*/images/{shard}/{obj_id}.npz`  — 打包后的多视角渲染图（`image_npz_dir`）
+- `data/*/mesh/{shard}/{obj_id}.npz`    — 打包后的网格（含 `full.ply`）（`mesh_npz_dir`）
+- `data/*/slat/{shard}/{obj_id}_feats.pt`、`{obj_id}_coords.pt`  — SLAT 编码（`slat_dir`）
+
+### 管线 vs 预渲染数据路径职责（2026-03-30 对齐）
+
+- **预渲染**产出并依赖 `img_Enc/`（`paths.img_enc_dir`）：原始渲染图 + `mesh.ply`
+- **编辑管线**只依赖打包后的产物：`images/*.npz`、`mesh/*.npz`、`slat/`
+- `derive_dataset_subpaths: true` 只自动派生 `image_npz_dir`、`mesh_npz_dir`、`slat_dir`，**不派生 `img_enc_dir`**
+- `img_enc_dir` 在管线中唯一消费点是 `trellis_refine.py` 加载 VD mesh 的可选 fallback；不存在时从 `mesh.npz` 中读 `full.ply`
 
 ### 共享预处理能力
 

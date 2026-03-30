@@ -79,7 +79,7 @@ phase2:
 
 # ── Pipeline 全局 ──────────────────────────────────────────────────
 pipeline:
-  attn_backend:          "flash_attn"
+  attn_backend:          "xformers"
   lookahead_objects:     0
 
 # ── Phase 2.5: TRELLIS 3D 编辑 + 2D 图像编辑 ──────────────────────

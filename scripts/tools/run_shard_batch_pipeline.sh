@@ -275,7 +275,7 @@ PY
 run_pipeline_cmd() {
   # Ensure conda function is available, then switch to pipeline env
   set +u; source "${CONDA_INIT}" && conda activate "${CONDA_ENV_PIPELINE}"; set -u
-  ATTN_BACKEND=flash_attn PARTCRAFT_CKPT_ROOT="${TRELLIS_CKPT_ROOT}" "$@"
+  ATTN_BACKEND="${ATTN_BACKEND:-xformers}" PARTCRAFT_CKPT_ROOT="${TRELLIS_CKPT_ROOT}" "$@"
 }
 
 run_step12() {
