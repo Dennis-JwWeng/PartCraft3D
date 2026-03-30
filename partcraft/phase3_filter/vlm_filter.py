@@ -689,10 +689,10 @@ def run_vlm_filter(
             eid = entry["edit_id"]
             pair_dir = mesh_pairs_dir / eid
 
-            slat_before = pair_dir / "before_slat"
-            slat_after = pair_dir / "after_slat"
+            has_before = (pair_dir / "before.npz").exists() or (pair_dir / "before_slat").exists()
+            has_after = (pair_dir / "after.npz").exists() or (pair_dir / "after_slat").exists()
 
-            if not slat_before.exists() or not slat_after.exists():
+            if not has_before or not has_after:
                 score = VLMScore(edit_id=eid, edit_type=entry.get("edit_type", ""),
                                  reason="SLAT files missing")
                 score_dict = score.to_dict()

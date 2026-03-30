@@ -1,5 +1,55 @@
 # AI_LOG
 
+## 2026-03-30 — Save SS + SLAT as NPZ for all edit types
+
+### 改动
+
+**`third_party/interweave_Trellis.py`**
+- `interweave_Trellis_TI` 返回值从 `slat_new` 改为 `{"slat": slat_new, "z_s_before": z_s, "z_s_after": z_s_new}`
+- TextureOnly 分支新增 SS encoder 编码（`z_s = z_s_new`，结构不变）
+- Deletion/HybridDeletion 分支新增 SS encoder 编码 before/after
+
+**`partcraft/phase2_assembly/trellis_refine.py`**
+- 新增 `encode_ss(coords)` 方法：从坐标构建占据网格并编码为 SS VAE latent
+- `edit()` 返回值改为 `list[dict]`（每个 dict 包含 `slat`, `z_s_before`, `z_s_after`）
+- `export_pair()` / `export_pair_shared_before()` 重写为保存 `before.npz` / `after.npz`（keys: `slat_feats`, `slat_coords`, `ss`）
+- 新增 `export_deletion_pair()` 方法：对 deletion 编辑类型进行 SLAT 过滤 + SS 编码 + npz 保存
+- 新增 `load_pair_npz()` 静态方法：兼容读取新 npz 格式和旧 `*_slat/` 目录格式
+
+**`scripts/pipeline_step_3d.py`**
+- GPU 编辑路径：解包 `edit()` 返回的 dict，传递 `z_s_before`/`z_s_after` 到 `export_pair`
+- Deletion 路径：新增 `ensure_refiner()` + `build_part_mask` + `export_deletion_pair` 以产出 SLAT+SS npz
+- Addition 路径：复制 npz 文件（before/after 互换）
+- Identity 路径：复制 `before.npz` 到 before/after
+- 复用 deletion 已加载的 `ori_slat`，避免 GPU 编辑路径重复加载
+
+**`partcraft/streaming_lookahead.py`**
+- Deletion/GPU/Addition/Identity 路径同步更新（与 pipeline_step_3d.py 对齐）
+
+**下游消费者兼容更新**
+- `scripts/merge_streaming_workers.py`：完成度检测增加 `after.npz`
+- `partcraft/phase3_filter/vlm_filter.py`：存在性检测增加 `before.npz`/`after.npz`
+- `scripts/vis/render_gs_pairs.py`：`load_slat()` 优先从 npz 加载，fallback 到旧格式
+- `scripts/datasets/partobjaverse/build_dataset.py`：数据集构建同时记录 npz 和旧格式路径
+
+### 产物格式
+
+```
+mesh_pairs/{edit_id}/
+  before.npz   # keys: slat_feats [N,8], slat_coords [N,4], ss [C,R,R,R]
+  after.npz    # keys: slat_feats [N,8], slat_coords [N,4], ss [C,R,R,R]
+```
+
+### 编辑类型覆盖
+
+| 编辑类型 | SS 来源 | SLAT 来源 |
+|----------|---------|-----------|
+| modification, scale | interweave S1 repaint z_s/z_s_new | interweave S2 repaint |
+| material, global | SS encoder 从 coords 编码（before==after） | interweave S2 repaint |
+| deletion | SS encoder 从原始/过滤后 coords 编码 | 原始 SLAT 过滤 |
+| addition | 从 deletion 复制并互换 before/after | 从 deletion 复制并互换 |
+| identity | 从首个编辑对复制 before.npz | 从首个编辑对复制 |
+
 ## 2026-03-30 — node39 配置整理 & 管线启动修复
 
 ### 改动

@@ -29,6 +29,19 @@
 
 输出遵循 shard 目录下 `pipeline/reports` 与 `pipeline/manifests`，保持 JSONL/resume 兼容。
 
+### Step4 编辑产物格式（2026-03-30 对齐）
+
+Step4 每个编辑对保存为 `mesh_pairs/{edit_id}/before.npz` + `after.npz`，每个 npz 包含：
+
+- `slat_feats` `[N, C_slat]`：Stage-2 structured latent 特征
+- `slat_coords` `[N, 4]`：体素坐标 `[batch, x, y, z]`
+- `ss` `[C_ss, R, R, R]`：Stage-1 sparse structure VAE latent
+
+所有编辑类型（modification/scale/material/global/deletion/addition/identity）均产出完整的 SS + SLAT 对。
+deletion 通过 SLAT 过滤 + SS 编码产出；addition 从 deletion 复制并互换 before/after。
+
+旧格式（`before_slat/feats.pt` + `coords.pt` 目录）由下游消费者兼容读取。
+
 ### Step1/Step4 中断恢复协议（2026-03-29 对齐）
 
 Step1 与 Step4 的多 worker 执行统一采用“先合并、再失败”的恢复语义，避免 worker crash 时已完成结果丢失：

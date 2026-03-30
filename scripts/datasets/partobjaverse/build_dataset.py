@@ -193,6 +193,18 @@ def build_dataset(mesh_pairs_dir: Path, results_files: list[Path],
                 edit_entry["before_ply"] = relpath(pair_dir / "before.ply")
                 edit_entry["after_ply"]  = relpath(pair_dir / "after.ply")
 
+                # npz format (new)
+                before_npz = pair_dir / "before.npz"
+                after_npz  = pair_dir / "after.npz"
+                has_bn = before_npz.exists()
+                has_an = after_npz.exists()
+
+                if has_bn:
+                    edit_entry["before_npz"] = relpath(before_npz)
+                if has_an:
+                    edit_entry["after_npz"] = relpath(after_npz)
+
+                # legacy slat dirs
                 before_slat = pair_dir / "before_slat"
                 after_slat  = pair_dir / "after_slat"
                 has_bs = before_slat.exists() and (before_slat / "feats.pt").exists()
@@ -202,8 +214,8 @@ def build_dataset(mesh_pairs_dir: Path, results_files: list[Path],
                     edit_entry["before_slat"] = relpath(before_slat)
                 if has_as:
                     edit_entry["after_slat"] = relpath(after_slat)
-                edit_entry["has_slat_pair"] = has_bs and has_as
-                if has_bs and has_as:
+                edit_entry["has_slat_pair"] = (has_bn and has_an) or (has_bs and has_as)
+                if (has_bn and has_an) or (has_bs and has_as):
                     total_slat_pairs += 1
 
             type_counts[etype] += 1

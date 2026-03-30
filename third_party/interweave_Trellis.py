@@ -440,10 +440,23 @@ def interweave_Trellis_TI(args, trellis_text, trellis_img,
         coords_new = torch.argwhere(s1_decoder(z_s_new)>0)[:, [0, 2, 3, 4]].int()
     elif args['edit_type'] == "TextureOnly":
         # Keep original sparse structure unchanged — only S2 changes texture
+        sparse_voxels = torch.zeros(64, 64, 64).to(device)
+        sparse_voxels[slat.coords[:, 1], slat.coords[:, 2], slat.coords[:, 3]] = 1
+        sparse_voxels = sparse_voxels.unsqueeze(0).unsqueeze(0)
+        z_s = s1_encoder(sparse_voxels)
+        z_s_new = z_s
         coords_new = slat.coords.clone()
     elif args['edit_type'] in ("Deletion", "HybridDeletion"):
         # Pure voxel removal — no S1 repaint, no new structure generated
+        sparse_voxels = torch.zeros(64, 64, 64).to(device)
+        sparse_voxels[slat.coords[:, 1], slat.coords[:, 2], slat.coords[:, 3]] = 1
+        sparse_voxels = sparse_voxels.unsqueeze(0).unsqueeze(0)
+        z_s = s1_encoder(sparse_voxels)
         coords_new = slat.coords[get_coords_mask(slat.coords, mask)]
+        sparse_voxels_new = torch.zeros(64, 64, 64).to(device)
+        sparse_voxels_new[coords_new[:, 1], coords_new[:, 2], coords_new[:, 3]] = 1
+        sparse_voxels_new = sparse_voxels_new.unsqueeze(0).unsqueeze(0)
+        z_s_new = s1_encoder(sparse_voxels_new)
     else:
         raise ValueError(f"Invalid edit type: {args['edit_type']}")
         
@@ -481,4 +494,4 @@ def interweave_Trellis_TI(args, trellis_text, trellis_img,
         cnt += 1
     slat_new = sample * std + mean
     
-    return slat_new
+    return {"slat": slat_new, "z_s_before": z_s, "z_s_after": z_s_new}

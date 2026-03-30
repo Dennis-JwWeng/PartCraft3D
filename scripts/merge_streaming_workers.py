@@ -174,7 +174,9 @@ def _mesh_pair_stats(mesh_pairs_dir: Path) -> tuple[int, int]:
     subdirs = [d for d in mesh_pairs_dir.iterdir() if d.is_dir()]
     with_after = sum(
         1 for d in subdirs
-        if (d / "after.ply").is_file() or (d / "after_slat").is_dir()
+        if (d / "after.npz").is_file()
+        or (d / "after.ply").is_file()
+        or (d / "after_slat").is_dir()
     )
     return with_after, len(subdirs)
 

@@ -26,12 +26,18 @@ def _copy_addition_from_deletion(mesh_pairs_dir: Path, spec: EditSpec, obj_id: s
     del_pair_dir = mesh_pairs_dir / spec.source_del_id
     add_pair_dir = mesh_pairs_dir / spec.edit_id
     has_source_pair = (
-        (del_pair_dir / "before.ply").exists() or (del_pair_dir / "before_slat").exists()
+        (del_pair_dir / "before.npz").exists()
+        or (del_pair_dir / "before.ply").exists()
+        or (del_pair_dir / "before_slat").exists()
     )
     if not has_source_pair:
         return False
     add_pair_dir.mkdir(parents=True, exist_ok=True)
     for src, dst in [
+        # npz format (new)
+        (del_pair_dir / "before.npz", add_pair_dir / "after.npz"),
+        (del_pair_dir / "after.npz", add_pair_dir / "before.npz"),
+        # legacy formats (compat)
         (del_pair_dir / "before_slat", add_pair_dir / "after_slat"),
         (del_pair_dir / "after_slat", add_pair_dir / "before_slat"),
         (del_pair_dir / "before.ply", add_pair_dir / "after.ply"),
@@ -364,6 +370,19 @@ def process_object_edits(
                 fail += len(cpu_specs) + len(gpu_specs)
                 continue
 
+            # Pre-load SLAT once for all deletion specs on this object
+            del_refiner = None
+            del_ori_slat = None
+            if cpu_specs:
+                try:
+                    del_refiner = ensure_refiner()
+                    del_ori_slat = del_refiner.encode_object(None, obj_id)
+                except Exception as e:
+                    logger.warning(
+                        "Cannot load SLAT for deletion SLAT+SS export on %s: %s "
+                        "(GT mesh PLY will still be exported)", obj_id, e,
+                    )
+
             for spec in cpu_specs:
                 logger.info('\n[%d/%d] %s (%s): "%s"', success + fail + 1, len(pending), spec.edit_id, spec.edit_type, spec.edit_prompt[:80])
                 try:
@@ -374,6 +393,20 @@ def process_object_edits(
                         pair_dir,
                         export_ply=export_ply_for_deletion,
                     )
+                    # Export SLAT + SS as npz alongside the GT mesh
+                    if del_refiner is not None and del_ori_slat is not None:
+                        try:
+                            del_mask, _ = del_refiner.build_part_mask(
+                                obj_id, obj_record,
+                                spec.remove_part_ids, del_ori_slat,
+                                "Deletion",
+                            )
+                            slat_ss_paths = del_refiner.export_deletion_pair(
+                                del_ori_slat, del_mask, pair_dir,
+                            )
+                            export_paths.update(slat_ss_paths)
+                        except Exception as e:
+                            logger.warning("Deletion SLAT+SS export failed for %s: %s", spec.edit_id, e)
                     write_step4_record(out_fp, {
                         "edit_id": spec.edit_id,
                         "edit_type": spec.edit_type,
@@ -412,7 +445,7 @@ def process_object_edits(
             if gpu_specs:
                 try:
                     step_refiner = ensure_refiner()
-                    ori_slat = step_refiner.encode_object(None, obj_id)
+                    ori_slat = del_ori_slat if del_ori_slat is not None else step_refiner.encode_object(None, obj_id)
                     ori_gaussian = step_refiner.decode_to_gaussian(ori_slat)
                 except Exception as e:
                     logger.error("Failed to prepare TRELLIS state for %s: %s", obj_id, e)
@@ -492,7 +525,7 @@ def process_object_edits(
                         logger=logger,
                         prompts=prompts,
                     )
-                    slats_edited = step_refiner.edit(
+                    edit_results = step_refiner.edit(
                         ori_slat,
                         mask,
                         prompts,
@@ -500,15 +533,16 @@ def process_object_edits(
                         seed=seed,
                         combinations=combinations,
                     )
-                    if not slats_edited:
+                    if not edit_results:
                         raise RuntimeError("No edited SLATs produced")
-                    best_slat = slats_edited[0]
+                    best = edit_results[0]
                     pair_dir = mesh_pairs_dir / spec.edit_id
                     export_paths = step_refiner.export_pair(
                         ori_slat,
-                        best_slat,
+                        best["slat"],
                         pair_dir,
-                        export_ply=export_ply,
+                        z_s_before=best["z_s_before"],
+                        z_s_after=best["z_s_after"],
                     )
                     write_step4_record(out_fp, {
                         "edit_id": spec.edit_id,
@@ -536,10 +570,15 @@ def process_object_edits(
 
             for spec in idt_specs:
                 idt_pair = mesh_pairs_dir / spec.edit_id
+                has_before_npz = bool(first_pair_dir and (first_pair_dir / "before.npz").exists())
                 has_before_ply = bool(first_pair_dir and (first_pair_dir / "before.ply").exists())
                 has_before_slat = bool(first_pair_dir and (first_pair_dir / "before_slat").exists())
-                if has_before_ply or has_before_slat:
+                if has_before_npz or has_before_ply or has_before_slat:
                     idt_pair.mkdir(parents=True, exist_ok=True)
+                    if has_before_npz:
+                        src_npz = first_pair_dir / "before.npz"
+                        shutil.copy2(str(src_npz), str(idt_pair / "before.npz"))
+                        shutil.copy2(str(src_npz), str(idt_pair / "after.npz"))
                     if has_before_ply:
                         before_ply = first_pair_dir / "before.ply"
                         shutil.copy2(str(before_ply), str(idt_pair / "before.ply"))

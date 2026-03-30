@@ -137,10 +137,16 @@ def sample_pairs_by_type(
 # SLAT / Gaussian helpers
 # ---------------------------------------------------------------------------
 
-def load_slat(slat_dir: Path, device: str = "cuda"):
-    """Load SLAT from feats.pt + coords.pt (follows symlinks)."""
+def load_slat(path: Path, device: str = "cuda"):
+    """Load SLAT from npz or legacy feats.pt + coords.pt directory."""
     from trellis.modules import sparse as sp
-    resolved = slat_dir.resolve()
+    npz_path = path if path.suffix == ".npz" else path.with_suffix(".npz")
+    if npz_path.exists():
+        data = np.load(str(npz_path))
+        feats = torch.from_numpy(data["slat_feats"]).to(device)
+        coords = torch.from_numpy(data["slat_coords"]).to(device)
+        return sp.SparseTensor(feats=feats, coords=coords)
+    resolved = path.resolve()
     feats = torch.load(resolved / "feats.pt", weights_only=True)
     coords = torch.load(resolved / "coords.pt", weights_only=True)
     return sp.SparseTensor(feats=feats.to(device), coords=coords.to(device))
@@ -390,11 +396,14 @@ def main():
 
     valid_pairs = []
     for d in pair_dirs:
-        before_slat = d / "before_slat"
-        after_slat = d / "after_slat"
-        # Resolve symlinks (before_slat may be a relative symlink to shared dir)
-        has_before = (before_slat.resolve() / "feats.pt").exists()
-        has_after = (after_slat.resolve() / "feats.pt").exists()
+        has_before = (d / "before.npz").exists()
+        has_after = (d / "after.npz").exists()
+        if not has_before:
+            bs = d / "before_slat"
+            has_before = (bs.resolve() / "feats.pt").exists() if bs.exists() else False
+        if not has_after:
+            a_s = d / "after_slat"
+            has_after = (a_s.resolve() / "feats.pt").exists() if a_s.exists() else False
         if has_before and has_after:
             valid_pairs.append(d)
         else:
@@ -465,7 +474,8 @@ def main():
         # Decode both SLATs to Gaussian
         gaussians = {}
         for tag in ['before', 'after']:
-            slat = load_slat(pair_dir / f"{tag}_slat")
+            npz_path = pair_dir / f"{tag}.npz"
+            slat = load_slat(npz_path if npz_path.exists() else pair_dir / f"{tag}_slat")
             outputs = pipeline.decode_slat(slat, ['gaussian'])
             gaussians[tag] = outputs['gaussian'][0]
 

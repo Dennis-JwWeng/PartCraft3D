@@ -312,6 +312,20 @@ def run_streaming_with_lookahead(
                             pair_dir,
                             export_ply=export_ply_for_deletion,
                         )
+                        try:
+                            del_mask, _ = refiner.build_part_mask(
+                                uid, obj_record,
+                                spec.remove_part_ids, ori_slat,
+                                "Deletion",
+                            )
+                            slat_ss_paths = refiner.export_deletion_pair(
+                                ori_slat, del_mask, pair_dir,
+                            )
+                            export_paths.update(slat_ss_paths)
+                        except Exception as e:
+                            logger.warning(
+                                "Deletion SLAT+SS export failed for %s: %s",
+                                spec.edit_id, e)
                         rec = {
                             "edit_id": spec.edit_id,
                             "edit_type": spec.edit_type,
@@ -457,17 +471,19 @@ def run_streaming_with_lookahead(
                                 edited_images, original_images,
                                 edit_strength=edit_strength)
 
-                    slats_edited = refiner.edit(
+                    edit_results = refiner.edit(
                         ori_slat, mask, prompts,
                         img_cond=img_cond, seed=args.seed)
-                    if not slats_edited:
+                    if not edit_results:
                         raise RuntimeError("No edited SLATs produced")
 
+                    best = edit_results[0]
                     pair_dir = mesh_pairs_dir / spec.edit_id
                     export_paths = refiner.export_pair_shared_before(
-                        ori_slat, slats_edited[0], pair_dir,
+                        ori_slat, best["slat"], pair_dir,
                         shared_before_dir=first_pair_dir,
-                        export_ply=export_ply,
+                        z_s_before=best["z_s_before"],
+                        z_s_after=best["z_s_after"],
                     )
 
                     rec = {
@@ -503,13 +519,18 @@ def run_streaming_with_lookahead(
                     continue
                 del_pair = mesh_pairs_dir / spec.source_del_id
                 add_pair = mesh_pairs_dir / spec.edit_id
-                del_has_output = ((del_pair / "before_slat").exists()
-                                  or (del_pair / "before.ply").exists())
+                del_has_output = (
+                    (del_pair / "before.npz").exists()
+                    or (del_pair / "before_slat").exists()
+                    or (del_pair / "before.ply").exists()
+                )
                 if del_has_output:
                     if add_pair.exists():
                         shutil.rmtree(str(add_pair))
                     add_pair.mkdir(parents=True, exist_ok=True)
                     for src, dst in [
+                        (del_pair / "before.npz", add_pair / "after.npz"),
+                        (del_pair / "after.npz", add_pair / "before.npz"),
                         (del_pair / "before_slat", add_pair / "after_slat"),
                         (del_pair / "after_slat", add_pair / "before_slat"),
                         (del_pair / "before.ply", add_pair / "after.ply"),
@@ -542,10 +563,17 @@ def run_streaming_with_lookahead(
                 if spec.edit_id in done_edits:
                     continue
                 idt_pair = mesh_pairs_dir / spec.edit_id
+                has_before_npz = bool(first_pair_dir and (first_pair_dir / "before.npz").exists())
                 has_before_ply = bool(first_pair_dir and (first_pair_dir / "before.ply").exists())
                 has_before_slat = bool(first_pair_dir and (first_pair_dir / "before_slat").exists())
-                if has_before_ply or has_before_slat:
+                if has_before_npz or has_before_ply or has_before_slat:
                     idt_pair.mkdir(parents=True, exist_ok=True)
+                    if has_before_npz:
+                        src_npz = first_pair_dir / "before.npz"
+                        shutil.copy2(str(src_npz),
+                                     str(idt_pair / "before.npz"))
+                        shutil.copy2(str(src_npz),
+                                     str(idt_pair / "after.npz"))
                     if has_before_ply:
                         before_ply = first_pair_dir / "before.ply"
                         shutil.copy2(str(before_ply),
