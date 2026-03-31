@@ -4,6 +4,52 @@
 
 ---
 
+## 2026-03-31 — 编辑对可视化工具 `render_edit_gallery.py`
+
+**问题**：现有 `render_gs_pairs.py` 仅支持旧平铺 `mesh_pairs/` 格式且输出 MP4 视频，不适合快速浏览大量编辑的合理性。
+
+**代码**：`scripts/vis/render_edit_gallery.py`
+
+- 同时支持 `--input-dir`（新 object-centric `shard_XX/{obj_id}/`）和 `--pairs-dir`（旧平铺 `mesh_pairs/`）
+- SLAT → TRELLIS Gaussian decode → N 视角正面环绕渲染
+- 输出单张 PNG：header（编辑类型、prompt、quality tier/score）+ before N 视角 + after N 视角
+- 支持 `--min-tier` 按 `quality.json` 过滤、`--sample-per-type` 每类采样、`--edit-types`/`--shards` 筛选
+- 复用 `render_gs_pairs.py` 的 `load_slat` 兼容逻辑（NPZ + 旧 feats.pt/coords.pt）
+
+**用法**：见 `docs/ARCH.md`「可视化工具」一节。
+
+---
+
+## 2026-03-31 — NPZ 数据清洗管线 + Step 7
+
+**问题**：现有 Step 5 (VLM filter) 基于 PLY mesh 做几何检查，无法直接对 NPZ（SLAT/SS）格式的训练数据做质量过滤；且未按编辑类型特化检查逻辑。
+
+**代码**：
+
+| 路径 | 作用 |
+|------|------|
+| `partcraft/cleaning/npz_checks.py` | Layer 1：NPZ 健全性（体素数、特征值域、SS 值域、坐标合法性/唯一性） |
+| `partcraft/cleaning/pair_checks.py` | Layer 2：7 类编辑各自的对比检查（deletion 子集关系、modification 局部性、material/global S2-only 坐标不变约束等） |
+| `partcraft/cleaning/cleaner.py` | 主入口：遍历 object-centric 目录，执行 L1+L2，输出 `quality.json` + `manifest_clean.jsonl` |
+| `scripts/tools/run_cleaning.py` | CLI 入口，含完整默认阈值配置 |
+
+**修改现有文件**：
+
+- `partcraft/phase3_filter/filter.py`：提取 `weighted_score()` 为公共函数
+- `partcraft/phase3_filter/vlm_filter.py`：公开 `build_judge_prompt`、添加 `__all__` 导出
+- `partcraft/io/edit_pair_dataset.py`：新增 `quality_dir` / `min_tier` 参数，加载时自动过滤
+- `scripts/run_pipeline.py`：新增 `run_step_cleaning()` + `--cleaning-input-dir` / `--cleaning-workers`
+- `scripts/pipeline_orchestrator.py`：Step 7 调度（opt-in，不在默认 steps 中）
+
+**设计要点**：
+
+- 纯 numpy + scipy，无 GPU 依赖（Layer 1/2）
+- material/global 类型强制 `slat_coords` 和 `ss` 完全一致（S2-only 不改几何的约束）
+- scale 比 modification 有更严格的 SS 余弦相似度和 bbox 轴向比阈值
+- 所有阈值可通过 YAML `cleaning:` 段或 CLI 默认配置覆盖
+
+---
+
 ## 2026-03-31 — Object-Centric 训练数据重组 + DataLoader
 
 **问题**：平铺 `mesh_pairs/{edit_id}/` 下同一物体的 `before` 大量重复；训练侧需要可缓存的 Dataset。

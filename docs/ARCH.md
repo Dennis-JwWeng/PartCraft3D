@@ -181,7 +181,7 @@ flowchart TD
 
 - `scripts/datasets/`：数据构建、预处理、打包、校验。
 - `scripts/tools/`：运维与辅助工具（服务、下载、对比、测试等）。
-- `scripts/vis/`：可视化与渲染辅助。
+- `scripts/vis/`：可视化与渲染辅助（见下方「可视化工具」一节）。
 - `scripts/standalone/encode_slat.py`：保留为编码工具脚本（非主入口）。
 
 ## 已清理的冗余入口/模块
@@ -392,6 +392,37 @@ for batch in loader:
 ### 训练侧集成
 
 `EditPairDataset(root=..., quality_dir=..., min_tier="medium")` 自动过滤低质量编辑。
+
+## 可视化工具（scripts/vis/）
+
+| 工具 | 输入格式 | 输出 | 渲染方式 | 用途 |
+|------|---------|------|---------|------|
+| `render_edit_gallery.py` | Object-centric `shard_XX/` **或** 旧平铺 `mesh_pairs/` | 静态 PNG（N 视角 before/after 对比） | TRELLIS Gaussian | **快速浏览编辑合理性** |
+| `render_gs_pairs.py` | 旧平铺 `mesh_pairs/` | MP4 旋转视频 | TRELLIS Gaussian | 深度查看编辑效果 |
+| `render_ply_pairs.py` | PLY 文件 | PNG（4 正交视角） | Blender Cycles | mesh 质量对比 |
+| `visualize_edit_pair.py` | PLY 文件 | MP4 旋转视频 | Open3D | mesh 旋转动画 |
+
+### render_edit_gallery.py（推荐）
+
+支持新旧两种数据格式，输出单张 PNG：header 显示编辑元信息 + 上行 before N 视角 + 下行 after N 视角。
+
+```bash
+# Object-centric 格式，每类采样 5 个
+python scripts/vis/render_edit_gallery.py \
+    --input-dir partverse_pairs --shards 00 \
+    --sample-per-type 5 --config configs/xxx.yaml
+
+# 旧平铺格式，指定编辑
+python scripts/vis/render_edit_gallery.py \
+    --pairs-dir outputs/.../mesh_pairs_shard01 \
+    --edit-ids mod_xxx_000 scl_xxx_001 --config configs/xxx.yaml
+
+# 只看通过清洗的高质量编辑
+python scripts/vis/render_edit_gallery.py \
+    --input-dir partverse_pairs --min-tier medium --sample-per-type 3
+```
+
+支持参数：`--num-views`（默认 8）、`--pitch`（默认 0.4）、`--min-tier`、`--sample-per-type`、`--edit-types`、`--shards`、`--force`。
 
 ## 后续演进规则
 
