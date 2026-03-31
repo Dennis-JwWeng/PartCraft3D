@@ -630,7 +630,7 @@ def _result_groups_to_record(result: dict, uid: str, category: str,
 
     def _map_pids(vlm_indices: list[int]) -> list[int]:
         """Map VLM label indices to actual NPZ part_ids."""
-        return [idx_to_pid[i] for i in vlm_indices if i < len(idx_to_pid)]
+        return [idx_to_pid[int(i)] for i in vlm_indices if int(i) < len(idx_to_pid)]
 
     # Map label-index → group info (using label indices for lookup)
     part_group_map: dict[int, str] = {}   # keyed by actual part_id
@@ -642,6 +642,7 @@ def _result_groups_to_record(result: dict, uid: str, category: str,
         is_core = group.get("is_core", False)
         gdesc = group.get("desc", "")
         for label_idx in group.get("part_ids", []):
+            label_idx = int(label_idx)
             real_pid = idx_to_pid[label_idx] if label_idx < len(idx_to_pid) else label_idx
             part_group_map[real_pid] = gname
             part_descs[real_pid] = gdesc
