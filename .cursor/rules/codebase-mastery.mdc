@@ -1,0 +1,37 @@
+---
+description: How to understand and safely change any codebase (architecture, verification, scope)
+alwaysApply: true
+---
+
+# Codebase comprehension & change discipline
+
+Use these habits in **every** repo so the agent builds a reliable mental model before editing.
+
+## 1. Orient from the outside in
+
+- Locate **authoritative docs** first (`README`, `docs/ARCH*` or `architecture.md`, `CONTRIBUTING`), then **entrypoints** (CLI, `main`, app bootstrap, `pyproject`/`package.json` scripts).
+- Sketch **dependency direction**: which layers call which (e.g. scripts → lib → third_party). Do not reverse that direction without an explicit design reason.
+
+## 2. Establish ground truth in code, not memory
+
+- **Confirm** symbols, config keys, and file layouts with search/read before describing behavior or proposing APIs.
+- Prefer **tracing one real call path** (from user command or public function to implementation) over summarizing many files shallowly.
+
+## 3. Respect local conventions
+
+- Match **existing** naming, error handling, imports, and test style in the touched area. When two styles exist, follow the **nearest neighbors** to your edit.
+- If the project documents a pattern (e.g. config schema, logging prefix), treat it as **contract** unless you are explicitly refactoring.
+
+## 4. Keep changes proportional
+
+- Touch only what the task requires; **no** drive-by refactors, unrelated formatting, or new docs unless asked.
+- When fixing a bug, aim for the **smallest** change that proves the failure mode and prevents regression.
+
+## 5. Verify when possible
+
+- Run the project’s **standard** checks (tests, linters, typecheck) when available; if the environment is unknown, state what should be run rather than assuming green.
+- For behavioral changes, prefer adding or updating a **minimal** test or a reproducible command over “it should work” reasoning.
+
+## 6. Surface uncertainty
+
+- Distinguish **observed in repo** vs **inferred**. Flag assumptions that could break across branches, machines, or optional dependencies.
