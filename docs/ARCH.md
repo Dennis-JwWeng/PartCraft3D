@@ -290,6 +290,73 @@ DATA_DIR, OUTPUT_ROOT
   - `FLUX.2-klein-9B`
 - 可通过环境变量覆盖仓库与目标目录（`VLM_REPO_ID` / `EDIT_REPO_ID` / `PARTCRAFT_CKPT_ROOT`），无需修改代码。
 
+## 训练数据契约（Object-Centric Edit Pairs）
+
+管线产出的 `mesh_pairs/{edit_id}/` 平铺布局用于生产；训练侧使用 **按物体聚合** 的重组格式。
+
+### 目录结构
+
+```
+partverse_pairs/                         # 训练数据根目录
+  shard_XX/
+    {obj_id}/
+      original.npz                       # 共享 before 状态（唯一一份）
+      mod_000.npz                        # 各编辑的 after 状态
+      scl_000.npz
+      del_000.npz
+      ...
+      metadata.json                      # 物体 + 所有编辑元数据
+  manifest.jsonl                         # 全局扁平索引（一行一条编辑）
+```
+
+- 每个 NPZ 含 `slat_feats [N,8]`、`slat_coords [N,4]`、`ss [8,16,16,16]`
+- addition / identity 不产出文件，通过 `metadata.json` 引用（addition 反转对应 deletion，identity 引用 original）
+
+### 从管线产出转换
+
+```bash
+python scripts/tools/repack_to_object_dirs.py \
+    --mesh-pairs <mesh_pairs_dir> \
+    --specs-jsonl <edit_specs.jsonl> \
+    --output-dir <partverse_pairs> \
+    --shard XX
+```
+
+### DataLoader API
+
+```python
+from partcraft.io.edit_pair_dataset import EditPairDataset
+from partcraft.io.edit_pair_sampler import ObjectGroupedSampler
+
+dataset = EditPairDataset(
+    root="partverse_pairs",
+    shards=["00", "05", "06", "07"],
+    edit_types={"modification", "scale", "material", "global"},
+    max_voxels=32768,
+)
+
+sampler = ObjectGroupedSampler(dataset, shuffle=True)
+
+loader = DataLoader(
+    dataset,
+    batch_size=4,
+    sampler=sampler,
+    collate_fn=EditPairDataset.collate_fn,
+    num_workers=4,
+    pin_memory=True,
+)
+
+for batch in loader:
+    before_slat = batch["before_slat"]   # SparseTensor
+    after_slat  = batch["after_slat"]    # SparseTensor
+    before_ss   = batch["before_ss"]     # [B, 8, 16, 16, 16]
+    after_ss    = batch["after_ss"]      # [B, 8, 16, 16, 16]
+    prompts     = batch["prompt"]        # list[str]
+```
+
+- `ObjectGroupedSampler` 按物体分组采样，最大化 `original.npz` 的 LRU 缓存命中
+- `collate_fn` 遵循 Trellis `SLat.collate_fn` 的 SparseTensor 拼接协议（batch-index prepend + layout slices）
+
 ## 后续演进规则
 
 - 不新增第三条主编排入口。

@@ -1,5 +1,209 @@
 # AI_LOG
 
+## 2026-03-31 — Object-Centric 训练数据重组 + DataLoader
+
+### 背景
+管线按编辑平铺输出 `mesh_pairs/{edit_id}/before.npz + after.npz`，每物体平均 ~25 条编辑共享同一个 before（原始物体），导致大量文件冗余。训练侧无 PyTorch DataLoader。
+
+### 新增文件
+
+**`scripts/tools/repack_to_object_dirs.py`**
+- 从平铺 `mesh_pairs/` + `edit_specs.jsonl` 转换为物体聚合目录
+- 每物体一个目录：`original.npz`（共享 before）+ 各编辑的 after NPZ
+- addition/identity 不产出文件，仅记录在 `metadata.json` 中
+- 生成 `manifest.jsonl` 全局扁平索引
+- 支持 `--dry-run`、`--manifest-only`，幂等可重跑
+
+**`partcraft/io/edit_pair_dataset.py`** — `EditPairDataset(torch.utils.data.Dataset)`
+- 从 `manifest.jsonl` 构建索引，按 shard/edit_type 过滤
+- `original.npz` 用 `functools.lru_cache` 按物体缓存（~600MB 全量）
+- addition 自动解析引用（before = 对应 deletion 的 after，after = original）
+- identity 自动解析（before = after = original）
+- `collate_fn` 遵循 Trellis `SLat.collate_fn` 协议：双路 SparseTensor + SS + prompt
+
+**`partcraft/io/edit_pair_sampler.py`** — `ObjectGroupedSampler(Sampler)`
+- 按物体分组采样，最大化 LRU 缓存命中
+- 每 epoch shuffle 物体顺序 + 物体内编辑顺序
+- 支持 `set_epoch()` (DDP 兼容)
+
+### 存储对比（per shard, ~1200 objects / ~30000 edits）
+
+| | 旧平铺 | 新物体聚合 |
+|--|--------|-----------|
+| 文件数 | ~60,000 | ~27,400 |
+| 目录数 | ~30,000 | ~1,200 |
+| addition/identity 文件 | ~7,000 | 0 (metadata 引用) |
+
+### 用法
+
+```bash
+# 转换
+python scripts/tools/repack_to_object_dirs.py \
+    --mesh-pairs <mesh_pairs_dir> \
+    --specs-jsonl <edit_specs.jsonl> \
+    --output-dir <partverse_pairs> --shard 00
+
+# 训练
+from partcraft.io.edit_pair_dataset import EditPairDataset
+from partcraft.io.edit_pair_sampler import ObjectGroupedSampler
+ds = EditPairDataset("partverse_pairs", edit_types={"modification","scale"})
+loader = DataLoader(ds, batch_size=4, sampler=ObjectGroupedSampler(ds),
+                    collate_fn=EditPairDataset.collate_fn)
+```
+
+### 已验证
+- shard07 dry-run: 31,531 edits → 27,834 个文件 + 1,203 个 original.npz
+- shard07 真实 repack (2 objects): 目录结构/metadata.json/manifest.jsonl 正确
+- EditPairDataset: 全部 7 种编辑类型加载正确，identity 复用 original，addition 引用 deletion
+- collate_fn: SparseTensor 双路拼接 + SS 堆叠正确
+
+## 2026-03-31 — migrate_slat_to_npz.py 对象级去重优化
+
+### 背景
+迁移脚本原始实现中，同一对象的多条编辑各自独立计算 `z_s_before` + 保存 `before.npz`，存在大量重复。实测数据显示 GPU 编辑平均每对象 ~20 条、deletion 平均 ~2.1 条，重复率极高。
+
+### 改动
+
+**`scripts/tools/migrate_slat_to_npz.py`**
+
+**Phase 1** (`*_slat/` → npz):
+- 新增 `_obj_id_from_edit_id()` 从 edit_id 提取对象 UUID
+- pair_dirs 按 object 分组，每组只对第一个 edit 做 SS 编码 + 保存 `before.npz`，后续 edit 直接 `os.link()` 硬链接（跨设备 fallback 到 copy）
+- `after.npz` 仍逐条独立处理（每条编辑的 after 不同）
+
+**Phase 2** (deletion backfill):
+- `z_s_before = encode_ss(...)` 提到 object 循环外，每对象只计算一次
+- 首个 deletion 的 `before.npz` 作为 canonical，后续同对象 deletion 硬链接
+- `build_part_mask` + `z_s_after` 仍逐条处理（每条 deletion 移除不同 part）
+
+**Phase 3** (addition backfill):
+- 按 object 分组，`add.after.npz`（= 原始对象 = `del.before.npz`）在同对象内硬链接
+- `add.before.npz`（= 对应 deletion 的 after）仍从源文件链接
+
+**Phase 4** (identity backfill):
+- `before.npz` / `after.npz` 均硬链接到已有的 canonical `before.npz`
+
+**通用**:
+- 新增 `_link_or_copy()` 辅助函数：优先 `os.link()`，跨设备 fallback 到 `shutil.copy2()`
+- 各 phase stats 新增 `hardlinked` 计数
+- 进度日志输出 hardlink 统计
+
+### 节省量
+
+| Phase | 操作 | 优化前 | 优化后 | 节省 |
+|-------|------|--------|--------|------|
+| Phase 1 SS 编码 (before) | GPU forward | 70,018 次 | 3,575 次 | **95%** |
+| Phase 1 NFS 写 (before.npz) | savez + write | 70,018 次 | 3,575 次写 + 66,443 次 link | **~95%** |
+| Phase 2 SS 编码 (before) | GPU forward | 10,019 次 | 4,125 次 | **59%** |
+| Phase 2 NFS 写 (before.npz) | savez + write | 10,019 次 | 4,125 次写 + 5,894 次 link | **59%** |
+| Phase 3 NFS 复制 (after.npz) | copy | 10,019 次 | 4,125 次 link + 5,894 次 link | **100%→link** |
+| **总 SS 编码次数** | | ~150,074 | ~77,718 | **48%** |
+| **总 NFS 写次数** | | ~160,112 | ~81,843 | **49%** |
+
+### 磁盘空间节省（硬链接）
+硬链接不占额外磁盘空间。同对象的所有 `before.npz` 指向同一 inode：
+- Phase 1: ~66,443 个 hardlink × ~370KB = **~24 GB** 省空间
+- Phase 2+3: ~10,019 个 hardlink × ~370KB = **~3.6 GB** 省空间
+
+### 优化后时间估算
+
+| Phase | 优化前 | 优化后 | 原因 |
+|-------|--------|--------|------|
+| Phase 1 | ~76 min | **~45 min** | before 侧省去 95% SS 编码 + NFS 写，hardlink ~0.1ms |
+| Phase 2 | ~109 min | **~80 min** | before SS 编码/写省 59%，build_part_mask 仍是瓶颈 |
+| Phase 3 | ~5 min | **~1 min** | 全部改为 link，无 370KB×N 文件复制 |
+| **总计（串行）** | ~3-3.5h | **~2-2.5h** | |
+| **4 shard 并行** | ~1-1.5h | **~50-70 min** | |
+
+## 2026-03-31 — 已完成 shard 产物格式审计 & NPZ 迁移计划
+
+### 背景
+管线 Step4 的输出格式经历了多次迭代（PLY → PLY+SLAT 目录 → SLAT 目录 → NPZ），已完成的 shard00/05/06 和进行中的 shard07 各自处于不同格式阶段，需要统一迁移到最终的 NPZ 格式。
+
+### 各 shard 当前产物格式
+
+| Shard | 对数 | GPU 编辑 (mod/scl/mat/glb) | Deletion/Addition | Identity |
+|-------|------|---------------------------|-------------------|----------|
+| shard05 (最早, ~Mar 26) | 27002 | PLY + `*_slat/` + mp4 | PLY only | 0 |
+| shard00 (~Mar 28) | 29342 | PLY + `*_slat/` | PLY only | 0 |
+| shard06 (~Mar 29-30) | 30007 | `*_slat/` only (export_ply=false) | PLY only | 0 |
+| shard07 (进行中, ~Mar 31) | 6983+ | **`before.npz` + `after.npz`** ✓ | PLY only | 0 |
+
+目标格式：`before.npz` + `after.npz`（keys: `slat_feats [N,8]`, `slat_coords [N,4]`, `ss [C,R,R,R]`）
+
+### 各 shard 编辑类型分布
+
+| Type | shard00 | shard05 | shard06 | shard07 |
+|------|---------|---------|---------|---------|
+| mod | 2356 | 2041 | 3440 | 145 |
+| scl | 8599 | 7885 | 7492 | 294 |
+| mat | 9649 | 8784 | 9808 | 369 |
+| glb | 3227 | 3146 | 3591 | 116 |
+| del | 2234 | 1986 | 2305 | 2494 |
+| add | 2234 | 1986 | 2305 | 2494 |
+
+### 迁移方案
+
+使用 `scripts/tools/migrate_slat_to_npz.py`（四阶段幂等迁移脚本）：
+
+| Phase | 作用 | shard00 | shard05 | shard06 | shard07 |
+|-------|------|---------|---------|---------|---------|
+| Phase 1: `*_slat/` → npz + SS | GPU 编辑 | 23831 | 21856 | 24331 | 跳过 (已是 npz) |
+| Phase 2: Deletion backfill | deletion | 2234 | 1986 | 2305 | 2494 |
+| Phase 3: Addition backfill | addition | 2234 | 1986 | 2305 | 2494 |
+| Phase 4: Identity backfill | identity | 0 | 0 | 0 | 0 |
+
+- Phase 1 轻量：只需 SS encoder，从已有 `feats.pt` + `coords.pt` 加 SS 编码
+- Phase 2 较重：需 GPU 加载 dataset + 源 SLAT + mesh voxelization
+- Phase 3/4 纯文件复制：从 Phase 2 产物派生
+
+### 迁移命令
+
+现有配置 `configs/partverse_H200_shard00.yaml` 的 `data.shards: ["00"]`。Phase 2 的 `dataset.load_object(shard, obj_id)` 需要 config 中 shards 包含目标 shard，否则无法加载对象。**每个 shard 迁移前需将 config 中 `data.shards` 改为对应值，或创建 per-shard 配置副本。** Phase 1 不依赖 dataset，可直接用任意 config。
+
+```bash
+# shard00（全量 Phase 1-4，config 已匹配）
+python scripts/tools/migrate_slat_to_npz.py \
+    --config configs/partverse_H200_shard00.yaml \
+    --mesh-pairs /mnt/zsn/data/partverse/outputs/partverse/shard_00/mesh_pairs_shard00 \
+    --specs-jsonl /mnt/zsn/data/partverse/outputs/partverse/shard_00/cache/phase1/edit_specs_shard00.jsonl
+
+# shard05（全量，注意 mesh_pairs 无后缀，需 config shards=["05"]）
+python scripts/tools/migrate_slat_to_npz.py \
+    --config configs/partverse_H200_shard05.yaml \
+    --mesh-pairs /mnt/zsn/data/partverse/outputs/partverse/shard_05/mesh_pairs \
+    --specs-jsonl /mnt/zsn/data/partverse/outputs/partverse/shard_05/cache/phase1/edit_specs_shard05.jsonl
+
+# shard06（全量，需 config shards=["06"]）
+python scripts/tools/migrate_slat_to_npz.py \
+    --config configs/partverse_H200_shard06.yaml \
+    --mesh-pairs /mnt/zsn/data/partverse/outputs/partverse/shard_06/mesh_pairs_shard06 \
+    --specs-jsonl /mnt/zsn/data/partverse/outputs/partverse/shard_06/cache/phase1/edit_specs_shard06.jsonl
+
+# shard07（仅 Phase 2-4，GPU 编辑已是新格式，需 config shards=["07"]）
+python scripts/tools/migrate_slat_to_npz.py \
+    --config configs/partverse_H200_shard07.yaml \
+    --mesh-pairs /mnt/zsn/data/partverse/outputs/partverse/shard_07/mesh_pairs_shard07 \
+    --specs-jsonl /mnt/zsn/data/partverse/outputs/partverse/shard_07/cache/phase1/edit_specs_shard07.jsonl \
+    --phase 2,3,4
+
+# Dry run 先预览（不需要 GPU）
+python scripts/tools/migrate_slat_to_npz.py \
+    --mesh-pairs /mnt/zsn/data/partverse/outputs/partverse/shard_00/mesh_pairs_shard00 \
+    --specs-jsonl /mnt/zsn/data/partverse/outputs/partverse/shard_00/cache/phase1/edit_specs_shard00.jsonl \
+    --dry-run
+```
+
+### 注意事项
+- 目前只有 `configs/partverse_H200_shard00.yaml`，需要为 shard05/06/07 创建配置副本（仅改 `data.shards`）
+- shard05 的 `mesh_pairs` 目录无 shard 后缀（其他均为 `mesh_pairs_shardXX`）
+- shard05 含 mp4 可视化视频（额外空间），其余 shard 无
+- shard07 的 deletion/addition 在 Step4 运行时虽有 `export_deletion_pair()` 代码，但非 GPU worker 未成功加载 TrellisRefiner，因此只产出了 PLY（无 NPZ）
+- 迁移脚本幂等——已有 `*.npz` 不会被覆盖，可安全重跑
+- Phase 1 总工作量：~70018 个 `_slat/` → npz 转换（shard00: 23831 + shard05: 21856 + shard06: 24331）
+- Phase 2 总工作量：~10019 个 deletion backfill（shard00: 2234 + shard05: 1986 + shard06: 2305 + shard07: 2494）
+- Phase 3 总工作量：与 Phase 2 相同（addition = deletion 反转）
+
 ## 2026-03-31 — prerender.py 多 GPU encode + 多进程 pack 支持
 
 ### 背景
