@@ -1,37 +1,54 @@
 ---
-description: How to understand and safely change any codebase (architecture, verification, scope)
+description: Codebase orientation, docs map, config-driven portability, and safe edits
 alwaysApply: true
 ---
 
 # Codebase comprehension & change discipline
 
-Use these habits in **every** repo so the agent builds a reliable mental model before editing.
+Use these habits so the agent builds a reliable model before editing and keeps changes portable across machines.
+
+## Documentation (this repo)
+
+Human-written docs live under **`docs/`** at the repository root (not under `.cursor/`). **Read them when changing architecture, pipeline behavior, data layout, or historical decisions.**
+
+| Path | Role |
+|------|------|
+| `docs/ARCH.md` | **Primary architecture & data contracts** — pipeline steps, configs, I/O layout. Prefer this over guessing. |
+| `docs/AI_LOG.md` | Chronological decisions and migrations; cross-check with **current code** if something looks stale. |
+| `docs/Explore.md` | Exploration / notes as applicable. |
+
+**How to “see” docs:** open these paths in the workspace (same as any file), or ask to read `docs/ARCH.md` (or a section) before large edits. Do not assume behavior that is only documented in chat — **verify in `docs/` + code.**
+
+## Config-driven behavior & environment isolation
+
+Code must remain **adaptable across hosts** (paths, GPUs, conda envs, NFS mounts). Enforce:
+
+- **No hardcoded machine paths** in logic that should be configurable (data roots, checkpoints, outputs). Use **YAML config**, **`configs/machine/*.env`**, and documented **env overrides** (e.g. `PARTCRAFT_DATA_ROOT`) as the project already does — **extend that pattern** instead of embedding `/mnt/...` in new code.
+- **Single source of truth:** behavior switches belong in config or env, not scattered literals. When adding a path or toggle, wire it through the same loading path as sibling options (see `partcraft/utils/config.py` and existing scripts).
+- **Secrets & local state** stay out of committed defaults; document optional vars in comments or `docs/`, not only in one machine’s shell history.
+- **When suggesting commands** for the user, prefer placeholders or env-backed paths (`$DATA_DIR`, config values) over copying one developer’s absolute paths unless the task is explicitly bound to that host.
 
 ## 1. Orient from the outside in
 
-- Locate **authoritative docs** first (`README`, `docs/ARCH*` or `architecture.md`, `CONTRIBUTING`), then **entrypoints** (CLI, `main`, app bootstrap, `pyproject`/`package.json` scripts).
-- Sketch **dependency direction**: which layers call which (e.g. scripts → lib → third_party). Do not reverse that direction without an explicit design reason.
+- After skimming `docs/ARCH.md`, locate **entrypoints** (CLI, `scripts/run_pipeline.py`, `package.json` / `pyproject` scripts).
+- Sketch **dependency direction**: scripts → `partcraft/` → `third_party/`. Do not reverse layers without an explicit design reason.
 
 ## 2. Establish ground truth in code, not memory
 
-- **Confirm** symbols, config keys, and file layouts with search/read before describing behavior or proposing APIs.
-- Prefer **tracing one real call path** (from user command or public function to implementation) over summarizing many files shallowly.
+- **Confirm** symbols, config keys, and file layouts with search/read before describing behavior.
+- Prefer **tracing one real call path** over summarizing many files shallowly.
 
 ## 3. Respect local conventions
 
-- Match **existing** naming, error handling, imports, and test style in the touched area. When two styles exist, follow the **nearest neighbors** to your edit.
-- If the project documents a pattern (e.g. config schema, logging prefix), treat it as **contract** unless you are explicitly refactoring.
+- Match **existing** naming, error handling, imports, and tests in the touched area.
+- Treat documented config and logging patterns as **contract** unless refactoring is in scope.
 
 ## 4. Keep changes proportional
 
-- Touch only what the task requires; **no** drive-by refactors, unrelated formatting, or new docs unless asked.
-- When fixing a bug, aim for the **smallest** change that proves the failure mode and prevents regression.
+- Touch only what the task requires; **no** drive-by refactors or unsolicited new docs.
+- For bugs, prefer the **smallest** fix plus a minimal test or repro command when feasible.
 
 ## 5. Verify when possible
 
-- Run the project’s **standard** checks (tests, linters, typecheck) when available; if the environment is unknown, state what should be run rather than assuming green.
-- For behavioral changes, prefer adding or updating a **minimal** test or a reproducible command over “it should work” reasoning.
-
-## 6. Surface uncertainty
-
-- Distinguish **observed in repo** vs **inferred**. Flag assumptions that could break across branches, machines, or optional dependencies.
+- Run the project’s tests/linters when available; if the environment is unknown, say what should be run.
+- Distinguish **observed in repo** vs **inferred**; flag assumptions that break across machines or optional deps.
