@@ -9,6 +9,23 @@ import torch
 import numpy as np
 from PIL import Image
 import utils3d
+
+def _intrinsics_from_fov_xy(fov_x, fov_y):
+    """Compat shim: utils3d <=0.x had intrinsics_from_fov_xy; v1.7+ uses intrinsics_from_fov."""
+    try:
+        return utils3d.torch.intrinsics_from_fov_xy(fov_x, fov_y)
+    except AttributeError:
+        from utils3d.torch.transforms import intrinsics_from_fov
+        return intrinsics_from_fov(fov_x=fov_x, fov_y=fov_y)
+
+_NEW_PROJECT_CV = not hasattr(utils3d.torch, 'intrinsics_from_fov_xy')
+
+def _project_cv(points, extrinsics, intrinsics):
+    """Compat shim: old utils3d.torch.project_cv(pts, extr, intr); v1.7 swapped arg order."""
+    if _NEW_PROJECT_CV:
+        from utils3d.torch.transforms import project_cv
+        return project_cv(points, intrinsics, extrinsics)
+    return utils3d.torch.project_cv(points, extrinsics, intrinsics)
 import math
 import torch.nn.functional as F
 from torchvision import transforms
@@ -126,12 +143,12 @@ def encode_into_SLAT(name):
         c2w[:3, 1:3] *= -1
         extrinsic = torch.inverse(c2w)
         fov = views[i]['camera_angle_x']
-        intrinsic = utils3d.torch.intrinsics_from_fov_xy(torch.tensor(fov), torch.tensor(fov))
+        intrinsic = _intrinsics_from_fov_xy(torch.tensor(fov), torch.tensor(fov))
         batch_extrinsics = extrinsic.unsqueeze(0).cuda()
         batch_intrinsics = intrinsic.unsqueeze(0).cuda()
 
         features = dinov2_model(batch_images, is_training=True)
-        uv = utils3d.torch.project_cv(positions, batch_extrinsics, batch_intrinsics)[0] * 2 - 1
+        uv = _project_cv(positions, batch_extrinsics, batch_intrinsics)[0] * 2 - 1
         patchtokens = features['x_prenorm'][:, dinov2_model.num_register_tokens + 1:].permute(0, 2, 1).reshape(1, 1024, n_patch, n_patch)
         patchtokens_lst.append(patchtokens.detach().cpu())
         uv_lst.append(uv.detach().cpu())

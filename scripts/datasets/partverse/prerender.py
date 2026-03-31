@@ -114,7 +114,8 @@ def _pack_worker(oid: str) -> tuple[str, dict]:
     ctx = _pack_ctx
     return oid, _pack_one(oid, ctx["img_enc_dir"] / oid,
                           ctx["render_out"], ctx["mesh_out"],
-                          ctx["captions"], keep_views=PACK_VIEWS)
+                          ctx["captions"], keep_views=PACK_VIEWS,
+                          anno_dir=ctx.get("anno_dir"))
 
 
 def _run_pack(
@@ -128,6 +129,7 @@ def _run_pack(
     images_dir: Path,
     mesh_dir: Path,
     workers: int = 1,
+    anno_dir: Path | None = None,
 ):
     """Pack rendered img_Enc outputs into images/{shard}/ + mesh/{shard}/ NPZ."""
     from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -162,7 +164,7 @@ def _run_pack(
     if workers <= 1:
         for i, obj_id in enumerate(pending):
             result = _pack_one(obj_id, img_enc_dir / obj_id, render_out, mesh_out,
-                               captions, keep_views=PACK_VIEWS)
+                               captions, keep_views=PACK_VIEWS, anno_dir=anno_dir)
             if result["status"] == "ok":
                 ok += 1
                 logger.info(f"[pack {i+1}/{len(pending)}] {obj_id}: "
@@ -172,7 +174,7 @@ def _run_pack(
                 logger.warning(f"[pack {i+1}/{len(pending)}] {obj_id}: skip — {result['reason']}")
     else:
         _pack_ctx.update(img_enc_dir=img_enc_dir, render_out=render_out,
-                         mesh_out=mesh_out, captions=captions)
+                         mesh_out=mesh_out, captions=captions, anno_dir=anno_dir)
         with ProcessPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(_pack_worker, oid): oid for oid in pending}
             done_count = 0
@@ -269,6 +271,7 @@ def main():
     slat_root_dir = Path(paths["slat_dir"])
     images_dir = Path(paths["images_npz_dir"])
     mesh_dir = Path(paths["mesh_npz_dir"])
+    anno_dir = Path(paths["anno_infos_dir"]) if "anno_infos_dir" in paths else None
     # region agent log
     _debug_log(
         "H1",
@@ -455,6 +458,7 @@ def main():
                 images_dir=images_dir,
                 mesh_dir=mesh_dir,
                 workers=args.pack_workers,
+                anno_dir=anno_dir,
             )
         print_summary(obj_ids, img_enc_dir, slat_shard_dir, logger)
         return
@@ -506,6 +510,7 @@ def main():
             images_dir=images_dir,
             mesh_dir=mesh_dir,
             workers=args.pack_workers,
+            anno_dir=anno_dir,
         )
 
     print_summary(obj_ids, img_enc_dir, slat_shard_dir, logger)

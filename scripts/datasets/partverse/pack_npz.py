@@ -109,9 +109,10 @@ def _label_from_part_captions(cap_list: list) -> str | None:
     return None
 
 
-def _load_face2label(obj_id: str) -> np.ndarray | None:
+def _load_face2label(obj_id: str, anno_dir: Path | None = None) -> np.ndarray | None:
     """Load face2label.json and return per-face part-id array."""
-    path = _ANNO_DIR / obj_id / f"{obj_id}_face2label.json"
+    base = anno_dir if anno_dir is not None else _ANNO_DIR
+    path = base / obj_id / f"{obj_id}_face2label.json"
     if not path.exists():
         return None
     with open(path) as f:
@@ -125,7 +126,7 @@ def _load_face2label(obj_id: str) -> np.ndarray | None:
     return arr
 
 
-def _load_source_mesh(obj_id: str):
+def _load_source_mesh(obj_id: str, anno_dir: Path | None = None):
     """Load segmented GLB from anno_infos/.
 
     face2label.json indices correspond to the segmented.glb faces (not the
@@ -138,7 +139,8 @@ def _load_source_mesh(obj_id: str):
     except ImportError:
         raise RuntimeError("trimesh is required — pip install trimesh")
 
-    seg_path = _ANNO_DIR / obj_id / f"{obj_id}_segmented.glb"
+    base = anno_dir if anno_dir is not None else _ANNO_DIR
+    seg_path = base / obj_id / f"{obj_id}_segmented.glb"
     if not seg_path.exists():
         return None
     mesh = trimesh.load(str(seg_path), force="mesh")
@@ -150,12 +152,15 @@ def _load_source_mesh(obj_id: str):
 def _pack_one(obj_id: str, img_enc_dir: Path,
                render_out: Path, mesh_out: Path,
                captions: dict,
-               keep_views: list[int] | None = None) -> dict:
+               keep_views: list[int] | None = None,
+               anno_dir: Path | None = None) -> dict:
     """Pack one PartVerse object into render + mesh NPZ.
 
     Args:
         keep_views: View indices to include in the render NPZ. None = all views.
                     transforms.json is always packed in full regardless.
+        anno_dir:   Override for _ANNO_DIR (source/anno_infos) when source data
+                    lives on a different mount than the output dataset_root.
     """
     transforms_path = img_enc_dir / "transforms.json"
     if not transforms_path.exists():
@@ -186,11 +191,11 @@ def _pack_one(obj_id: str, img_enc_dir: Path,
         json.dumps(transforms).encode("utf-8"), dtype=np.uint8)
 
     # ---- Load source mesh and per-face part labels ----
-    instance_gt = _load_face2label(obj_id)
+    instance_gt = _load_face2label(obj_id, anno_dir=anno_dir)
     if instance_gt is None:
         return {"status": "skip", "reason": "no face2label.json"}
 
-    source_mesh = _load_source_mesh(obj_id)
+    source_mesh = _load_source_mesh(obj_id, anno_dir=anno_dir)
     if source_mesh is None:
         return {"status": "skip", "reason": "no source GLB"}
 

@@ -84,7 +84,18 @@ def voxelize(file, name, output_dir):
     vertices = np.array([voxel.grid_index for voxel in voxel_grid.get_voxels()])
     assert np.all(vertices >= 0) and np.all(vertices < 64), "Some vertices are out of bounds"
     vertices = (vertices + 0.5) / 64 - 0.5
-    utils3d.io.write_ply(os.path.join(output_dir, f'voxels.ply'), vertices)
+    out_path = os.path.join(output_dir, 'voxels.ply')
+    try:
+        utils3d.io.write_ply(out_path, vertices)
+    except (AttributeError, TypeError):
+        from utils3d.numpy.io.ply import write_ply as _write_ply
+        _write_ply(out_path, {
+            "vertex": {
+                "x": vertices[:, 0].astype(np.float32),
+                "y": vertices[:, 1].astype(np.float32),
+                "z": vertices[:, 2].astype(np.float32),
+            }
+        })
 
 def renderImg_voxelize(input_file):
     name = os.path.splitext(os.path.basename(input_file))[0]

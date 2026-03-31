@@ -13,8 +13,10 @@ data:
 
 paths:
   dataset_root: "/mnt/pfs/ca41bi/omni3d/partverse"
+  source_root: "/mnt/cfs/vffey4/3dedit/data/partverse"
   source_glb_dir: "/mnt/cfs/vffey4/3dedit/data/partverse/source/normalized_glbs"
   captions_json: "/mnt/cfs/vffey4/3dedit/data/partverse/source/text_captions.json"
+  anno_infos_dir: "/mnt/cfs/vffey4/3dedit/data/partverse/source/anno_infos"
 
   img_enc_dir: "/mnt/pfs/ca41bi/omni3d/partverse/img_Enc"
   slat_dir: "/mnt/pfs/ca41bi/omni3d/partverse/slat"
