@@ -5,6 +5,7 @@ from pathlib import Path
 
 def build_runtime_context(args, cfg: dict, *, target_shard: str | None, run_token: str, report_dir: Path) -> dict:
     steps = set(args.steps) if args.steps else {1, 2, 3, 4, 5, 6}
+    # Step 7 is opt-in only (not in default set)
     token_suffix = f"_{run_token}" if run_token else ""
     suffix = args.suffix
     labels_path = Path(cfg["phase0"]["cache_dir"]) / f"semantic_labels{token_suffix}.jsonl"
@@ -222,11 +223,25 @@ def run_selected_steps(ctx: dict, *, args, cfg, logger, dataset, callbacks: dict
             callbacks["write_stage_diag"](report_dir, "step6_export", stage_diagnostics["step6"])
             callbacks["sync_manifest_link"](cfg, target_shard, "phase4", "edit_pairs.jsonl", Path(export_path))
 
+    # Step 7: Data Cleaning (opt-in)
+    cleaning_summary = None
+    if 7 in steps:
+        cleaning_input = getattr(args, "cleaning_input_dir", None)
+        if not cleaning_input:
+            logger.warning("Step 7 requested but --cleaning-input-dir not set, skipping")
+        else:
+            cleaning_workers = getattr(args, "cleaning_workers", 4)
+            cleaning_summary = callbacks["run_step_cleaning"](
+                cfg, cleaning_input, logger,
+                tag=run_token, workers=cleaning_workers,
+            )
+
     ctx["labels_path"] = labels_path
     ctx["specs_path"] = specs_path
     ctx["results_path"] = results_path
     ctx["scores_path"] = scores_path
     ctx["export_path"] = export_path
+    ctx["cleaning_summary"] = cleaning_summary
     return ctx
 
 

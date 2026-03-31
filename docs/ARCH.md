@@ -18,7 +18,7 @@
 
 ## Batch 流程职责
 
-`scripts/run_pipeline.py` 负责 Step1-6 的可恢复批处理：
+`scripts/run_pipeline.py` 负责 Step1-7 的可恢复批处理：
 
 1. Step1 语义与 enrich
 2. Step2 规划
@@ -26,6 +26,7 @@
 4. Step4 TRELLIS 3D 编辑（支持多 GPU 分发）
 5. Step5 质量评估
 6. Step6 导出
+7. Step7 数据清洗（opt-in，需 `--steps 7 --cleaning-input-dir`）
 
 输出遵循 shard 目录下 `pipeline/reports` 与 `pipeline/manifests`，保持 JSONL/resume 兼容。
 
@@ -356,6 +357,41 @@ for batch in loader:
 
 - `ObjectGroupedSampler` 按物体分组采样，最大化 `original.npz` 的 LRU 缓存命中
 - `collate_fn` 遵循 Trellis `SLat.collate_fn` 的 SparseTensor 拼接协议（batch-index prepend + layout slices）
+
+## 数据清洗（Step 7 / 独立工具）
+
+对 `repack_to_object_dirs.py` 产出的 object-centric 训练数据进行质量过滤。
+
+### 三层过滤
+
+1. **Layer 1（NPZ 健全性）**：`partcraft/cleaning/npz_checks.py`
+   - 体素数范围、特征值域（NaN/Inf/常量）、SS 值域、坐标合法性/唯一性
+   - 纯 numpy，无 GPU 依赖
+
+2. **Layer 2（编辑对比）**：`partcraft/cleaning/pair_checks.py`
+   - 按编辑类型分发（7 类各有独立检查函数）
+   - 关键类型特化：
+     - **deletion/addition**：体素减少/增加比、连通性、退化检测
+     - **modification**：SS 余弦相似度、编辑局部性、中心漂移
+     - **scale**：更严格的 SS 保持、轴向 bbox 比
+     - **material/global**：坐标 & SS 必须完全一致（S2-only 约束），仅特征可变
+     - **identity**：天然有效（引用同一 `original.npz`）
+   - 纯 numpy + scipy，无 GPU 依赖
+
+3. **Layer 3（VLM 语义，可选）**：复用 `partcraft/phase3_filter/vlm_filter.py` 的 `call_vlm_judge` 等公共函数
+
+### 入口
+
+- **独立工具**：`scripts/tools/run_cleaning.py --input-dir partverse_pairs [--shards ...] [--workers N]`
+- **管线集成**：`python scripts/run_pipeline.py --steps 7 --cleaning-input-dir partverse_pairs`
+
+### 输出
+
+每个 `shard_XX/{obj_id}/` 下追加 `quality.json`；全局产出 `manifest_clean.jsonl`、`manifest_tiered.jsonl`、`cleaning_summary.json`。
+
+### 训练侧集成
+
+`EditPairDataset(root=..., quality_dir=..., min_tier="medium")` 自动过滤低质量编辑。
 
 ## 后续演进规则
 

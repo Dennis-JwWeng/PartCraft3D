@@ -31,6 +31,18 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Public API for reuse by partcraft.cleaning
+__all__ = [
+    "VLMScore",
+    "compute_composite_score",
+    "classify_tier",
+    "call_vlm_judge",
+    "render_views",
+    "compose_comparison",
+    "load_slat",
+    "build_judge_prompt",
+]
+
 # Mesh prefilter: full ``evaluate_pair`` (volume / edit ratio / …) only for types
 # where vertex motion is expected.  Light checks for del/add.  Skip for identity
 # and appearance-only edits (material/global) where metrics misfire.
@@ -190,9 +202,12 @@ def compose_comparison(before_imgs: list[np.ndarray],
 # VLM judge
 # ---------------------------------------------------------------------------
 
-def _build_judge_prompt(edit_prompt: str, edit_type: str,
-                        object_desc: str, part_label: str) -> str:
-    """Build the VLM judge prompt."""
+def build_judge_prompt(edit_prompt: str, edit_type: str,
+                       object_desc: str, part_label: str) -> str:
+    """Build the VLM judge prompt.
+
+    Public API — reused by partcraft.cleaning for Layer 3 VLM evaluation.
+    """
     return f"""You are a quality judge for 3D object editing.
 
 The image shows two rows of multi-view renders of a 3D object:
@@ -320,7 +335,7 @@ def call_vlm_judge(client, model: str, img_bytes: bytes,
     """Call VLM to judge edit quality. Returns parsed JSON or None."""
     import time
     b64 = base64.b64encode(img_bytes).decode('utf-8')
-    base_text = _build_judge_prompt(edit_prompt, edit_type, object_desc, part_label)
+    base_text = build_judge_prompt(edit_prompt, edit_type, object_desc, part_label)
     strict_suffix = (
         "\n\nIf you already wrote analysis above, IGNORE it for the parser: "
         "output ONE new line that is ONLY the JSON object, starting with { "

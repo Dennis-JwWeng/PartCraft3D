@@ -49,6 +49,14 @@ class EditPairDataset(Dataset):
         ``{"mean": [...], "std": [...]}`` applied to ``slat_feats``.
     original_cache_size : int
         LRU cache size for ``original.npz`` (number of objects).
+    quality_dir : str | Path | None
+        If provided, path to cleaning output (same layout as ``root``,
+        with ``quality.json`` per object).  Entries below ``min_tier``
+        are excluded.  Can also be the same as ``root`` if
+        ``quality.json`` files sit alongside data.
+    min_tier : str
+        Minimum quality tier to include (``"high"``, ``"medium"``,
+        ``"low"``).  Only used when ``quality_dir`` is set.
     """
 
     def __init__(
@@ -60,6 +68,8 @@ class EditPairDataset(Dataset):
         max_voxels: int = 32768,
         normalization: Optional[dict] = None,
         original_cache_size: int = 2048,
+        quality_dir: Optional[str | Path] = None,
+        min_tier: str = "medium",
     ):
         self.root = Path(root)
         self.max_voxels = max_voxels
@@ -103,6 +113,24 @@ class EditPairDataset(Dataset):
                         self._meta[key] = json.load(mf)
 
                 self._entries.append((shard, obj_id, edit_idx))
+
+        # Quality-based filtering
+        if quality_dir is not None:
+            allowed = self._load_quality_tiers(Path(quality_dir), min_tier)
+            if allowed is not None:
+                before_n = len(self._entries)
+                self._entries = [
+                    e for e in self._entries
+                    if self._meta[(e[0], e[1])]["edits"][e[2]]["edit_id"]
+                    in allowed
+                ]
+                filtered = before_n - len(self._entries)
+                if filtered > 0:
+                    import logging as _log
+                    _log.getLogger(__name__).info(
+                        "Quality filter: %d/%d edits removed (min_tier=%s)",
+                        filtered, before_n, min_tier,
+                    )
 
         # Build the LRU-cached original loader
         self._load_original = functools.lru_cache(maxsize=original_cache_size)(
@@ -238,6 +266,41 @@ class EditPairDataset(Dataset):
         """Return a random valid item (error recovery, matches Trellis convention)."""
         idx = np.random.randint(0, len(self))
         return self[idx]
+
+    # ─────────────────── quality filtering ─────────────────────────────
+
+    @staticmethod
+    def _load_quality_tiers(
+        quality_dir: Path,
+        min_tier: str = "medium",
+    ) -> set[str] | None:
+        """Load passing edit IDs from quality.json files.
+
+        Returns a set of edit_ids that meet the minimum tier, or None if
+        no quality data is found.
+        """
+        tier_order = {"high": 0, "medium": 1, "low": 2, "negative": 3, "rejected": 4}
+        min_val = tier_order.get(min_tier, 1)
+
+        allowed: set[str] = set()
+        found_any = False
+
+        for shard_dir in quality_dir.iterdir():
+            if not shard_dir.is_dir() or not shard_dir.name.startswith("shard_"):
+                continue
+            for obj_dir in shard_dir.iterdir():
+                qpath = obj_dir / "quality.json"
+                if not qpath.exists():
+                    continue
+                found_any = True
+                with open(qpath) as f:
+                    q = json.load(f)
+                for edit in q.get("edits", []):
+                    tier = edit.get("tier", "rejected")
+                    if tier_order.get(tier, 4) <= min_val:
+                        allowed.add(edit["edit_id"])
+
+        return allowed if found_any else None
 
     # ─────────────────── diagnostics ──────────────────────────────────
 

@@ -1044,6 +1044,58 @@ def run_step_export(cfg, specs_path, scores_path, logger, tag=None):
     return export_path
 
 
+# =========================================================================
+# Step 7: Data Cleaning (object-centric)
+# =========================================================================
+
+def run_step_cleaning(cfg, input_dir, logger, tag=None, workers=4):
+    """Step 7: NPZ-based data cleaning on repacked object-centric data."""
+    logger.info("=" * 60)
+    logger.info("STEP 7: Data Cleaning")
+    logger.info("=" * 60)
+
+    from partcraft.cleaning.cleaner import run_cleaning
+
+    # Build cleaning config with defaults
+    default_cleaning = {
+        "min_voxels": 100, "max_voxels": 40000,
+        "max_feat_abs": 50.0, "min_feat_std": 0.01,
+        "max_ss_abs": 100.0, "min_ss_std": 0.001,
+        "deletion": {"min_voxel_ratio": 0.05, "max_voxel_ratio": 0.95,
+                      "min_delete_ratio": 0.02, "max_delete_ratio": 0.80,
+                      "min_bbox_iou": 0.15, "max_components": 3},
+        "addition": {"min_voxel_ratio": 1.05, "max_voxel_ratio": 20.0,
+                      "min_add_ratio": 0.02, "max_add_ratio": 0.80},
+        "modification": {"min_voxel_ratio": 0.3, "max_voxel_ratio": 3.0,
+                          "min_ss_cosine": 0.3, "min_edit_locality": 0.02,
+                          "max_edit_locality": 0.70, "max_components": 5},
+        "scale": {"min_voxel_ratio": 0.5, "max_voxel_ratio": 2.0,
+                   "min_ss_cosine": 0.5, "min_edit_locality": 0.01,
+                   "max_edit_locality": 0.50},
+        "material": {"require_coords_match": True, "require_ss_match": True,
+                      "ss_match_tol": 1e-4, "min_feat_change": 0.01},
+        "global": {"require_coords_match": True, "require_ss_match": True,
+                    "ss_match_tol": 1e-4, "min_change_coverage": 0.3},
+        "tier_thresholds": {"high": 0.8, "medium": 0.6, "low": 0.4},
+    }
+    yaml_cleaning = cfg.get("cleaning", {})
+    merged = dict(default_cleaning)
+    for k, v in yaml_cleaning.items():
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k] = {**merged[k], **v}
+        else:
+            merged[k] = v
+    cfg["cleaning"] = merged
+
+    summary_path = run_cleaning(
+        input_dir=input_dir,
+        cfg=cfg,
+        workers=workers,
+    )
+    logger.info(f"Cleaning summary: {summary_path}")
+    return str(summary_path)
+
+
 def diagnose_step1(labels_path: Path, shard: str | None) -> dict:
     return _diagnose_step1(labels_path, shard)
 
@@ -1076,7 +1128,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="PartCraft3D Batch Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Steps 1–6: semantic, plan, 2D, TRELLIS, quality, export. "
+        epilog="Steps 1–7: semantic, plan, 2D, TRELLIS, quality, export, cleaning. "
                "Examples: run_pipeline.py | --steps 4 5 | --dry-run")
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--steps", type=int, nargs="*", default=None,
@@ -1137,6 +1189,11 @@ def main():
                              "ortho images). Off by default.")
     parser.add_argument("--force", action="store_true",
                         help="Force re-run (delete and regenerate cached results)")
+    parser.add_argument("--cleaning-input-dir", type=str, default=None,
+                        help="Step 7: root of repacked object-centric data "
+                             "(partverse_pairs dir with shard_XX subdirs)")
+    parser.add_argument("--cleaning-workers", type=int, default=4,
+                        help="Step 7: parallel workers per shard")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -1225,6 +1282,7 @@ def main():
         "run_step_3d_edit_multi_gpu": run_step_3d_edit_multi_gpu,
         "run_step_quality": run_step_quality,
         "run_step_export": run_step_export,
+        "run_step_cleaning": run_step_cleaning,
     }
     try:
         ctx = run_selected_steps(

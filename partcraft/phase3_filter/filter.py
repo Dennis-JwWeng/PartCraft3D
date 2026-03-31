@@ -366,6 +366,22 @@ MODIFICATION_METRICS: list[Callable] = [
 # Core scoring
 # ---------------------------------------------------------------------------
 
+def weighted_score(results: list[MetricResult]) -> tuple[float, bool]:
+    """Compute weighted composite score and all-pass flag.
+
+    Returns (score, all_passed) where score is in [0, 1].
+    Shared by mesh-based filter and NPZ-based cleaning.
+    """
+    if not results:
+        return 0.0, True
+    total_weight = sum(r.weight for r in results)
+    if total_weight <= 0:
+        return 0.0, True
+    score = sum(r.weight * (1.0 if r.passed else 0.0) for r in results) / total_weight
+    passed = all(r.passed for r in results)
+    return round(score, 4), passed
+
+
 def evaluate_pair(edit_id: str, edit_type: str,
                   before: trimesh.Trimesh, after: trimesh.Trimesh,
                   cfg: dict) -> QualityReport:
@@ -385,14 +401,7 @@ def evaluate_pair(edit_id: str, edit_type: str,
                 metric_fn.__name__.replace("metric_", ""),
                 0.0, False, weight=1.0, reason=f"error: {e}"))
 
-    # Composite weighted score
-    total_weight = sum(r.weight for r in results)
-    if total_weight > 0:
-        score = sum(r.weight * (1.0 if r.passed else 0.0) for r in results) / total_weight
-    else:
-        score = 0.0
-
-    passed = all(r.passed for r in results)
+    score, passed = weighted_score(results)
 
     return QualityReport(
         edit_id=edit_id,
@@ -433,10 +442,7 @@ def evaluate_modification_pair(edit_id: str,
     all_metrics = report.metrics + extra
 
     # Recompute score with extra metrics
-    total_weight = sum(r.weight for r in all_metrics)
-    score = sum(r.weight * (1.0 if r.passed else 0.0)
-                for r in all_metrics) / max(total_weight, 1e-8)
-    passed = all(r.passed for r in all_metrics)
+    score, passed = weighted_score(all_metrics)
 
     return QualityReport(
         edit_id=edit_id,
