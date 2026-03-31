@@ -106,6 +106,17 @@ def _glb_getter(glb_dir: Path, obj_id: str) -> Path:
 # Pack step: render outputs → images/ + mesh/ NPZ, clean up img_Enc PNGs
 # ---------------------------------------------------------------------------
 
+_pack_ctx: dict = {}
+
+def _pack_worker(oid: str) -> tuple[str, dict]:
+    """Top-level function for ProcessPoolExecutor (must be picklable)."""
+    from scripts.datasets.partverse.pack_npz import _pack_one, PACK_VIEWS
+    ctx = _pack_ctx
+    return oid, _pack_one(oid, ctx["img_enc_dir"] / oid,
+                          ctx["render_out"], ctx["mesh_out"],
+                          ctx["captions"], keep_views=PACK_VIEWS)
+
+
 def _run_pack(
     obj_ids: list[str],
     shard: str,
@@ -116,12 +127,10 @@ def _run_pack(
     img_enc_dir: Path,
     images_dir: Path,
     mesh_dir: Path,
+    workers: int = 1,
 ):
-    """Pack rendered img_Enc outputs into images/{shard}/ + mesh/{shard}/ NPZ.
-
-    After successful packing, PNGs / transforms.json / mesh.ply are removed
-    from img_Enc — only voxels.ply is kept (used as encode cache marker).
-    """
+    """Pack rendered img_Enc outputs into images/{shard}/ + mesh/{shard}/ NPZ."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
     from scripts.datasets.partverse.pack_npz import _pack_one, PACK_VIEWS
 
     render_out = images_dir / shard
@@ -130,34 +139,61 @@ def _run_pack(
     mesh_out.mkdir(parents=True, exist_ok=True)
 
     total = len(obj_ids)
-    ok = skip = fail = 0
+    pending = []
+    pre_skip = 0
 
-    for i, obj_id in enumerate(obj_ids):
+    for obj_id in obj_ids:
         out_r = render_out / f"{obj_id}.npz"
         out_m = mesh_out   / f"{obj_id}.npz"
         if out_r.exists() and out_m.exists() and not force:
-            skip += 1
+            pre_skip += 1
             continue
-
-        one_img_enc_dir = img_enc_dir / obj_id
-        if not one_img_enc_dir.exists():
-            skip += 1
+        if not (img_enc_dir / obj_id).exists():
+            pre_skip += 1
             continue
+        pending.append(obj_id)
 
-        result = _pack_one(obj_id, one_img_enc_dir, render_out, mesh_out, captions,
-                           keep_views=PACK_VIEWS)
-        if result["status"] == "ok":
-            ok += 1
-            logger.info(f"[pack {i+1}/{total}] {obj_id}: "
-                        f"{result['views']} views, {result['parts']} parts")
-            # Keep all 150 PNGs in img_Enc — only 16 selected views go into NPZ.
-            # img_Enc serves as the full render archive; images/ NPZ is the slim
-            # pipeline input.
-        else:
-            fail += 1
-            logger.warning(f"[pack {i+1}/{total}] {obj_id}: skip — {result['reason']}")
+    logger.info(f"Pack: {len(pending)} pending, {pre_skip} cached / {total} total "
+                f"(workers={workers})")
+    if not pending:
+        return
 
-    logger.info(f"Pack: {ok} packed, {skip} skipped, {fail} failed / {total} total")
+    ok = fail = 0
+    if workers <= 1:
+        for i, obj_id in enumerate(pending):
+            result = _pack_one(obj_id, img_enc_dir / obj_id, render_out, mesh_out,
+                               captions, keep_views=PACK_VIEWS)
+            if result["status"] == "ok":
+                ok += 1
+                logger.info(f"[pack {i+1}/{len(pending)}] {obj_id}: "
+                            f"{result['views']} views, {result['parts']} parts")
+            else:
+                fail += 1
+                logger.warning(f"[pack {i+1}/{len(pending)}] {obj_id}: skip — {result['reason']}")
+    else:
+        _pack_ctx.update(img_enc_dir=img_enc_dir, render_out=render_out,
+                         mesh_out=mesh_out, captions=captions)
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_pack_worker, oid): oid for oid in pending}
+            done_count = 0
+            for future in as_completed(futures):
+                done_count += 1
+                oid = futures[future]
+                try:
+                    _, result = future.result()
+                    if result["status"] == "ok":
+                        ok += 1
+                        if done_count % 50 == 0 or done_count == len(pending):
+                            logger.info(f"[pack {done_count}/{len(pending)}] {oid}")
+                    else:
+                        fail += 1
+                        logger.warning(f"[pack {done_count}/{len(pending)}] {oid}: "
+                                       f"skip — {result['reason']}")
+                except Exception as e:
+                    fail += 1
+                    logger.error(f"[pack {done_count}/{len(pending)}] {oid}: ERROR — {e}")
+
+    logger.info(f"Pack: {ok} packed, {pre_skip} cached, {fail} failed / {total} total")
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +240,8 @@ def main():
     parser.add_argument("--render-workers", type=int, default=1,
                         help="Parallel Blender workers, each on a dedicated GPU. "
                              "Should not exceed the number of available GPUs.")
+    parser.add_argument("--pack-workers", type=int, default=1,
+                        help="Parallel CPU workers for pack step (default: 1)")
     args = parser.parse_args()
 
     # region agent log
@@ -416,6 +454,7 @@ def main():
                 img_enc_dir=img_enc_dir,
                 images_dir=images_dir,
                 mesh_dir=mesh_dir,
+                workers=args.pack_workers,
             )
         print_summary(obj_ids, img_enc_dir, slat_shard_dir, logger)
         return
@@ -466,6 +505,7 @@ def main():
             img_enc_dir=img_enc_dir,
             images_dir=images_dir,
             mesh_dir=mesh_dir,
+            workers=args.pack_workers,
         )
 
     print_summary(obj_ids, img_enc_dir, slat_shard_dir, logger)

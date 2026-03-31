@@ -132,8 +132,11 @@ Step1 的 prompt 生成分为“VLM 主生成 + 模板兜底”两层：
   - 主入口：`render -> encode -> pack`（支持 `--render-only/--pack-only/--encode-only`）。
   - 默认从 `configs/prerender_partverse.yaml` 读取路径；支持 `--config` 指定。
   - 产出：`img_Enc/`、`slat/{shard}/`、`images/{shard}/`、`mesh/{shard}/`。
+  - `--num-gpus N`：多 GPU 并行 SLAT encode，已编码对象自动跳过（缓存 `{obj_id}_feats.pt`）。
+  - `--pack-workers N`：多进程并行 pack（CPU 密集，推荐 32–64），已打包 NPZ 自动跳过。
 - `scripts/datasets/partverse/pack_npz.py`
   - 将 `img_Enc` 和标注打包为 pipeline 输入 NPZ（含 `split_mesh.json`、`transforms.json`）。
+  - 核心函数 `_pack_one` 和 `PACK_VIEWS` 被 `prerender.py` 复用；推荐通过 `prerender.py --pack-only` 调用。
 - `scripts/datasets/partverse/repack_images_slim.py`
   - 对 `images/*.npz` 做视角瘦身，并可刷新 `part_id_to_name` 文本标签。
 - `scripts/datasets/partverse/unpack_for_encode.py`

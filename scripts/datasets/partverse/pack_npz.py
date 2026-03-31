@@ -51,6 +51,7 @@ import io
 import json
 import logging
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -259,6 +260,8 @@ def main():
 
     parser.add_argument("--force", action="store_true",
                         help="Re-pack even if output NPZs already exist")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of parallel CPU workers (default: 1)")
     args = parser.parse_args()
 
     global _PARTVERSE_DIR, _ANNO_DIR, _CAPTIONS_PATH, _IMG_ENC_DIR, _IMAGES_DIR, _MESH_DIR
@@ -310,33 +313,65 @@ def main():
 
     # ---- Pack ----
     total = len(obj_ids)
-    ok, skip, fail = 0, 0, 0
 
-    for i, obj_id in enumerate(obj_ids):
+    pending = []
+    pre_skip = 0
+    for obj_id in obj_ids:
         out_r = render_out / f"{obj_id}.npz"
         out_m = mesh_out   / f"{obj_id}.npz"
         if out_r.exists() and out_m.exists() and not args.force:
-            skip += 1
+            pre_skip += 1
             continue
-
         img_enc_dir = _IMG_ENC_DIR / obj_id
         if not img_enc_dir.exists():
-            logger.warning(f"[{i+1}/{total}] {obj_id}: no img_Enc dir, skip")
-            skip += 1
+            logger.warning(f"{obj_id}: no img_Enc dir, skip")
+            pre_skip += 1
             continue
+        pending.append(obj_id)
 
-        result = _pack_one(obj_id, img_enc_dir, render_out, mesh_out, captions,
-                           keep_views=PACK_VIEWS)
+    logger.info(f"Pack: {len(pending)} pending, {pre_skip} skipped / {total} total "
+                f"(workers={args.workers})")
 
-        if result["status"] == "ok":
-            ok += 1
-            logger.info(f"[{i+1}/{total}] {obj_id}: "
-                        f"{result['views']} views, {result['parts']} parts")
-        else:
-            fail += 1
-            logger.warning(f"[{i+1}/{total}] {obj_id}: SKIP — {result['reason']}")
+    if not pending:
+        logger.info("Nothing to pack.")
+        return
 
-    logger.info(f"\nDone: {ok} packed, {skip} skipped, {fail} failed / {total} total")
+    def _do_pack(oid: str) -> dict:
+        return _pack_one(oid, _IMG_ENC_DIR / oid, render_out, mesh_out, captions,
+                         keep_views=PACK_VIEWS)
+
+    ok = fail = 0
+    if args.workers <= 1:
+        for i, obj_id in enumerate(pending):
+            result = _do_pack(obj_id)
+            if result["status"] == "ok":
+                ok += 1
+                logger.info(f"[{i+1}/{len(pending)}] {obj_id}: "
+                            f"{result['views']} views, {result['parts']} parts")
+            else:
+                fail += 1
+                logger.warning(f"[{i+1}/{len(pending)}] {obj_id}: SKIP — {result['reason']}")
+    else:
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(_do_pack, oid): oid for oid in pending}
+            done_count = 0
+            for future in as_completed(futures):
+                done_count += 1
+                oid = futures[future]
+                try:
+                    result = future.result()
+                    if result["status"] == "ok":
+                        ok += 1
+                        if done_count % 50 == 0 or done_count == len(pending):
+                            logger.info(f"[{done_count}/{len(pending)}] packed {oid}")
+                    else:
+                        fail += 1
+                        logger.warning(f"[{done_count}/{len(pending)}] {oid}: SKIP — {result['reason']}")
+                except Exception as e:
+                    fail += 1
+                    logger.error(f"[{done_count}/{len(pending)}] {oid}: ERROR — {e}")
+
+    logger.info(f"\nDone: {ok} packed, {pre_skip} skipped, {fail} failed / {total} total")
 
 
 if __name__ == "__main__":

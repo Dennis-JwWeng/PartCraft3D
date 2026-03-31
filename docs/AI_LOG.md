@@ -1,5 +1,45 @@
 # AI_LOG
 
+## 2026-03-31 — prerender.py 多 GPU encode + 多进程 pack 支持
+
+### 背景
+shard07 预渲染的 encode 阶段因原始启动命令未传 `--num-gpus`，导致 8 卡机器只用 1 张 GPU 跑 SLAT 编码（速度为完整吞吐的 1/8）。且 pack 步骤为纯串行，在 192 核机器上浪费 CPU。
+
+### 改动
+
+**`scripts/datasets/partverse/prerender.py`**
+- `_run_pack()` 新增 `workers` 参数，支持 `ProcessPoolExecutor` 多进程并行 pack
+- 新增模块级 `_pack_worker()` 函数（解决 `ProcessPoolExecutor` 无法 pickle 嵌套函数的问题）
+- 新增 CLI 参数 `--pack-workers`，透传到 `_run_pack` 的两处调用（multi-GPU 路径和串行路径）
+- pack 函数内部先过滤 pending 对象，打印 `pending/cached` 统计后再 dispatch
+
+**`scripts/datasets/partverse/pack_npz.py`**
+- 新增 `--workers` 参数，支持多进程并行 pack（与 prerender.py 的 `_run_pack` 功能等价）
+- 保留为独立入口，prerender.py 的 `_run_pack` 复用其 `_pack_one` 和 `PACK_VIEWS`
+
+### 实际效果（shard07）
+
+| 阶段 | 配置 | 耗时 |
+|------|------|------|
+| SLAT encode（修复前） | 1 GPU | ~4.5 小时（预估全量） |
+| SLAT encode（修复后） | 8 GPU，735/1203 缓存命中 | ~40 分钟 |
+| Pack NPZ（修复前） | 1 worker 串行 | ~10 分钟（预估） |
+| Pack NPZ（修复后） | 64 workers | ~30 秒 |
+
+### 推荐用法
+```bash
+# 多 GPU encode + 多进程 pack（一条命令）
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+    python scripts/datasets/partverse/prerender.py \
+    --config configs/prerender_partverse_H200.yaml \
+    --shard 07 --num-shards 10 --num-gpus 8 --pack-workers 64
+
+# 仅 pack（encode 已完成时）
+python scripts/datasets/partverse/prerender.py \
+    --config configs/prerender_partverse_H200.yaml \
+    --shard 07 --num-shards 10 --pack-only --pack-workers 64
+```
+
 ## 2026-03-30 — 环境配置脚本完善（跨机器一键部署）
 
 ### 背景
