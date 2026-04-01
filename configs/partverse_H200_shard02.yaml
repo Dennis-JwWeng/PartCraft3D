@@ -1,9 +1,9 @@
-# PartVerse shard00 — H200 (8× NVIDIA L20X 48GB)
+# PartVerse shard02 — H200 (8× NVIDIA L20X 48GB)
 # Machine env: configs/machine/H200.env
 #
 # ── 启动方式 ────────────────────────────────────────────────────────
 # 一键批处理（推荐）：
-#   SHARD=00 BASE_CONFIG=configs/partverse_H200_shard00.yaml \
+#   SHARD=00 BASE_CONFIG=configs/partverse_H200_shard02.yaml \
 #       bash scripts/tools/run_shard_batch_pipeline.sh
 #
 # 手动分步：
@@ -26,7 +26,7 @@
 #   3) 管线（vinedresser3d 环境）：
 #      conda activate vinedresser3d
 #      python scripts/run_pipeline.py \
-#          --config configs/partverse_H200_shard00.yaml \
+#          --config configs/partverse_H200_shard02.yaml \
 #          --shard 00 --steps 4 --gpus 0 1 2 3 4 5 6 7
 
 # ── Checkpoints ─────────────────────────────────────────────────────
@@ -37,7 +37,7 @@ ckpt_root: "/root/workspace/PartCraft3D/checkpoints"
 data:
   data_dir:                "/mnt/zsn/data/partverse"
   derive_dataset_subpaths: true
-  shards:                  ["00"]
+  shards:                  ["02"]
   output_by_shard:         true
   output_dir:              "/mnt/zsn/data/partverse/outputs/partverse"
 
