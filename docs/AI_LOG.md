@@ -12,7 +12,7 @@
 
 **修复**（`partcraft/phase2_assembly/trellis_refine.py` — `_align_masks_to_slat`）：在计算 `unassigned` 之前检测 `overlap = slat_is_edit & slat_is_preserved`，将重叠体素的 `preserved` 标记清除（优先保留 `edit` 身份），并增加日志记录重叠数量。
 
-**影响**：Modification、Scale、Addition、Deletion 等需要 `& ~preserved` 的编辑类型受益；Material 类型不受影响（直接使用 `edit_parts.clone()`）。
+**影响**：仅 Modification 和 Scale 编辑类型受此 bug 影响（经过 `_compute_editing_region` 的 `mask & ~preserved` 路径）。Deletion 由 `direct_delete_mesh` 直接操作 GT mesh，Material 直接使用 `edit_parts.clone()`，Addition 虽经过同一路径但其编辑区域在空白空间、与 preserved 重叠极少，均不受实质影响。
 
 ---
 
