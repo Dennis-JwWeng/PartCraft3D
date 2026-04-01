@@ -4,6 +4,18 @@
 
 ---
 
+## 2026-03-31 — `_align_masks_to_slat` 体素重叠导致 Empty mask 修复
+
+**问题**：shard09 批量跑 Step4 时大量编辑失败，日志报 `Final mask: 0 voxels`。GPU0 共 251 次空 mask，其中 208 次是有编辑体素但最终被清零。
+
+**根因**：64³ 体素化分辨率下，编辑部件与保留部件的网格在相邻区域共享体素格子，导致 `_align_masks_to_slat` 中同一 SLAT 体素同时被标记为 `edit` 和 `preserved`。后续 `_compute_editing_region` 执行 `mask & ~preserved_parts` 时把这些重叠的编辑体素也剔除，小编辑区域的 mask 因此变为全零。
+
+**修复**（`partcraft/phase2_assembly/trellis_refine.py` — `_align_masks_to_slat`）：在计算 `unassigned` 之前检测 `overlap = slat_is_edit & slat_is_preserved`，将重叠体素的 `preserved` 标记清除（优先保留 `edit` 身份），并增加日志记录重叠数量。
+
+**影响**：Modification、Scale、Addition、Deletion 等需要 `& ~preserved` 的编辑类型受益；Material 类型不受影响（直接使用 `edit_parts.clone()`）。
+
+---
+
 ## 2026-03-31 — Object-Centric 训练数据重组 + DataLoader
 
 **问题**：平铺 `mesh_pairs/{edit_id}/` 下同一物体的 `before` 大量重复；训练侧需要可缓存的 Dataset。

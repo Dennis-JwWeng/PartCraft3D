@@ -618,6 +618,18 @@ class TrellisRefiner:
 
         slat_is_edit = edit_parts[sc[:, 0], sc[:, 1], sc[:, 2]]
         slat_is_preserved = preserved_parts[sc[:, 0], sc[:, 1], sc[:, 2]]
+
+        # At 64³ resolution adjacent parts can share voxel cells, causing
+        # a SLAT voxel to be flagged as both edit and preserved.  Resolve
+        # overlap in favour of edit (the operation target) so that
+        # `mask & ~preserved` in _compute_editing_region won't cancel them.
+        overlap = slat_is_edit & slat_is_preserved
+        n_overlap = int(overlap.sum())
+        if n_overlap > 0:
+            slat_is_preserved[overlap] = False
+            logger.info(f"SLAT overlap resolved: {n_overlap} voxels "
+                        f"reassigned from preserved → edit")
+
         unassigned = ~(slat_is_edit | slat_is_preserved)
 
         n_edit = int(slat_is_edit.sum())
