@@ -514,7 +514,9 @@ def run_cleaning(
 
     logger.info("Cleaning %d shards in %s", len(shard_dirs), root)
 
-    # Process each shard
+    # Process each shard — write per-shard manifests independently
+    tier_order = {"high": 0, "medium": 1, "low": 2, "negative": 3, "rejected": 4}
+    min_tier_val = tier_order.get(min_tier, 1)
     all_summaries = []
     all_results: list[dict] = []
 
@@ -523,7 +525,8 @@ def run_cleaning(
                               require_ss=require_ss, mesh_pairs_dir=mp_dir)
         all_summaries.append(summary)
 
-        # Collect results for manifest
+        # Collect results for this shard
+        shard_results: list[dict] = []
         for obj_dir in sorted(shard_dir.iterdir()):
             quality_path = obj_dir / "quality.json"
             if not quality_path.exists():
@@ -535,14 +538,38 @@ def run_cleaning(
                     continue
                 edit["shard"] = q.get("shard", "")
                 edit["obj_id"] = q.get("obj_id", "")
-                all_results.append(edit)
+                shard_results.append(edit)
 
-    # Write manifest_clean.jsonl (only edits meeting min_tier)
-    tier_order = {"high": 0, "medium": 1, "low": 2, "negative": 3, "rejected": 4}
-    min_tier_val = tier_order.get(min_tier, 1)
+        all_results.extend(shard_results)
+
+        # Write per-shard manifests (never overwrite other shards)
+        shard_id = shard_dir.name.replace("shard_", "")
+        shard_clean = shard_dir / f"manifest_clean_{shard_id}.jsonl"
+        shard_tiered = shard_dir / f"manifest_tiered_{shard_id}.jsonl"
+        shard_summary = shard_dir / f"cleaning_summary_{shard_id}.json"
+        n_shard_clean = 0
+        with open(shard_clean, "w") as fc, open(shard_tiered, "w") as ft:
+            for r in shard_results:
+                line = json.dumps(r, ensure_ascii=False)
+                ft.write(line + "\n")
+                tier = r.get("tier", "rejected")
+                if tier_order.get(tier, 4) <= min_tier_val:
+                    fc.write(line + "\n")
+                    n_shard_clean += 1
+        with open(shard_summary, "w") as f:
+            json.dump({
+                "shard": shard_id,
+                "total_edits": len(shard_results),
+                "clean_edits": n_shard_clean,
+                "min_tier": min_tier,
+                **summary,
+            }, f, ensure_ascii=False, indent=2)
+        logger.info("  Shard %s: %d/%d passed → %s",
+                     shard_id, n_shard_clean, len(shard_results), shard_clean)
+
+    # Write merged global manifests (union of all shards processed in this run)
     clean_path = root / "manifest_clean.jsonl"
     tiered_path = root / "manifest_tiered.jsonl"
-
     n_clean = 0
     with open(clean_path, "w") as f_clean, open(tiered_path, "w") as f_all:
         for r in all_results:
@@ -569,8 +596,8 @@ def run_cleaning(
 
     logger.info("Cleaning done: %d/%d edits passed (%s tier+)",
                 n_clean, len(all_results), min_tier)
-    logger.info("  manifest_clean.jsonl: %s", clean_path)
-    logger.info("  manifest_tiered.jsonl: %s", tiered_path)
+    logger.info("  Per-shard manifests: shard_XX/manifest_clean_XX.jsonl")
+    logger.info("  Merged manifest_clean.jsonl: %s", clean_path)
     logger.info("  cleaning_summary.json: %s", summary_path)
 
     return summary_path
