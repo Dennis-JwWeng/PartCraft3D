@@ -109,14 +109,14 @@ DEFAULT_CLEANING_CFG: dict = {
     "material": {
         "require_coords_match": True,
         "require_ss_match": True,
-        "ss_match_tol": 1e-4,
+        "ss_match_tol": 1e-3,
         "min_feat_change": 0.01,
         "max_feat_change": 2.0,
     },
     "global": {
         "require_coords_match": True,
         "require_ss_match": True,
-        "ss_match_tol": 1e-4,
+        "ss_match_tol": 1e-3,
         "min_feat_change": 0.02,
         "max_feat_change": 2.0,
         "min_change_coverage": 0.3,
@@ -175,7 +175,7 @@ def main():
     yaml_cleaning = cfg.get("cleaning", {})
     cfg["cleaning"] = _merge_cleaning_cfg(DEFAULT_CLEANING_CFG, yaml_cleaning)
 
-    edit_types = set(args.edit_types) if args.edit_types else None
+    edit_types = set(args.edit_types) if args.edit_types is not None else None
 
     summary_path = run_cleaning(
         input_dir=args.input_dir,

@@ -120,9 +120,7 @@ def clean_edit(
     # --- Identity: trivially valid ---
     if edit_type == "identity":
         if original_data is not None:
-            l1 = check_npz_sanity.__wrapped__(original_data) if hasattr(
-                check_npz_sanity, "__wrapped__") else _run_l1_on_arrays(
-                    original_data, cleaning_cfg)
+            l1 = _run_l1_on_arrays(original_data, cleaning_cfg)
             l1_score, l1_passed = weighted_score(l1)
             result.layer1 = _metrics_to_dict(l1)
             result.layer1_passed = l1_passed
