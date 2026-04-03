@@ -4,6 +4,23 @@
 
 ---
 
+## 2026-04-03 — Material/Global 体素匹配策略定稿
+
+**问题**：TRELLIS S2-only 编辑（material/global）理论上不改变几何，但实际产出会有 1-2 个体素的微小差异。之前的 `coords_match`（`np.array_equal`）和 `voxel_count_match`（精确相等）导致 material 类型全部被误杀（0% 通过率）。
+
+**决策**：统一移除严格体素匹配检查，不论是否有 SS，material/global 均使用宽松的 `voxel_count_close`（1% 容差）。
+
+**代码**：`partcraft/cleaning/pair_checks.py` 的 `check_material()`
+- 移除 `require_coords_match` / `coords_match`（`np.array_equal`）
+- 移除 `voxel_count_match`（精确 `n_before == n_after`）
+- 统一使用 `voxel_count_close`：`abs(ratio - 1.0) <= 0.01`，weight=2.0
+- `feat_change` 检查不再依赖体素数完全一致（`feat_change_ratio` 已兼容不同长度）
+- SS match 检查保留（`ss_match_tol: 1e-3`，有 SS 时生效）
+
+**验证**：shard01 全量 cleaning，修复前 material 0%，修复后预期 ~95%+。
+
+---
+
 ## 2026-04-03 — 统一后处理管线 `run_postprocess.py`
 
 **问题**：shard01 的旧格式（`feats.pt+coords.pt`，无 SS）和 PLY-only deletion 无法直接用现有 cleaning 管线处理；所有编辑类型缺少 VLM 语义评判。

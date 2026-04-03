@@ -389,29 +389,15 @@ def check_material(
     n_before = len(original["coords"])
     n_after = len(after["coords"])
 
-    if require_ss and c.get("require_coords_match", True):
-        coords_match = (
-            original["coords"].shape == after["coords"].shape
-            and bool(np.array_equal(original["coords"], after["coords"]))
-        )
-        results.append(MetricResult(
-            "coords_match", 1.0 if coords_match else 0.0, coords_match, 3.0,
-            "" if coords_match else "coords differ (S2-only should preserve geometry)"
-        ))
-        count_match = n_before == n_after
-        results.append(MetricResult(
-            "voxel_count_match", 1.0 if count_match else 0.0, count_match, 3.0,
-            "" if count_match else f"voxel count {n_before} vs {n_after}"
-        ))
-    else:
-        # Relaxed: allow small voxel count difference (< 1%)
-        ratio = n_after / max(n_before, 1)
-        tol = c.get("voxel_count_tol", 0.01)
-        close_enough = abs(ratio - 1.0) <= tol
-        results.append(MetricResult(
-            "voxel_count_close", ratio, close_enough, 2.0,
-            "" if close_enough else f"voxel count ratio {ratio:.4f}, diff > {tol*100:.0f}%"
-        ))
+    # Voxel count must be close (TRELLIS S2-only edits may have tiny
+    # voxel count differences even though geometry should be preserved)
+    ratio = n_after / max(n_before, 1)
+    tol = c.get("voxel_count_tol", 0.01)
+    close_enough = abs(ratio - 1.0) <= tol
+    results.append(MetricResult(
+        "voxel_count_close", ratio, close_enough, 2.0,
+        "" if close_enough else f"voxel count ratio {ratio:.4f}, diff > {tol*100:.0f}%"
+    ))
 
     # SS must match (skip if no SS)
     if require_ss and c.get("require_ss_match", True) and _has_ss(original, after):
@@ -424,14 +410,13 @@ def check_material(
             "" if ss_match else f"ss max diff {ss_diff:.6f} >= {tol}"
         ))
 
-    # Feature change should exist (requires same voxel count)
-    if n_before == n_after:
-        fr = feat_change_ratio(original["feats"], after["feats"])
-        min_fc = c.get("min_feat_change", 0.01)
-        max_fc = c.get("max_feat_change", 2.0)
-        passed = min_fc <= fr <= max_fc
-        reason = "" if passed else f"feat change {fr:.4f} outside [{min_fc},{max_fc}]"
-        results.append(MetricResult("feat_change", fr, passed, 1.5, reason))
+    # Feature change should exist
+    fr = feat_change_ratio(original["feats"], after["feats"])
+    min_fc = c.get("min_feat_change", 0.01)
+    max_fc = c.get("max_feat_change", 2.0)
+    passed = min_fc <= fr <= max_fc
+    reason = "" if passed else f"feat change {fr:.4f} outside [{min_fc},{max_fc}]"
+    results.append(MetricResult("feat_change", fr, passed, 1.5, reason))
 
     return results
 
