@@ -384,8 +384,12 @@ def check_material(
     c = cfg or {}
     results = []
 
-    # Coords must match exactly
-    if c.get("require_coords_match", True):
+    # Coords must match (exact when SS available; relaxed when no SS
+    # because TRELLIS S2-only edits may have tiny voxel count differences)
+    n_before = len(original["coords"])
+    n_after = len(after["coords"])
+
+    if require_ss and c.get("require_coords_match", True):
         coords_match = (
             original["coords"].shape == after["coords"].shape
             and bool(np.array_equal(original["coords"], after["coords"]))
@@ -394,15 +398,20 @@ def check_material(
             "coords_match", 1.0 if coords_match else 0.0, coords_match, 3.0,
             "" if coords_match else "coords differ (S2-only should preserve geometry)"
         ))
-
-    # Voxel count must be identical
-    n_before = len(original["coords"])
-    n_after = len(after["coords"])
-    count_match = n_before == n_after
-    results.append(MetricResult(
-        "voxel_count_match", 1.0 if count_match else 0.0, count_match, 3.0,
-        "" if count_match else f"voxel count {n_before} vs {n_after}"
-    ))
+        count_match = n_before == n_after
+        results.append(MetricResult(
+            "voxel_count_match", 1.0 if count_match else 0.0, count_match, 3.0,
+            "" if count_match else f"voxel count {n_before} vs {n_after}"
+        ))
+    else:
+        # Relaxed: allow small voxel count difference (< 1%)
+        ratio = n_after / max(n_before, 1)
+        tol = c.get("voxel_count_tol", 0.01)
+        close_enough = abs(ratio - 1.0) <= tol
+        results.append(MetricResult(
+            "voxel_count_close", ratio, close_enough, 2.0,
+            "" if close_enough else f"voxel count ratio {ratio:.4f}, diff > {tol*100:.0f}%"
+        ))
 
     # SS must match (skip if no SS)
     if require_ss and c.get("require_ss_match", True) and _has_ss(original, after):

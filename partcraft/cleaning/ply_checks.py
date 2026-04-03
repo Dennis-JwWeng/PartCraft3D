@@ -104,11 +104,13 @@ def check_deletion_ply(
     reason = "" if passed else f"center drift {drift_ratio:.3f} >= {max_drift}"
     results.append(MetricResult("center_drift", drift_ratio, passed, 1.5, reason))
 
-    # --- watertight (soft check, lower weight) ---
+    # --- watertight (informational only, weight=0) ---
+    # Deletion inherently breaks watertightness (open hole where part was
+    # removed), so this must not block pass/fail.
     is_wt = bool(after.is_watertight)
     results.append(MetricResult(
-        "watertight", 1.0 if is_wt else 0.0, is_wt, 0.5,
-        "" if is_wt else "after mesh is not watertight"))
+        "watertight", 1.0 if is_wt else 0.0, True, 0.0,
+        "" if is_wt else "after mesh is not watertight (expected for deletion)"))
 
     return results
 
