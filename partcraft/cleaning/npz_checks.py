@@ -203,7 +203,7 @@ def load_slat_dir_arrays(slat_dir: str | Path) -> dict[str, np.ndarray]:
     feats = torch.load(feats_path, weights_only=True)
     coords = torch.load(coords_path, weights_only=True)
     return {
-        "coords": coords.cpu().numpy() if isinstance(coords, torch.Tensor) else coords,
-        "feats": feats.cpu().numpy() if isinstance(feats, torch.Tensor) else feats,
+        "coords": coords.detach().cpu().numpy() if isinstance(coords, torch.Tensor) else coords,
+        "feats": feats.detach().cpu().numpy() if isinstance(feats, torch.Tensor) else feats,
         "ss": None,
     }

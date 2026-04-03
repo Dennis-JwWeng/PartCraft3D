@@ -172,16 +172,16 @@ def run_phase_a(
             etype = s["edit_type"]
             after_slat = mesh_pairs / eid / "after_slat"
             if not after_slat.is_dir():
-                results_all.append({"edit_id": eid, "phase_a": "no_data"})
+                results_all.append({"edit_id": eid, "type": etype, "phase_a": "no_data"})
                 continue
             try:
                 after_data = load_slat_dir_arrays(after_slat)
             except Exception as e:
-                results_all.append({"edit_id": eid, "phase_a": f"load_error: {e}"})
+                results_all.append({"edit_id": eid, "type": etype, "phase_a": f"load_error: {e}"})
                 continue
 
             if original_data is None:
-                results_all.append({"edit_id": eid, "phase_a": "no_before"})
+                results_all.append({"edit_id": eid, "type": etype, "phase_a": "no_before"})
                 continue
 
             type_cfg = cleaning_cfg.get(etype, {})
