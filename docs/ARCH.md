@@ -374,7 +374,7 @@ for batch in loader:
      - **deletion/addition**：体素减少/增加比、连通性、退化检测
      - **modification**：SS 余弦相似度、编辑局部性、中心漂移
      - **scale**：更严格的 SS 保持、轴向 bbox 比
-     - **material/global**：坐标 & SS 必须完全一致（S2-only 约束），仅特征可变
+     - **material/global**：坐标 & SS 必须完全一致（S2-only 约束，`ss_match_tol: 1e-3`），仅特征可变
      - **identity**：天然有效（引用同一 `original.npz`）
    - 纯 numpy + scipy，无 GPU 依赖
 
@@ -388,6 +388,12 @@ for batch in loader:
 ### 输出
 
 每个 `shard_XX/{obj_id}/` 下追加 `quality.json`；全局产出 `manifest_clean.jsonl`、`manifest_tiered.jsonl`、`cleaning_summary.json`。
+
+### 已知修复（2026-04-03）
+
+- `ss_match_tol` 从 `1e-4` 放宽到 `1e-3`：避免浮点精度误杀 material/global 编辑
+- `--edit-types` 空参数不再静默过滤所有编辑（`if args.edit_types` → `if args.edit_types is not None`）
+- identity L1 检查移除 `__wrapped__` 探测，统一走 `_run_l1_on_arrays()`
 
 ### 训练侧集成
 

@@ -4,6 +4,20 @@
 
 ---
 
+## 2026-04-03 — 数据清洗关键 Bug 修复
+
+**问题**：审核 cleaning 管线代码时发现三处影响正确性的 bug。
+
+**修复**：
+
+| 文件 | 问题 | 修复 |
+|------|------|------|
+| `scripts/tools/run_cleaning.py` | `ss_match_tol: 1e-4` 过于严格，浮点运算误差导致 material/global 编辑被大量误杀 | 放宽到 `1e-3` |
+| `scripts/tools/run_cleaning.py` | `--edit-types` 不带参数时 `args.edit_types` 为 `[]`，`set([])` 过滤掉所有编辑，静默产出空结果 | 改为 `if args.edit_types is not None` |
+| `partcraft/cleaning/cleaner.py` | identity L1 检查通过 `check_npz_sanity.__wrapped__` 探测，依赖装饰器实现细节，一旦上游改动会静默走错分支 | 直接调用 `_run_l1_on_arrays()` |
+
+---
+
 ## 2026-03-31 — 编辑对可视化工具 `render_edit_gallery.py`
 
 **问题**：现有 `render_gs_pairs.py` 仅支持旧平铺 `mesh_pairs/` 格式且输出 MP4 视频，不适合快速浏览大量编辑的合理性。
