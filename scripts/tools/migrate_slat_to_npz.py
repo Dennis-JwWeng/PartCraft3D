@@ -125,9 +125,9 @@ def encode_ss(encoder, coords: torch.Tensor, device: str = "cuda") -> torch.Tens
 
 def _save_npz(path: Path, feats, coords, z_s):
     data = {
-        "slat_feats": feats.cpu().float().numpy(),
-        "slat_coords": coords.cpu().int().numpy(),
-        "ss": z_s.cpu().float().numpy(),
+        "slat_feats": feats.detach().cpu().float().numpy(),
+        "slat_coords": coords.detach().cpu().int().numpy(),
+        "ss": z_s.detach().cpu().float().numpy(),
     }
     np.savez(path, **data)
 
