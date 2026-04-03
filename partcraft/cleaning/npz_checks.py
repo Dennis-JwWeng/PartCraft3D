@@ -2,13 +2,18 @@
 
 Each check returns a MetricResult. All checks operate purely on numpy
 arrays loaded from .npz files (keys: slat_coords, slat_feats, ss).
+
+Supports ``require_ss=False`` mode for legacy data that only has
+``feats.pt`` + ``coords.pt`` without SS latents.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
+import torch
 
 
 @dataclass
@@ -127,40 +132,78 @@ def check_npz_sanity(
     max_ss_abs: float = 100.0,
     min_ss_std: float = 0.001,
     spatial_range: int = 64,
+    require_ss: bool = True,
 ) -> list[MetricResult]:
     """Run all Layer-1 sanity checks on a single NPZ file.
+
+    Args:
+        require_ss: If False, skip SS checks (for legacy data without SS).
 
     Returns a list of MetricResult (one per check).
     Raises FileNotFoundError / ValueError on missing keys.
     """
     data = np.load(npz_path)
-    required = {"slat_coords", "slat_feats", "ss"}
+    required = {"slat_coords", "slat_feats"}
+    if require_ss:
+        required.add("ss")
     missing = required - set(data.keys())
     if missing:
         raise ValueError(f"NPZ {npz_path} missing keys: {missing}")
 
     coords = data["slat_coords"]
     feats = data["slat_feats"]
-    ss = data["ss"]
 
-    return [
+    results = [
         check_voxel_count(coords, min_voxels, max_voxels),
         check_feat_range(feats, max_feat_abs, min_feat_std),
-        check_ss_range(ss, max_ss_abs, min_ss_std),
+    ]
+    if require_ss:
+        results.append(check_ss_range(data["ss"], max_ss_abs, min_ss_std))
+    results.extend([
         check_coords_valid(coords, spatial_range),
         check_coords_unique(coords),
-    ]
+    ])
+    return results
 
 
-def load_npz_arrays(npz_path: str) -> dict[str, np.ndarray]:
-    """Load and validate the three required arrays from an NPZ file."""
+def load_npz_arrays(npz_path: str, *, require_ss: bool = True) -> dict[str, np.ndarray]:
+    """Load and validate arrays from an NPZ file.
+
+    Args:
+        require_ss: If False, ``ss`` key is optional; missing SS yields None.
+    """
     data = np.load(npz_path)
-    required = {"slat_coords", "slat_feats", "ss"}
+    required = {"slat_coords", "slat_feats"}
+    if require_ss:
+        required.add("ss")
     missing = required - set(data.keys())
     if missing:
         raise ValueError(f"NPZ {npz_path} missing keys: {missing}")
-    return {
+    result = {
         "coords": data["slat_coords"],
         "feats": data["slat_feats"],
-        "ss": data["ss"],
+    }
+    if "ss" in data:
+        result["ss"] = data["ss"]
+    else:
+        result["ss"] = None
+    return result
+
+
+def load_slat_dir_arrays(slat_dir: str | Path) -> dict[str, np.ndarray]:
+    """Load arrays from legacy ``*_slat/feats.pt`` + ``coords.pt`` directory.
+
+    Returns dict with keys ``coords``, ``feats``, ``ss`` (always None).
+    """
+    slat_dir = Path(slat_dir)
+    feats_path = slat_dir / "feats.pt"
+    coords_path = slat_dir / "coords.pt"
+    if not feats_path.exists() or not coords_path.exists():
+        raise FileNotFoundError(f"Missing feats.pt or coords.pt in {slat_dir}")
+    feats = torch.load(feats_path, weights_only=True)
+    coords = torch.load(coords_path, weights_only=True)
+    return {
+        "coords": coords.cpu().numpy() if isinstance(coords, torch.Tensor) else coords,
+        "feats": feats.cpu().numpy() if isinstance(feats, torch.Tensor) else feats,
+        "ss": None,
     }

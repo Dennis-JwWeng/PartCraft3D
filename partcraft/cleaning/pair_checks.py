@@ -2,6 +2,9 @@
 
 Each edit type has a dedicated checker that exploits the type's invariants.
 All checks operate on numpy arrays from NPZ files — no PLY / trimesh needed.
+
+Supports ``require_ss=False`` mode for legacy data without SS latents;
+SS-dependent checks are skipped when SS is unavailable.
 """
 
 from __future__ import annotations
@@ -142,10 +145,17 @@ def feat_change_coverage(
 # Per-type checkers
 # =========================================================================
 
+def _has_ss(*dicts: dict[str, np.ndarray]) -> bool:
+    """Check if all data dicts have a non-None ``ss`` array."""
+    return all(d.get("ss") is not None for d in dicts)
+
+
 def check_deletion(
     original: dict[str, np.ndarray],
     after: dict[str, np.ndarray],
     cfg: Optional[dict] = None,
+    *,
+    require_ss: bool = True,
 ) -> list[MetricResult]:
     """Deletion: after should be a subset of original with parts removed."""
     c = cfg or {}
@@ -174,12 +184,13 @@ def check_deletion(
     reason = "" if passed else f"bbox iou {iou:.3f} < {min_iou}"
     results.append(MetricResult("bbox_iou", iou, passed, 1.5, reason))
 
-    # SS relative change
-    ss_dist = ss_l2_distance(original["ss"], after["ss"])
-    min_ss, max_ss = c.get("min_ss_change", 0.01), c.get("max_ss_change", 0.90)
-    passed = min_ss <= ss_dist <= max_ss
-    reason = "" if passed else f"ss change {ss_dist:.3f} outside [{min_ss},{max_ss}]"
-    results.append(MetricResult("ss_change", ss_dist, passed, 1.0, reason))
+    # SS relative change (skip if no SS)
+    if require_ss and _has_ss(original, after):
+        ss_dist = ss_l2_distance(original["ss"], after["ss"])
+        min_ss, max_ss = c.get("min_ss_change", 0.01), c.get("max_ss_change", 0.90)
+        passed = min_ss <= ss_dist <= max_ss
+        reason = "" if passed else f"ss change {ss_dist:.3f} outside [{min_ss},{max_ss}]"
+        results.append(MetricResult("ss_change", ss_dist, passed, 1.0, reason))
 
     # Connected components
     n_comp = connected_components_voxel(after["coords"])
@@ -189,8 +200,7 @@ def check_deletion(
     results.append(MetricResult("connected_components", float(n_comp), passed, 1.5, reason))
 
     # Degeneracy
-    _, hi, _, diag = bbox_from_coords(after["coords"])
-    lo, _, _, _ = bbox_from_coords(after["coords"])
+    lo, hi, _, _ = bbox_from_coords(after["coords"])
     extents = hi - lo
     min_ext = float(extents.min())
     passed = min_ext > 1.0
@@ -239,6 +249,8 @@ def check_modification(
     original: dict[str, np.ndarray],
     after: dict[str, np.ndarray],
     cfg: Optional[dict] = None,
+    *,
+    require_ss: bool = True,
 ) -> list[MetricResult]:
     """Modification (swap): TRELLIS S1+S2, geometry changes locally."""
     c = cfg or {}
@@ -253,12 +265,13 @@ def check_modification(
     reason = "" if passed else f"voxel ratio {ratio:.3f} outside [{min_r},{max_r}]"
     results.append(MetricResult("voxel_ratio", ratio, passed, 1.5, reason))
 
-    # SS cosine similarity (structural preservation)
-    sim = ss_cosine_sim(original["ss"], after["ss"])
-    min_sim = c.get("min_ss_cosine", 0.3)
-    passed = sim >= min_sim
-    reason = "" if passed else f"ss cosine sim {sim:.3f} < {min_sim}"
-    results.append(MetricResult("ss_cosine_sim", sim, passed, 2.0, reason))
+    # SS cosine similarity (skip if no SS)
+    if require_ss and _has_ss(original, after):
+        sim = ss_cosine_sim(original["ss"], after["ss"])
+        min_sim = c.get("min_ss_cosine", 0.3)
+        passed = sim >= min_sim
+        reason = "" if passed else f"ss cosine sim {sim:.3f} < {min_sim}"
+        results.append(MetricResult("ss_cosine_sim", sim, passed, 2.0, reason))
 
     # Edit locality (voxel diff ratio)
     diff_r = voxel_diff_ratio(original["coords"], after["coords"])
@@ -299,6 +312,8 @@ def check_scale(
     original: dict[str, np.ndarray],
     after: dict[str, np.ndarray],
     cfg: Optional[dict] = None,
+    *,
+    require_ss: bool = True,
 ) -> list[MetricResult]:
     """Scale: TRELLIS S1+S2, size change concentrated on one part."""
     c = cfg or {}
@@ -313,12 +328,13 @@ def check_scale(
     reason = "" if passed else f"voxel ratio {ratio:.3f} outside [{min_r},{max_r}]"
     results.append(MetricResult("voxel_ratio", ratio, passed, 2.0, reason))
 
-    # SS cosine similarity (higher bar than modification)
-    sim = ss_cosine_sim(original["ss"], after["ss"])
-    min_sim = c.get("min_ss_cosine", 0.5)
-    passed = sim >= min_sim
-    reason = "" if passed else f"ss cosine sim {sim:.3f} < {min_sim}"
-    results.append(MetricResult("ss_cosine_sim", sim, passed, 2.5, reason))
+    # SS cosine similarity (skip if no SS)
+    if require_ss and _has_ss(original, after):
+        sim = ss_cosine_sim(original["ss"], after["ss"])
+        min_sim = c.get("min_ss_cosine", 0.5)
+        passed = sim >= min_sim
+        reason = "" if passed else f"ss cosine sim {sim:.3f} < {min_sim}"
+        results.append(MetricResult("ss_cosine_sim", sim, passed, 2.5, reason))
 
     # Edit locality
     diff_r = voxel_diff_ratio(original["coords"], after["coords"])
@@ -361,6 +377,8 @@ def check_material(
     original: dict[str, np.ndarray],
     after: dict[str, np.ndarray],
     cfg: Optional[dict] = None,
+    *,
+    require_ss: bool = True,
 ) -> list[MetricResult]:
     """Material: S2-only, coords and SS must be identical, only feats change."""
     c = cfg or {}
@@ -386,9 +404,9 @@ def check_material(
         "" if count_match else f"voxel count {n_before} vs {n_after}"
     ))
 
-    # SS must match (within tolerance)
-    if c.get("require_ss_match", True):
-        tol = c.get("ss_match_tol", 1e-4)
+    # SS must match (skip if no SS)
+    if require_ss and c.get("require_ss_match", True) and _has_ss(original, after):
+        tol = c.get("ss_match_tol", 1e-3)
         ss_diff = float(np.abs(original["ss"].astype(np.float64) -
                                 after["ss"].astype(np.float64)).max())
         ss_match = ss_diff < tol
@@ -413,11 +431,13 @@ def check_global(
     original: dict[str, np.ndarray],
     after: dict[str, np.ndarray],
     cfg: Optional[dict] = None,
+    *,
+    require_ss: bool = True,
 ) -> list[MetricResult]:
     """Global: S2-only full mask, coords/SS identical, broad feat change."""
     c = cfg or {}
     # Start with material checks (same geometry constraints)
-    results = check_material(original, after, cfg)
+    results = check_material(original, after, cfg, require_ss=require_ss)
 
     # Additionally: change should be widespread (global style, not local)
     n_before = len(original["coords"])
@@ -447,22 +467,13 @@ def check_identity(
 # Unified dispatcher
 # =========================================================================
 
-_CHECKERS = {
-    "deletion": lambda orig, after, cfg: check_deletion(orig, after, cfg),
-    "addition": lambda orig, after, cfg: check_addition(after, orig, cfg),
-    "modification": lambda orig, after, cfg: check_modification(orig, after, cfg),
-    "scale": lambda orig, after, cfg: check_scale(orig, after, cfg),
-    "material": lambda orig, after, cfg: check_material(orig, after, cfg),
-    "global": lambda orig, after, cfg: check_global(orig, after, cfg),
-    "identity": lambda orig, after, cfg: check_identity(orig),
-}
-
-
 def check_pair(
     edit_type: str,
     original_data: dict[str, np.ndarray],
     after_data: Optional[dict[str, np.ndarray]],
     cfg: Optional[dict] = None,
+    *,
+    require_ss: bool = True,
 ) -> list[MetricResult]:
     """Dispatch to the appropriate type-specific checker.
 
@@ -472,9 +483,20 @@ def check_pair(
         after_data: Arrays from the type-specific NPZ (or deletion's NPZ for addition).
                     None for identity.
         cfg: Type-specific config dict (e.g. cfg["cleaning"]["deletion"]).
+        require_ss: If False, skip SS-dependent checks.
     """
+    _ss = {"require_ss": require_ss}
+    _CHECKERS = {
+        "deletion": lambda: check_deletion(original_data, after_data, cfg, **_ss),
+        "addition": lambda: check_addition(after_data, original_data, cfg),
+        "modification": lambda: check_modification(original_data, after_data, cfg, **_ss),
+        "scale": lambda: check_scale(original_data, after_data, cfg, **_ss),
+        "material": lambda: check_material(original_data, after_data, cfg, **_ss),
+        "global": lambda: check_global(original_data, after_data, cfg, **_ss),
+        "identity": lambda: check_identity(original_data),
+    }
     checker = _CHECKERS.get(edit_type)
     if checker is None:
         return [MetricResult("unknown_type", 0.0, False, 1.0,
                              f"unknown edit type: {edit_type}")]
-    return checker(original_data, after_data, cfg)
+    return checker()

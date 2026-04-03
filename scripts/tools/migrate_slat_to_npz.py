@@ -568,6 +568,10 @@ def main():
         "--phase", type=str, default="all",
         help="Comma-separated phases to run: 1,2,3,4 or 'all' (default: all)",
     )
+    parser.add_argument("--include-list", type=str, default=None,
+                        help="Text file with edit_ids to process (one per line); "
+                             "others are skipped. Phase 3/4 auto-includes "
+                             "addition/identity whose source deletion is included.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Count only, do not write files or load models")
     parser.add_argument("--device", default="cuda")
@@ -597,9 +601,27 @@ def main():
         log.error("--ckpt-root is required (or provide --config)")
         sys.exit(1)
 
+    # ── Load include list (optional filter) ──
+    include_set: set[str] | None = None
+    if args.include_list:
+        inc_path = Path(args.include_list)
+        if not inc_path.exists():
+            log.error("Include list not found: %s", inc_path)
+            sys.exit(1)
+        include_set = set()
+        with open(inc_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    include_set.add(line)
+        log.info("Include list: %d edit_ids from %s", len(include_set), inc_path)
+
     # ── Collect pair dirs ──
     pair_dirs = sorted(d for d in mesh_pairs.iterdir() if d.is_dir())
-    log.info("Found %d pair directories under %s", len(pair_dirs), mesh_pairs)
+    if include_set is not None:
+        pair_dirs = [d for d in pair_dirs if d.name in include_set]
+    log.info("Found %d pair directories under %s (filtered=%s)",
+             len(pair_dirs), mesh_pairs, include_set is not None)
 
     # ── Load specs (Phase 2–4) ──
     specs: list[SpecInfo] = []
@@ -613,6 +635,32 @@ def main():
             log.error("Specs file not found: %s", specs_path)
             sys.exit(1)
         specs = _load_specs(specs_path)
+
+        # Filter by include list: deletion must be in set;
+        # addition/identity auto-included if their source deletion is included
+        if include_set is not None:
+            included_del_ids = {
+                s.edit_id for s in specs
+                if s.edit_type == "deletion" and s.edit_id in include_set
+            }
+            filtered = []
+            for s in specs:
+                if s.edit_id in include_set:
+                    filtered.append(s)
+                elif s.edit_type == "addition" and s.source_del_id in included_del_ids:
+                    filtered.append(s)
+                elif s.edit_type == "identity":
+                    # Include identity if any edit of the same object is included
+                    obj_included = any(
+                        o.obj_id == s.obj_id and o.edit_id in include_set
+                        for o in specs if o.edit_type != "identity"
+                    )
+                    if obj_included:
+                        filtered.append(s)
+            log.info("Specs filtered by include list: %d → %d",
+                     len(specs), len(filtered))
+            specs = filtered
+
         specs_by_type = _group_by_type(specs)
         log.info(
             "Loaded %d specs: %s",

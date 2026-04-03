@@ -4,6 +4,36 @@
 
 ---
 
+## 2026-04-03 — 统一后处理管线 `run_postprocess.py`
+
+**问题**：shard01 的旧格式（`feats.pt+coords.pt`，无 SS）和 PLY-only deletion 无法直接用现有 cleaning 管线处理；所有编辑类型缺少 VLM 语义评判。
+
+**新增文件**：
+
+| 路径 | 作用 |
+|------|------|
+| `scripts/tools/run_postprocess.py` | 四阶段统一编排入口（Phase A-D） |
+| `partcraft/cleaning/ply_checks.py` | PLY mesh 几何检查（水密性、连通性、退化、体积比） |
+
+**修改文件**：
+
+| 路径 | 改动 |
+|------|------|
+| `partcraft/cleaning/npz_checks.py` | `require_ss=False` 模式；`load_slat_dir_arrays()` 支持旧 `*_slat/` 目录 |
+| `partcraft/cleaning/pair_checks.py` | 所有 checker 新增 `require_ss` 参数，无 SS 时跳过 SS 检查 |
+| `partcraft/cleaning/cleaner.py` | 支持从旧 `mesh_pairs/` 平铺布局加载；`require_ss` 和 `mesh_pairs_dir` 透传 |
+| `partcraft/phase3_filter/vlm_filter.py` | `render_ply_views()`、`evaluate_edit_from_ply()`、`evaluate_edit_from_slat_dir()` |
+| `scripts/tools/migrate_slat_to_npz.py` | `--include-list` 过滤，仅处理通过预筛的子集 |
+
+**设计要点**：
+
+- Phase A（几何预筛）无需 GPU，按数据格式自动分流：SLAT 编辑用 feats+coords 检查，PLY 编辑用 trimesh 检查
+- Phase B（VLM 语义）所有编辑类型都走 VLM 评判 prompt 对齐度；PLY 用 Blender 渲染，SLAT 用 TRELLIS Gaussian
+- Phase C 仅对 A+B 通过子集 encode SS，避免浪费 GPU
+- addition/identity 跟随配对 deletion 的结果，不独立评判
+
+---
+
 ## 2026-04-03 — 数据清洗关键 Bug 修复
 
 **问题**：审核 cleaning 管线代码时发现三处影响正确性的 bug。

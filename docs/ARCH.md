@@ -364,23 +364,65 @@ for batch in loader:
 
 ### 三层过滤
 
-1. **Layer 1（NPZ 健全性）**：`partcraft/cleaning/npz_checks.py`
+1. **Layer 1（NPZ/SLAT 健全性）**：`partcraft/cleaning/npz_checks.py`
    - 体素数范围、特征值域（NaN/Inf/常量）、SS 值域、坐标合法性/唯一性
+   - 支持 `require_ss=False` 模式，跳过 SS 检查（用于旧格式 `feats.pt+coords.pt`）
+   - `load_slat_dir_arrays()` 支持从旧 `*_slat/` 目录加载
    - 纯 numpy，无 GPU 依赖
 
 2. **Layer 2（编辑对比）**：`partcraft/cleaning/pair_checks.py`
    - 按编辑类型分发（7 类各有独立检查函数）
+   - 所有 checker 支持 `require_ss=False`，跳过 SS 相关指标
    - 关键类型特化：
      - **deletion/addition**：体素减少/增加比、连通性、退化检测
-     - **modification**：SS 余弦相似度、编辑局部性、中心漂移
-     - **scale**：更严格的 SS 保持、轴向 bbox 比
-     - **material/global**：坐标 & SS 必须完全一致（S2-only 约束，`ss_match_tol: 1e-3`），仅特征可变
+     - **modification**：SS 余弦相似度（可选）、编辑局部性、中心漂移
+     - **scale**：更严格的 SS 保持（可选）、轴向 bbox 比
+     - **material/global**：坐标 & SS 必须完全一致（S2-only 约束，`ss_match_tol: 1e-3`，SS 可选），仅特征可变
      - **identity**：天然有效（引用同一 `original.npz`）
    - 纯 numpy + scipy，无 GPU 依赖
 
-3. **Layer 3（VLM 语义，可选）**：复用 `partcraft/phase3_filter/vlm_filter.py` 的 `call_vlm_judge` 等公共函数
+3. **Layer 2-PLY（PLY 几何检查）**：`partcraft/cleaning/ply_checks.py`（**新增**）
+   - 针对仅有 PLY 产物的编辑（如 deletion 直接 mesh 操作）
+   - 检查：水密性、连通性、退化、体积比、中心漂移、顶点数
+   - 复用 `partcraft/phase3_filter/filter.py` 的 trimesh 指标
+   - 纯 CPU（trimesh），无 GPU 依赖
 
-### 入口
+4. **Layer 3（VLM 语义）**：`partcraft/phase3_filter/vlm_filter.py`
+   - **所有编辑类型**都需要 VLM 评判 prompt 对齐度
+   - 5 维评分：edit_executed、correct_region、preserve_other、visual_quality、artifact_free
+   - 支持两种渲染路径：
+     - SLAT 编辑：SLAT → TRELLIS Gaussian → 多视角渲染（`render_views`）
+     - PLY 编辑：PLY → Blender Cycles → 多视角渲染（`render_ply_views`，**新增**）
+   - `evaluate_edit_from_ply()` / `evaluate_edit_from_slat_dir()`（**新增**）
+
+### 统一后处理管线（2026-04-03 新增）
+
+`scripts/tools/run_postprocess.py` 整合预筛、VLM、SS 编码、repack、cleaning 为四阶段管线：
+
+| Phase | 功能 | 资源 |
+|-------|------|------|
+| **A** | 几何预筛：SLAT 编辑用 feats+coords 检查，PLY 编辑用 mesh 检查 | CPU |
+| **B** | VLM 语义评分：SLAT 编辑走 TRELLIS 渲染，PLY 编辑走 Blender 渲染 | GPU + VLM API |
+| **C** | 仅对 A+B 通过的子集 encode SS（`migrate_slat_to_npz --include-list`） | GPU |
+| **D** | repack → 完整 cleaning（含 SS 检查）→ 最终 manifest | CPU |
+
+```bash
+# 完整流程
+python scripts/tools/run_postprocess.py \
+    --config configs/partverse_node39_shard01.yaml \
+    --mesh-pairs outputs/partverse/shard_01/mesh_pairs_shard01 \
+    --specs-jsonl outputs/partverse/shard_01/cache/phase1/edit_specs_shard01.jsonl \
+    --output-dir outputs/partverse/partverse_pairs \
+    --shard 01
+
+# 仅预筛（无 GPU）
+python scripts/tools/run_postprocess.py ... --phase A
+
+# 预筛 + VLM（无需 SS）
+python scripts/tools/run_postprocess.py ... --phase AB
+```
+
+### 旧入口（仍可用）
 
 - **独立工具**：`scripts/tools/run_cleaning.py --input-dir partverse_pairs [--shards ...] [--workers N]`
 - **管线集成**：`python scripts/run_pipeline.py --steps 7 --cleaning-input-dir partverse_pairs`
@@ -388,12 +430,6 @@ for batch in loader:
 ### 输出
 
 每个 `shard_XX/{obj_id}/` 下追加 `quality.json`；全局产出 `manifest_clean.jsonl`、`manifest_tiered.jsonl`、`cleaning_summary.json`。
-
-### 已知修复（2026-04-03）
-
-- `ss_match_tol` 从 `1e-4` 放宽到 `1e-3`：避免浮点精度误杀 material/global 编辑
-- `--edit-types` 空参数不再静默过滤所有编辑（`if args.edit_types` → `if args.edit_types is not None`）
-- identity L1 检查移除 `__wrapped__` 探测，统一走 `_run_l1_on_arrays()`
 
 ### 训练侧集成
 

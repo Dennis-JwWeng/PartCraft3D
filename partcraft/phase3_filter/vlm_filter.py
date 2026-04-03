@@ -38,9 +38,12 @@ __all__ = [
     "classify_tier",
     "call_vlm_judge",
     "render_views",
+    "render_ply_views",
     "compose_comparison",
     "load_slat",
     "build_judge_prompt",
+    "evaluate_edit_from_ply",
+    "evaluate_edit_from_slat_dir",
 ]
 
 # Mesh prefilter: full ``evaluate_pair`` (volume / edit ratio / …) only for types
@@ -196,6 +199,127 @@ def compose_comparison(before_imgs: list[np.ndarray],
     buf = io.BytesIO()
     canvas.save(buf, format="PNG")
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# PLY rendering (Blender-based, no TRELLIS needed)
+# ---------------------------------------------------------------------------
+
+def render_ply_views(
+    ply_path: str | Path,
+    num_views: int = 4,
+    blender_path: str = "blender",
+    resolution: int = 512,
+) -> list[np.ndarray]:
+    """Render multiview images from a PLY mesh via Blender.
+
+    Returns list of (H, W, 3) uint8 numpy arrays — same format as
+    ``render_views()`` for drop-in compatibility.
+    """
+    import sys
+    _project_root = Path(__file__).resolve().parents[2]
+    vis_dir = str(_project_root / "scripts" / "vis")
+    if vis_dir not in sys.path:
+        sys.path.insert(0, vis_dir)
+    from render_ply_pairs import render_4views  # noqa: E402
+
+    imgs = render_4views(str(ply_path), resolution=resolution,
+                         blender_path=blender_path)
+    if num_views < len(imgs):
+        imgs = imgs[:num_views]
+    return imgs
+
+
+# ---------------------------------------------------------------------------
+# Convenience evaluators for different data formats
+# ---------------------------------------------------------------------------
+
+def evaluate_edit_from_ply(
+    before_ply: str | Path,
+    after_ply: str | Path,
+    edit_id: str,
+    edit_type: str,
+    edit_prompt: str,
+    object_desc: str,
+    part_label: str,
+    vlm_client,
+    vlm_model: str,
+    *,
+    num_views: int = 4,
+    blender_path: str = "blender",
+    vlm_max_tokens: int = 4096,
+    vlm_json_object_mode: bool = False,
+) -> VLMScore:
+    """Evaluate an edit pair from PLY files: Blender render → VLM judge."""
+    score = VLMScore(edit_id=edit_id, edit_type=edit_type)
+    try:
+        before_imgs = render_ply_views(before_ply, num_views,
+                                       blender_path=blender_path)
+        after_imgs = render_ply_views(after_ply, num_views,
+                                      blender_path=blender_path)
+        comp_bytes = compose_comparison(before_imgs, after_imgs)
+        result = call_vlm_judge(
+            vlm_client, vlm_model, comp_bytes,
+            edit_prompt, edit_type, object_desc, part_label,
+            max_tokens=vlm_max_tokens,
+            json_object_mode=vlm_json_object_mode,
+        )
+        if result is None:
+            score.reason = "VLM returned no valid response"
+            return score
+        score.edit_executed = bool(result.get("edit_executed", False))
+        score.correct_region = bool(result.get("correct_region", False))
+        score.preserve_other = bool(result.get("preserve_other", False))
+        score.visual_quality = int(result.get("visual_quality", 0))
+        score.artifact_free = bool(result.get("artifact_free", False))
+        score.reason = result.get("reason", "")
+        score.score = compute_composite_score(score)
+        score.quality_tier = classify_tier(score)
+    except Exception as e:
+        score.reason = f"Evaluation error: {e}"
+        logger.error("  %s: %s", edit_id, e)
+    return score
+
+
+def evaluate_edit_from_slat_dir(
+    pipeline,
+    slat_dir_before: str | Path,
+    slat_dir_after: str | Path,
+    edit_id: str,
+    edit_type: str,
+    edit_prompt: str,
+    object_desc: str,
+    part_label: str,
+    vlm_client,
+    vlm_model: str,
+    *,
+    num_views: int = 4,
+    device: str = "cuda",
+    vlm_max_tokens: int = 4096,
+    vlm_json_object_mode: bool = False,
+) -> VLMScore:
+    """Evaluate an edit pair from ``*_slat/`` directories.
+
+    Loads feats.pt + coords.pt, decodes via TRELLIS Gaussian, renders,
+    and sends to VLM — same as ``evaluate_edit`` but takes directory paths
+    instead of pre-loaded SLATs.
+    """
+    return evaluate_edit(
+        pipeline=pipeline,
+        slat_dir_before=Path(slat_dir_before),
+        slat_dir_after=Path(slat_dir_after),
+        edit_id=edit_id,
+        edit_type=edit_type,
+        edit_prompt=edit_prompt,
+        object_desc=object_desc,
+        part_label=part_label,
+        vlm_client=vlm_client,
+        vlm_model=vlm_model,
+        num_views=num_views,
+        device=device,
+        vlm_max_tokens=vlm_max_tokens,
+        vlm_json_object_mode=vlm_json_object_mode,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -26,7 +26,9 @@ from typing import Optional
 import numpy as np
 from tqdm import tqdm
 
-from .npz_checks import MetricResult, check_npz_sanity, load_npz_arrays
+from .npz_checks import (
+    MetricResult, check_npz_sanity, load_npz_arrays, load_slat_dir_arrays,
+)
 from .pair_checks import check_pair
 
 logger = logging.getLogger(__name__)
@@ -104,13 +106,90 @@ def _get_type_cfg(cfg: dict, edit_type: str) -> dict:
     return cleaning.get(edit_type, {})
 
 
+def _load_after_data(
+    obj_dir: Path,
+    edit_entry: dict,
+    edit_type: str,
+    *,
+    require_ss: bool,
+    mesh_pairs_dir: Path | None = None,
+) -> tuple[dict[str, np.ndarray] | None, str]:
+    """Resolve and load after-edit data from various formats.
+
+    Returns (data_dict_or_None, error_reason).
+    """
+    # --- Object-centric layout (shard_XX/{obj_id}/mod_000.npz) ---
+    npz_file = edit_entry.get("file")
+    if edit_type == "addition":
+        source_del_seq = edit_entry.get("source_del_seq", -1)
+        if source_del_seq < 0:
+            return None, "missing source_del_seq for addition"
+        npz_file = f"del_{source_del_seq:03d}.npz"
+
+    if npz_file is not None:
+        npz_path = obj_dir / npz_file
+        if npz_path.exists():
+            return load_npz_arrays(str(npz_path), require_ss=require_ss), ""
+
+    # --- Flat mesh_pairs layout ({edit_id}/after.npz or after_slat/) ---
+    edit_id = edit_entry.get("edit_id", "")
+    if mesh_pairs_dir is not None and edit_id:
+        pair_dir = mesh_pairs_dir / edit_id
+        # Try NPZ first
+        after_npz = pair_dir / "after.npz"
+        if after_npz.exists():
+            return load_npz_arrays(str(after_npz), require_ss=require_ss), ""
+        # Try legacy *_slat/ directory
+        after_slat = pair_dir / "after_slat"
+        if after_slat.is_dir():
+            return load_slat_dir_arrays(after_slat), ""
+
+    if npz_file is not None:
+        return None, f"after data not found: {npz_file}"
+    return None, f"no file for edit type {edit_type}"
+
+
+def _load_original_data(
+    obj_dir: Path,
+    edit_entry: dict,
+    *,
+    require_ss: bool,
+    mesh_pairs_dir: Path | None = None,
+) -> dict[str, np.ndarray] | None:
+    """Load original (before) data from various formats."""
+    # Object-centric layout
+    original_path = obj_dir / "original.npz"
+    if original_path.exists():
+        return load_npz_arrays(str(original_path), require_ss=require_ss)
+    # Flat mesh_pairs layout
+    edit_id = edit_entry.get("edit_id", "")
+    if mesh_pairs_dir is not None and edit_id:
+        pair_dir = mesh_pairs_dir / edit_id
+        before_npz = pair_dir / "before.npz"
+        if before_npz.exists():
+            return load_npz_arrays(str(before_npz), require_ss=require_ss)
+        before_slat = pair_dir / "before_slat"
+        if before_slat.is_dir():
+            return load_slat_dir_arrays(before_slat)
+    return None
+
+
 def clean_edit(
     obj_dir: Path,
     edit_entry: dict,
     original_data: dict[str, np.ndarray] | None,
     cfg: dict,
+    *,
+    require_ss: bool = True,
+    mesh_pairs_dir: Path | None = None,
 ) -> CleaningResult:
-    """Run Layer 1 + Layer 2 on a single edit."""
+    """Run Layer 1 + Layer 2 on a single edit.
+
+    Args:
+        require_ss: If False, skip SS-dependent checks (for legacy data).
+        mesh_pairs_dir: If set, also search flat ``mesh_pairs/{edit_id}/``
+            layout for data files (before_slat/, after_slat/, *.npz).
+    """
     edit_id = edit_entry["edit_id"]
     edit_type = edit_entry["type"]
     result = CleaningResult(edit_id=edit_id, edit_type=edit_type)
@@ -120,55 +199,38 @@ def clean_edit(
     # --- Identity: trivially valid ---
     if edit_type == "identity":
         if original_data is not None:
-            l1 = _run_l1_on_arrays(original_data, cleaning_cfg)
+            l1 = _run_l1_on_arrays(original_data, cleaning_cfg,
+                                   require_ss=require_ss)
             l1_score, l1_passed = weighted_score(l1)
             result.layer1 = _metrics_to_dict(l1)
             result.layer1_passed = l1_passed
         else:
             result.layer1_passed = True
         result.layer2_passed = True
-        l2 = check_pair("identity", original_data, None, type_cfg)
+        l2 = check_pair("identity", original_data, None, type_cfg,
+                        require_ss=require_ss)
         result.layer2 = _metrics_to_dict(l2)
         score = 1.0 if result.layer1_passed else 0.5
         result.score = score
         result.tier = classify_tier(score, result.layer1_passed, cleaning_cfg)
         return result
 
-    # --- Determine NPZ file path ---
-    npz_file = edit_entry.get("file")
-
-    # Addition: no own file, references deletion's file
-    if edit_type == "addition":
-        source_del_seq = edit_entry.get("source_del_seq", -1)
-        if source_del_seq < 0:
-            result.reason = "missing source_del_seq for addition"
-            return result
-        npz_file = f"del_{source_del_seq:03d}.npz"
-
-    if npz_file is None:
-        result.reason = f"no file for edit type {edit_type}"
-        return result
-
-    npz_path = obj_dir / npz_file
-    if not npz_path.exists():
-        result.reason = f"NPZ file not found: {npz_file}"
-        return result
-
-    # --- Layer 1: NPZ sanity on the after file ---
+    # --- Load after data ---
     try:
-        l1_after = check_npz_sanity(
-            str(npz_path),
-            min_voxels=cleaning_cfg.get("min_voxels", 100),
-            max_voxels=cleaning_cfg.get("max_voxels", 40000),
-            max_feat_abs=cleaning_cfg.get("max_feat_abs", 50.0),
-            min_feat_std=cleaning_cfg.get("min_feat_std", 0.01),
-            max_ss_abs=cleaning_cfg.get("max_ss_abs", 100.0),
-            min_ss_std=cleaning_cfg.get("min_ss_std", 0.001),
+        after_data, err = _load_after_data(
+            obj_dir, edit_entry, edit_type,
+            require_ss=require_ss, mesh_pairs_dir=mesh_pairs_dir,
         )
     except Exception as e:
-        result.reason = f"Layer1 error: {e}"
+        result.reason = f"Load after error: {e}"
         return result
 
+    if after_data is None:
+        result.reason = err or "after data not found"
+        return result
+
+    # --- Layer 1: sanity on the after data ---
+    l1_after = _run_l1_on_arrays(after_data, cleaning_cfg, require_ss=require_ss)
     l1_score, l1_passed = weighted_score(l1_after)
     result.layer1 = _metrics_to_dict(l1_after)
     result.layer1_passed = l1_passed
@@ -176,23 +238,18 @@ def clean_edit(
     if not l1_passed:
         failed = [r for r in l1_after if not r.passed]
         result.reason = f"Layer1 failed: {failed[0].name} — {failed[0].reason}"
-        result.score = l1_score * 0.5  # penalize
+        result.score = l1_score * 0.5
         result.tier = "rejected"
         return result
 
     # --- Layer 2: Pair comparison ---
-    try:
-        after_data = load_npz_arrays(str(npz_path))
-    except Exception as e:
-        result.reason = f"Layer2 load error: {e}"
-        return result
-
     if original_data is None:
-        result.reason = "original.npz not loaded"
+        result.reason = "original data not loaded"
         return result
 
     try:
-        l2 = check_pair(edit_type, original_data, after_data, type_cfg)
+        l2 = check_pair(edit_type, original_data, after_data, type_cfg,
+                        require_ss=require_ss)
     except Exception as e:
         result.reason = f"Layer2 error: {e}"
         return result
@@ -212,22 +269,32 @@ def clean_edit(
     return result
 
 
-def _run_l1_on_arrays(data: dict[str, np.ndarray], cfg: dict) -> list[MetricResult]:
+def _run_l1_on_arrays(
+    data: dict[str, np.ndarray],
+    cfg: dict,
+    *,
+    require_ss: bool = True,
+) -> list[MetricResult]:
     """Run Layer 1 checks directly on loaded arrays (no file I/O)."""
     from .npz_checks import (
         check_voxel_count, check_feat_range, check_ss_range,
         check_coords_valid, check_coords_unique,
     )
-    return [
+    results = [
         check_voxel_count(data["coords"], cfg.get("min_voxels", 100),
                           cfg.get("max_voxels", 40000)),
         check_feat_range(data["feats"], cfg.get("max_feat_abs", 50.0),
                          cfg.get("min_feat_std", 0.01)),
-        check_ss_range(data["ss"], cfg.get("max_ss_abs", 100.0),
-                       cfg.get("min_ss_std", 0.001)),
+    ]
+    if require_ss and data.get("ss") is not None:
+        results.append(
+            check_ss_range(data["ss"], cfg.get("max_ss_abs", 100.0),
+                           cfg.get("min_ss_std", 0.001)))
+    results.extend([
         check_coords_valid(data["coords"]),
         check_coords_unique(data["coords"]),
-    ]
+    ])
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -237,8 +304,16 @@ def _run_l1_on_arrays(data: dict[str, np.ndarray], cfg: dict) -> list[MetricResu
 def clean_object(
     obj_dir: Path,
     cfg: dict,
+    *,
+    require_ss: bool = True,
+    mesh_pairs_dir: Path | None = None,
 ) -> list[CleaningResult]:
-    """Clean all edits for one object."""
+    """Clean all edits for one object.
+
+    Args:
+        require_ss: If False, skip SS-dependent checks.
+        mesh_pairs_dir: If set, also search flat mesh_pairs layout.
+    """
     meta_path = obj_dir / "metadata.json"
     if not meta_path.exists():
         logger.warning("No metadata.json in %s, skipping", obj_dir)
@@ -247,18 +322,33 @@ def clean_object(
     with open(meta_path) as f:
         meta = json.load(f)
 
-    # Load original.npz once (shared by all edits)
-    original_path = obj_dir / "original.npz"
+    # Load original data once (shared by all edits)
     original_data = None
+    original_path = obj_dir / "original.npz"
     if original_path.exists():
         try:
-            original_data = load_npz_arrays(str(original_path))
+            original_data = load_npz_arrays(
+                str(original_path), require_ss=require_ss)
         except Exception as e:
             logger.warning("Failed to load original.npz in %s: %s", obj_dir, e)
 
+    # Fallback: try loading from first edit's before_slat/ in mesh_pairs
+    if original_data is None and mesh_pairs_dir is not None:
+        edits = meta.get("edits", [])
+        for edit in edits:
+            try:
+                original_data = _load_original_data(
+                    obj_dir, edit, require_ss=require_ss,
+                    mesh_pairs_dir=mesh_pairs_dir)
+                if original_data is not None:
+                    break
+            except Exception:
+                continue
+
     results = []
     for edit in meta.get("edits", []):
-        r = clean_edit(obj_dir, edit, original_data, cfg)
+        r = clean_edit(obj_dir, edit, original_data, cfg,
+                       require_ss=require_ss, mesh_pairs_dir=mesh_pairs_dir)
         results.append(r)
 
     # Write quality.json
@@ -278,9 +368,11 @@ def clean_object(
 
 def _clean_object_worker(args: tuple) -> tuple[str, list[dict]]:
     """Top-level pickleable worker for ProcessPoolExecutor."""
-    obj_dir_str, cfg = args
+    obj_dir_str, cfg, require_ss, mesh_pairs_str = args
     obj_dir = Path(obj_dir_str)
-    results = clean_object(obj_dir, cfg)
+    mesh_pairs_dir = Path(mesh_pairs_str) if mesh_pairs_str else None
+    results = clean_object(obj_dir, cfg, require_ss=require_ss,
+                           mesh_pairs_dir=mesh_pairs_dir)
     obj_id = obj_dir.name
     return obj_id, [r.to_dict() for r in results]
 
@@ -293,6 +385,9 @@ def clean_shard(
     shard_dir: Path,
     cfg: dict,
     workers: int = 1,
+    *,
+    require_ss: bool = True,
+    mesh_pairs_dir: Path | None = None,
 ) -> dict:
     """Clean all objects in a shard directory.
 
@@ -307,17 +402,19 @@ def clean_shard(
         return {"total": 0}
 
     shard = shard_dir.name.replace("shard_", "")
-    logger.info("Cleaning shard %s: %d objects, %d workers", shard,
-                len(obj_dirs), workers)
+    logger.info("Cleaning shard %s: %d objects, %d workers, require_ss=%s",
+                shard, len(obj_dirs), workers, require_ss)
 
     all_results: list[dict] = []
+    mp_str = str(mesh_pairs_dir) if mesh_pairs_dir else ""
 
     if workers <= 1:
         for obj_dir in tqdm(obj_dirs, desc=f"shard_{shard}"):
-            results = clean_object(obj_dir, cfg)
+            results = clean_object(obj_dir, cfg, require_ss=require_ss,
+                                   mesh_pairs_dir=mesh_pairs_dir)
             all_results.extend(r.to_dict() for r in results)
     else:
-        tasks = [(str(d), cfg) for d in obj_dirs]
+        tasks = [(str(d), cfg, require_ss, mp_str) for d in obj_dirs]
         with ProcessPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(_clean_object_worker, t): t[0] for t in tasks}
             for fut in tqdm(as_completed(futures), total=len(futures),
@@ -377,6 +474,9 @@ def run_cleaning(
     workers: int = 1,
     min_tier: str = "medium",
     dry_run: bool = False,
+    *,
+    require_ss: bool = True,
+    mesh_pairs_dir: str | Path | None = None,
 ) -> Path:
     """Run cleaning on object-centric training data.
 
@@ -388,11 +488,14 @@ def run_cleaning(
         workers: Parallel workers per shard.
         min_tier: Minimum tier for manifest_clean.jsonl.
         dry_run: If True, only scan and report, don't write quality.json.
+        require_ss: If False, skip SS-dependent checks (for legacy data).
+        mesh_pairs_dir: If set, also search flat mesh_pairs layout for data.
 
     Returns:
         Path to the generated cleaning_summary.json.
     """
     root = Path(input_dir)
+    mp_dir = Path(mesh_pairs_dir) if mesh_pairs_dir else None
     if not root.exists():
         raise FileNotFoundError(f"Input directory not found: {root}")
 
@@ -416,7 +519,8 @@ def run_cleaning(
     all_results: list[dict] = []
 
     for shard_dir in shard_dirs:
-        summary = clean_shard(shard_dir, cfg, workers=workers)
+        summary = clean_shard(shard_dir, cfg, workers=workers,
+                              require_ss=require_ss, mesh_pairs_dir=mp_dir)
         all_summaries.append(summary)
 
         # Collect results for manifest
