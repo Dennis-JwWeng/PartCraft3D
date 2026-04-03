@@ -424,8 +424,8 @@ def check_material(
             "" if ss_match else f"ss max diff {ss_diff:.6f} >= {tol}"
         ))
 
-    # Feature change should exist
-    if count_match:
+    # Feature change should exist (requires same voxel count)
+    if n_before == n_after:
         fr = feat_change_ratio(original["feats"], after["feats"])
         min_fc = c.get("min_feat_change", 0.01)
         max_fc = c.get("max_feat_change", 2.0)
