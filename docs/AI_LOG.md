@@ -4,35 +4,37 @@
 
 ---
 
-## 2026-04-04 — Deletion SLAT 改为 PLY 渲染重编码 + 全类型 `dino_voxel_mean`
+## 2026-04-04 — Phase 5：PLY 渲染重编码 + `dino_voxel_mean` + Deletion SLAT 重建
 
-**问题 1**：Deletion 的 SLAT 之前通过从原始 SLAT 按 mask 过滤 `feats[keep]` 产出。由于 SLAT 特征在完整物体上下文中编码（DINOv2 多视角聚合 + SLAT encoder），直接子集化后剩余体素的特征不再自洽，TRELLIS Gaussian decode 时出现严重毛边/模糊。PLY 直接渲染验证确认 mesh 本身是干净的，问题出在 SLAT latent 层。
+**问题**：
 
-**问题 2**：训练侧需要 `dino_voxel_mean`（SLAT encoder 的输入，多视角 DINOv2 patch 特征投影到体素后取均值，`[N, 1024]` float16），但之前编码流程未持久化该中间产物。
+1. Deletion 的 SLAT 之前通过 mask 过滤 `feats[keep]` 产出（旧 Phase 2），特征不自洽，Gaussian decode 有严重毛边
+2. 训练侧需要 `dino_voxel_mean`（DINOv2 多视角聚合特征 `[N,1024]` fp16），之前未持久化
 
-**决策**：
+**决策**：在 `migrate_slat_to_npz.py` 中新增 Phase 5，废弃旧 Phase 2：
 
-- Deletion after：走与原始物体完全相同的编码路径 — `after.ply → Blender Cycles 渲染 40 views → Open3D 体素化 64³ → DINOv2 → SLAT encoder → SS encoder`，产出完整 `after.npz`（slat_feats + slat_coords + ss + dino_voxel_mean）
-- 其他类型 after：保留 TRELLIS 生成的 SLAT+SS，通过 `after.ply → Blender 渲染 → DINOv2` 提取 `dino_voxel_mean` 注入已有 NPZ
-- Before 侧：从 `slat_dir` 加载预存的 `{obj_id}_dino_voxel_mean.pt`（需在有 `img_Enc` 的机器上重跑 `encode_into_SLAT`），或 fallback 渲染 `before.ply`
+- **Deletion after**：`after.ply` → Blender Cycles 40 views → voxelize → DINOv2 → SLAT encoder → SS encoder → **完整重写 `after.npz`**
+- **其他类型 after**：渲染 `after.ply` → DINOv2 → **仅注入 `dino_voxel_mean`** 到已有 NPZ（保留 TRELLIS SLAT+SS）
+- **Before 侧**：从 `slat_dir/{obj_id}_dino_voxel_mean.pt` 加载，或 fallback 渲染 `before.ply`
+- 推荐执行 `--phase 1,3,4,5`（跳过废弃的 Phase 2）
 
-**代码变更**：
+**`migrate_slat_to_npz.py` 完整 Phase 列表**：
 
-| 文件 | 改动 |
-|------|------|
-| `third_party/encode_asset/encode_into_SLAT.py` | 抽出 `extract_dino_voxel_mean(render_dir, num_views)` 可复用函数；`encode_into_SLAT()` 新增 `save_dino_voxel_mean=True` 参数 |
-| `scripts/tools/migrate_slat_to_npz.py` | `_save_npz()` 增加 `dino_voxel_mean` 参数；新增 `_render_and_extract_dino()`、`_inject_dino_into_npz()`；新增 **Phase 5**（PLY 渲染 + DINOv2 提取，deletion 含 SLAT+SS 完整重编码） |
-| `partcraft/phase2_assembly/trellis_refine.py` | `_save_npz()` 增加 `dino_voxel_mean` 参数 |
-| `partcraft/io/edit_pair_dataset.py` | `_load_npz()` 加载 `dino_voxel_mean`；`__getitem__` 返回 `before_dino`/`after_dino`；`collate_fn` 对 dino 做 `torch.cat`（与 SLAT 共享稀疏布局）|
+| Phase | 功能 | 状态 |
+|-------|------|------|
+| 1 | 旧 `*_slat/` → NPZ（编码 SS） | 有效 |
+| 2 | Deletion mask 过滤 | **废弃**（被 Phase 5 替代） |
+| 3 | Addition backfill（硬链接互换） | 有效 |
+| 4 | Identity backfill（硬链接） | 有效 |
+| 5 | PLY 渲染 → DINOv2 + SLAT 重编码 | **新增** |
 
-**NPZ 格式扩展**（向后兼容）：
+**兼容性修复**：
+- `blender_script/render.py`：Blender 4.x PLY import 用 `bpy.ops.wm.ply_import`
+- `dinov2_hub.py`：新版 hub Weights enum 不接受文件路径，fallback 到 `load_state_dict`
 
-```python
-{"slat_feats": [N, 8], "slat_coords": [N, 4], "ss": [C, R, R, R],
- "dino_voxel_mean": [N, 1024]}  # float16, 可选
-```
+**NPZ 格式**（向后兼容）：`slat_feats [N,8]` + `slat_coords [N,4]` + `ss [C,R,R,R]` + `dino_voxel_mean [N,1024]`（可选 fp16）
 
-**存储开销**：dino_voxel_mean 每个 NPZ 增加约 26 MB（13K voxels × 1024 × 2B），总量级 TB。
+**多 GPU 调度**：`scripts/tools/run_phase5_multi_gpu.sh`，按 edit_id 分片到各 GPU
 
 ---
 
@@ -53,33 +55,15 @@
 
 ---
 
-## 2026-04-03 — 统一后处理管线 `run_postprocess.py`
+## 2026-04-03 — 后处理预筛 `run_postprocess.py` + 清洗扩展
 
 **问题**：shard01 的旧格式（`feats.pt+coords.pt`，无 SS）和 PLY-only deletion 无法直接用现有 cleaning 管线处理；所有编辑类型缺少 VLM 语义评判。
 
-**新增文件**：
+**新增文件**：`scripts/tools/run_postprocess.py`（预筛编排）、`partcraft/cleaning/ply_checks.py`（PLY 几何检查）
 
-| 路径 | 作用 |
-|------|------|
-| `scripts/tools/run_postprocess.py` | 四阶段统一编排入口（Phase A-D） |
-| `partcraft/cleaning/ply_checks.py` | PLY mesh 几何检查（水密性、连通性、退化、体积比） |
+**修改文件**：`npz_checks.py`（`require_ss=False`）、`pair_checks.py`（`require_ss` 透传）、`cleaner.py`（旧布局支持）、`vlm_filter.py`（PLY 渲染）、`migrate_slat_to_npz.py`（`--include-list`）
 
-**修改文件**：
-
-| 路径 | 改动 |
-|------|------|
-| `partcraft/cleaning/npz_checks.py` | `require_ss=False` 模式；`load_slat_dir_arrays()` 支持旧 `*_slat/` 目录 |
-| `partcraft/cleaning/pair_checks.py` | 所有 checker 新增 `require_ss` 参数，无 SS 时跳过 SS 检查 |
-| `partcraft/cleaning/cleaner.py` | 支持从旧 `mesh_pairs/` 平铺布局加载；`require_ss` 和 `mesh_pairs_dir` 透传 |
-| `partcraft/phase3_filter/vlm_filter.py` | `render_ply_views()`、`evaluate_edit_from_ply()`、`evaluate_edit_from_slat_dir()` |
-| `scripts/tools/migrate_slat_to_npz.py` | `--include-list` 过滤，仅处理通过预筛的子集 |
-
-**设计要点**：
-
-- Phase A（几何预筛）无需 GPU，按数据格式自动分流：SLAT 编辑用 feats+coords 检查，PLY 编辑用 trimesh 检查
-- Phase B（VLM 语义）所有编辑类型都走 VLM 评判 prompt 对齐度；PLY 用 Blender 渲染，SLAT 用 TRELLIS Gaussian
-- Phase C 仅对 A+B 通过子集 encode SS，避免浪费 GPU
-- addition/identity 跟随配对 deletion 的结果，不独立评判
+**注意**：`run_postprocess.py` 的 Phase A/B 是 `migrate_slat_to_npz.py` Phase 1-5 的**上游可选预筛**，不是替代关系。预筛结果通过 `--include-list` 传递给 migrate，减少无效编码。详见 `ARCH.md`。
 
 ---
 
@@ -137,7 +121,7 @@
 **设计要点**：
 
 - 纯 numpy + scipy，无 GPU 依赖（Layer 1/2）
-- material/global 类型强制 `slat_coords` 和 `ss` 完全一致（S2-only 不改几何的约束）
+- material/global 使用宽松 `voxel_count_close`（1% 容差），不再要求严格一致（见 2026-04-03 体素匹配策略定稿）
 - scale 比 modification 有更严格的 SS 余弦相似度和 bbox 轴向比阈值
 - 所有阈值可通过 YAML `cleaning:` 段或 CLI 默认配置覆盖
 
@@ -159,29 +143,13 @@
 
 ---
 
-## 2026-03-31 — `migrate_slat_to_npz.py` 对象级去重
+## 2026-03-31 — `migrate_slat_to_npz.py` 对象级去重 + NPZ 迁移
 
-**问题**：同一 `obj_id` 的多条编辑重复计算 SS（`z_s_before`）并重复写入相同内容的 `before.npz`。
+**问题**：同一 `obj_id` 的多条编辑重复计算 SS / 重复写入 `before.npz`；早期 shard 存在 PLY、`*_slat/`、NPZ 混用。
 
-**实现要点**（`scripts/tools/migrate_slat_to_npz.py`）：
+**迁移工具**：`scripts/tools/migrate_slat_to_npz.py`（多 phase，幂等）。Phase 1-5 的完整说明见 `ARCH.md`。
 
-- `_obj_id_from_edit_id()`、`_link_or_copy()`（`os.link`，跨设备则 `copy2`）
-- Phase 1：按物体分组，首条编辑写 `before.npz`，同物体后续硬链
-- Phase 2 deletion：每物体一次 `encode_ss` + canonical `before.npz`，其余硬链
-- Phase 3 addition：同物体内对重复的 `add.after.npz` 等硬链
-- Phase 4 identity：`before.npz` / `after.npz` 均硬链到该物体已有非 identity 编辑的 canonical `before.npz`
-
-统计类数字为当时全量迁移估算，**以实际跑出来的日志为准**。
-
----
-
-## 2026-03-31 — 历史 shard 产物格式与 NPZ 迁移
-
-**背景**：早期 shard 存在 PLY、`*_slat/`、`before.npz`/`after.npz` 混用；需统一到 NPZ（keys：`slat_feats`, `slat_coords`, `ss`）。
-
-**迁移工具**：`scripts/tools/migrate_slat_to_npz.py`（多 phase，幂等：已有 `*.npz` 默认跳过）。
-
-**配置**：仓库内仅有 `configs/partverse_H200_shard00.yaml` 等少数模板；**跑其它 shard 时请复制 YAML 并将 `data.shards`（及 `mesh_pairs` / `edit_specs` 路径）改为目标 shard**。Phase 2 依赖 `dataset.load_object(shard, obj_id)`，config 中的 shards 必须包含目标 shard；Phase 1 不依赖 dataset。
+**注意**：旧 Phase 2（deletion mask 过滤）已在 2026-04-04 被 Phase 5（PLY 渲染重编码）替代，推荐 `--phase 1,3,4,5`。
 
 **示例（shard 00）**：
 
