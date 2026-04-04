@@ -4,19 +4,11 @@
 
 ---
 
-## 2026-04-04 — Phase 5：PLY 渲染重编码 + `dino_voxel_mean` + Deletion SLAT 重建
+## 2026-04-04 — Phase 5：Deletion PLY 渲染 → SLAT+SS 重编码
 
-**问题**：
+**问题**：Deletion 的 SLAT 之前通过 mask 过滤 `feats[keep]` 产出（旧 Phase 2），特征在缺失零件的上下文中不自洽，Gaussian decode 时有严重毛边/模糊。
 
-1. Deletion 的 SLAT 之前通过 mask 过滤 `feats[keep]` 产出（旧 Phase 2），特征不自洽，Gaussian decode 有严重毛边
-2. 训练侧需要 `dino_voxel_mean`（DINOv2 多视角聚合特征 `[N,1024]` fp16），之前未持久化
-
-**决策**：在 `migrate_slat_to_npz.py` 中新增 Phase 5，废弃旧 Phase 2：
-
-- **Deletion after**：`after.ply` → Blender Cycles 40 views → voxelize → DINOv2 → SLAT encoder → SS encoder → **完整重写 `after.npz`**
-- **其他类型 after**：渲染 `after.ply` → DINOv2 → **仅注入 `dino_voxel_mean`** 到已有 NPZ（保留 TRELLIS SLAT+SS）
-- **Before 侧**：从 `slat_dir/{obj_id}_dino_voxel_mean.pt` 加载，或 fallback 渲染 `before.ply`
-- 推荐执行 `--phase 1,3,4,5`（跳过废弃的 Phase 2）
+**决策**：在 `migrate_slat_to_npz.py` 中新增 Phase 5，废弃旧 Phase 2。仅对 deletion 的 `after.ply` 做完整重编码（`after.ply` → Blender Cycles 40 views → voxelize → DINOv2 → SLAT encoder → SS encoder → 重写 `after.npz`）。其他类型已有 TRELLIS 产出的有效 SLAT+SS，不处理。
 
 **`migrate_slat_to_npz.py` 完整 Phase 列表**：
 
@@ -26,13 +18,13 @@
 | 2 | Deletion mask 过滤 | **废弃**（被 Phase 5 替代） |
 | 3 | Addition backfill（硬链接互换） | 有效 |
 | 4 | Identity backfill（硬链接） | 有效 |
-| 5 | PLY 渲染 → DINOv2 + SLAT 重编码 | **新增** |
+| 5 | Deletion PLY → SLAT+SS 重编码 | **新增** |
+
+推荐执行：`--phase 1,3,4,5`
 
 **兼容性修复**：
 - `blender_script/render.py`：Blender 4.x PLY import 用 `bpy.ops.wm.ply_import`
 - `dinov2_hub.py`：新版 hub Weights enum 不接受文件路径，fallback 到 `load_state_dict`
-
-**NPZ 格式**（向后兼容）：`slat_feats [N,8]` + `slat_coords [N,4]` + `ss [C,R,R,R]` + `dino_voxel_mean [N,1024]`（可选 fp16）
 
 **多 GPU 调度**：`scripts/tools/run_phase5_multi_gpu.sh`，按 edit_id 分片到各 GPU
 

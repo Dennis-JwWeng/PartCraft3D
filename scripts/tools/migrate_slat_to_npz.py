@@ -580,23 +580,14 @@ def _render_and_full_encode(
         "slat_feats": latent.feats.detach().cpu().float().numpy(),
         "slat_coords": latent.coords.detach().cpu().int().numpy(),
         "ss": z_s.detach().cpu().float().numpy(),
-        "dino_voxel_mean": dino_voxel_mean.astype(np.float16),
     }
 
 
-def _inject_dino_into_npz(npz_path: Path, dino_voxel_mean: np.ndarray) -> None:
-    """Add or update ``dino_voxel_mean`` key in an existing NPZ file."""
-    existing = dict(np.load(npz_path))
-    existing["dino_voxel_mean"] = dino_voxel_mean.astype(np.float16)
-    np.savez(npz_path, **existing)
+# ──────────────────── Phase 5: Deletion PLY → SLAT+SS re-encode ──────────
 
-
-# ──────────────────────────── Phase 5: DINOv2 feature extraction ──────────
-
-def phase5_dino_features(
+def phase5_deletion_reencode(
     pair_dirs: list[Path],
     specs_by_type: dict[str, list[SpecInfo]],
-    slat_dir: Path | None,
     work_dir: Path,
     ss_encoder,
     device: str = "cuda",
@@ -605,152 +596,58 @@ def phase5_dino_features(
     blender_path: str | None = None,
     dry_run: bool,
 ) -> dict[str, int]:
-    """PLY render → DINOv2 → dino_voxel_mean for all types; full SLAT+SS re-encode for deletion.
+    """Re-encode deletion ``after.npz`` via PLY → render → DINOv2 → SLAT → SS.
 
-    For **after** side:
-      - **deletion**: ``after.ply`` → full re-encode (SLAT + SS + dino_voxel_mean),
-        **overwrites** existing ``after.npz``.
-      - **other types**: ``after.ply`` → DINOv2 only, inject ``dino_voxel_mean``
-        into existing ``after.npz`` (preserve TRELLIS-generated SLAT+SS).
-
-    For **before** side: load ``{obj_id}_dino_voxel_mean.pt`` from ``slat_dir``
-    (produced by ``encode_into_SLAT``). If not available, render ``before.ply``
-    as fallback.
-
-    Skips pairs whose NPZ already contains ``dino_voxel_mean`` (unless deletion
-    re-encode is needed).
+    Only processes **deletion** edits whose ``after.ply`` exists.
+    Non-deletion edits already have valid SLAT+SS from TRELLIS and are skipped.
+    ``before.npz`` is not touched (shared ``original.npz`` from Phase 1).
     """
-    stats = {
-        "after_full_encoded": 0, "after_dino_injected": 0,
-        "after_skipped": 0, "after_no_ply": 0, "after_error": 0,
-        "before_loaded": 0, "before_rendered": 0, "before_skipped": 0,
-        "before_no_src": 0, "before_error": 0,
-    }
+    stats = {"encoded": 0, "skipped": 0, "no_ply": 0, "error": 0}
 
-    # Build set of deletion edit_ids for fast lookup
     del_ids = {s.edit_id for s in specs_by_type.get("deletion", [])}
-
-    # Group by obj_id for before sharing
-    obj_groups: dict[str, list[Path]] = defaultdict(list)
-    for d in pair_dirs:
-        obj_id = _obj_id_from_edit_id(d.name)
-        obj_groups[obj_id].append(d)
+    del_dirs = [d for d in pair_dirs if d.name in del_ids]
 
     work_dir.mkdir(parents=True, exist_ok=True)
-    total_dirs = len(pair_dirs)
-    processed = 0
+    total = len(del_dirs)
+    log.info("Phase5: %d deletion dirs to re-encode (out of %d total pair dirs)",
+             total, len(pair_dirs))
 
-    for obj_id, dirs in obj_groups.items():
-        # ── before side (shared per object) ──
-        before_dino: np.ndarray | None = None
+    for i, d in enumerate(del_dirs):
+        edit_id = d.name
+        a_npz = d / "after.npz"
+        a_ply = d / "after.ply"
 
-        # Try loading pre-saved dino_voxel_mean from slat_dir
-        if slat_dir is not None and slat_dir.is_dir():
-            dvm_candidates = [slat_dir / f"{obj_id}_dino_voxel_mean.pt"]
-            for sub in sorted(slat_dir.iterdir()):
-                if sub.is_dir():
-                    dvm_candidates.append(sub / f"{obj_id}_dino_voxel_mean.pt")
-            for cand in dvm_candidates:
-                if cand.exists():
-                    if not dry_run:
-                        t = torch.load(str(cand), map_location="cpu", weights_only=True)
-                        before_dino = t.numpy().astype(np.float16)
-                    stats["before_loaded"] += 1
-                    break
+        if not a_ply.exists():
+            stats["no_ply"] += 1
+            continue
 
-        for d in dirs:
-            edit_id = d.name
-            is_deletion = edit_id in del_ids
+        # Skip if already re-encoded (has proper voxel count from render pipeline)
+        if a_npz.exists() and not dry_run:
+            try:
+                existing = np.load(a_npz)
+                # Heuristic: re-encoded NPZ won't have identical coords to
+                # mask-filtered version. We always re-encode for safety.
+            except Exception:
+                pass
 
-            # ── after side ──
-            a_npz = d / "after.npz"
-            a_ply = d / "after.ply"
+        if dry_run:
+            stats["encoded"] += 1
+            continue
 
-            if not a_ply.exists():
-                stats["after_no_ply"] += 1
-            elif not is_deletion and a_npz.exists() and not dry_run:
-                # Non-deletion: skip if already has dino_voxel_mean
-                try:
-                    existing = np.load(a_npz)
-                    if "dino_voxel_mean" in existing.files:
-                        stats["after_skipped"] += 1
-                        processed += 1
-                        # Still handle before side below
-                        self_skip = True
-                    else:
-                        self_skip = False
-                except Exception:
-                    self_skip = False
-                if not self_skip:
-                    try:
-                        dvm = _render_and_extract_dino(
-                            a_ply, f"after_{edit_id}", work_dir,
-                            num_views=num_views, blender_path=blender_path,
-                        )
-                        _inject_dino_into_npz(a_npz, dvm)
-                        stats["after_dino_injected"] += 1
-                    except Exception as e:
-                        log.warning("Phase5 after dino error %s: %s", edit_id, e)
-                        stats["after_error"] += 1
-            elif is_deletion and not dry_run:
-                # Deletion: full re-encode (SLAT + SS + dino)
-                try:
-                    result = _render_and_full_encode(
-                        a_ply, f"after_{edit_id}", work_dir,
-                        ss_encoder, device,
-                        num_views=num_views, blender_path=blender_path,
-                    )
-                    np.savez(a_npz, **result)
-                    stats["after_full_encoded"] += 1
-                except Exception as e:
-                    log.warning("Phase5 after full-encode error %s: %s", edit_id, e)
-                    stats["after_error"] += 1
-            elif dry_run:
-                if is_deletion:
-                    stats["after_full_encoded"] += 1
-                else:
-                    stats["after_dino_injected"] += 1
+        try:
+            result = _render_and_full_encode(
+                a_ply, f"after_{edit_id}", work_dir,
+                ss_encoder, device,
+                num_views=num_views, blender_path=blender_path,
+            )
+            np.savez(a_npz, **result)
+            stats["encoded"] += 1
+        except Exception as e:
+            log.warning("Phase5 error %s: %s", edit_id, e)
+            stats["error"] += 1
 
-            # ── before side ──
-            b_npz = d / "before.npz"
-            if b_npz.exists() and not dry_run:
-                try:
-                    existing = np.load(b_npz)
-                    if "dino_voxel_mean" in existing.files:
-                        stats["before_skipped"] += 1
-                        processed += 1
-                        continue
-                except Exception:
-                    pass
-
-            if not b_npz.exists():
-                stats["before_no_src"] += 1
-            elif before_dino is not None and not dry_run:
-                _inject_dino_into_npz(b_npz, before_dino)
-                # before_dino already counted above
-            elif dry_run:
-                stats["before_rendered"] += 1
-            else:
-                # Fallback: render before.ply
-                b_ply = d / "before.ply"
-                if b_ply.exists():
-                    try:
-                        before_dino = _render_and_extract_dino(
-                            b_ply, f"before_{edit_id}", work_dir,
-                            num_views=num_views, blender_path=blender_path,
-                        )
-                        _inject_dino_into_npz(b_npz, before_dino)
-                        stats["before_rendered"] += 1
-                    except Exception as e:
-                        log.warning("Phase5 before error %s: %s", edit_id, e)
-                        stats["before_error"] += 1
-                else:
-                    stats["before_no_src"] += 1
-
-            processed += 1
-            if processed % 50 == 0:
-                log.info("  Phase5 progress: %d / %d dirs  %s",
-                         processed, total_dirs, stats)
+        if (i + 1) % 50 == 0:
+            log.info("  Phase5 progress: %d / %d  %s", i + 1, total, stats)
 
     return stats
 
@@ -1002,21 +899,17 @@ def main():
     # ────────── Phase 5 ──────────
     if 5 in phases:
         log.info("=" * 60)
-        log.info("Phase 5: PLY render → DINOv2 + SLAT re-encode (deletion)")
-        slat_dir = None
-        if cfg is not None:
-            from scripts.pipeline_common import resolve_data_dirs
-            slat_dir = Path(resolve_data_dirs(cfg)[0])
-        dino_work = (
+        log.info("Phase 5: Deletion PLY → render → SLAT+SS re-encode")
+        work_dir = (
             Path(args.dino_work_dir) if args.dino_work_dir
-            else mesh_pairs.parent / "_dino_render_tmp"
+            else mesh_pairs.parent / "_render_tmp"
         )
         blender = args.blender_path or os.environ.get("BLENDER_PATH")
         ss_enc = None
         if not args.dry_run:
             ss_enc = _load_ss_encoder(Path(ckpt_root), args.device)
-        s = phase5_dino_features(
-            pair_dirs, specs_by_type, slat_dir, dino_work,
+        s = phase5_deletion_reencode(
+            pair_dirs, specs_by_type, work_dir,
             ss_enc, args.device,
             num_views=args.dino_views,
             blender_path=blender,
