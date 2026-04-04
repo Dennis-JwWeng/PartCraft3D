@@ -9,6 +9,12 @@ import glob
 
 """=============== BLENDER ==============="""
 
+def _ply_import_op():
+    """Blender 4.x moved PLY import to bpy.ops.wm.ply_import."""
+    if hasattr(bpy.ops.wm, 'ply_import'):
+        return bpy.ops.wm.ply_import
+    return bpy.ops.import_mesh.ply
+
 IMPORT_FUNCTIONS: Dict[str, Callable] = {
     "obj": bpy.ops.import_scene.obj,
     "glb": bpy.ops.import_scene.gltf,
@@ -18,7 +24,7 @@ IMPORT_FUNCTIONS: Dict[str, Callable] = {
     "stl": bpy.ops.import_mesh.stl,
     "usda": bpy.ops.import_scene.usda,
     "dae": bpy.ops.wm.collada_import,
-    "ply": bpy.ops.import_mesh.ply,
+    "ply": _ply_import_op(),
     "abc": bpy.ops.wm.alembic_import,
     "blend": bpy.ops.wm.append,
 }

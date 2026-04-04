@@ -502,10 +502,14 @@ def _render_ply_views(
     render_out = work_dir / name
     render_out.mkdir(parents=True, exist_ok=True)
 
-    from encode_asset.render_img_for_enc import render, voxelize
-
+    # Set BLENDER_PATH env BEFORE importing render module (it reads at import time)
     if blender_path:
         os.environ["BLENDER_PATH"] = blender_path
+    import encode_asset.render_img_for_enc as _rim
+    if blender_path:
+        _rim.BLENDER_PATH = blender_path
+    from encode_asset.render_img_for_enc import render, voxelize
+
     ret = render(str(ply_path), name, str(work_dir) + os.sep, num_views=num_views)
     if ret != 0:
         raise RuntimeError(f"Blender render failed (exit {ret}) for {ply_path}")

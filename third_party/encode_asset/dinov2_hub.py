@@ -203,7 +203,15 @@ def load_dinov2_vitl14_reg(pretrained: bool = True):
     if not pretrained:
         return dinov2_vitl14_reg(pretrained=False)
     wpath = ensure_dinov2_vitl14_reg_weights_file()
-    return dinov2_vitl14_reg(pretrained=True, weights=str(wpath))
+    # Newer dinov2 hub expects Weights enum, not file path.
+    # Build model without pretrained, then load state_dict from local file.
+    try:
+        model = dinov2_vitl14_reg(pretrained=True, weights=str(wpath))
+    except (AssertionError, KeyError):
+        model = dinov2_vitl14_reg(pretrained=False)
+        state_dict = torch.load(str(wpath), map_location="cpu")
+        model.load_state_dict(state_dict, strict=True)
+    return model
 
 
 def get_dinov2_vitl14_reg():
