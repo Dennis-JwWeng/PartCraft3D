@@ -1307,14 +1307,21 @@ class TrellisRefiner:
     # ---- Step 6: Export ----
 
     @staticmethod
-    def _save_npz(path: Path, slat, z_s: torch.Tensor | None) -> None:
-        """Write a single ``{tag}.npz`` containing SLAT + SS."""
+    def _save_npz(
+        path: Path,
+        slat,
+        z_s: torch.Tensor | None,
+        dino_voxel_mean: np.ndarray | None = None,
+    ) -> None:
+        """Write a single ``{tag}.npz`` containing SLAT + SS + optional DINOv2."""
         data = {
             "slat_feats": slat.feats.detach().cpu().float().numpy(),
             "slat_coords": slat.coords.detach().cpu().int().numpy(),
         }
         if z_s is not None:
             data["ss"] = z_s.detach().cpu().float().numpy()
+        if dino_voxel_mean is not None:
+            data["dino_voxel_mean"] = np.asarray(dino_voxel_mean).astype(np.float16)
         np.savez(path, **data)
 
     def export_pair(

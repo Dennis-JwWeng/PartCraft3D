@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Migrate legacy pipeline outputs to the unified NPZ format (SLAT + SS).
+"""Migrate legacy pipeline outputs to the unified NPZ format (SLAT + SS + DINOv2).
 
 Converts all edit pair artifacts produced by the old pipeline into the new
 ``before.npz`` / ``after.npz`` format with keys ``slat_feats``, ``slat_coords``,
-``ss`` (sparse-structure VAE latent).
+``ss`` (sparse-structure VAE latent), and ``dino_voxel_mean`` (multi-view averaged
+DINOv2 features projected onto voxels, ``[N, 1024]`` float16).
 
-Four processing phases (run in order):
+Five processing phases (run in order):
 
   Phase 1 — **Simple conversion** (modification / scale / material / global)
       Pairs that already have ``*_slat/`` directories: load feats.pt + coords.pt,
@@ -23,6 +24,13 @@ Four processing phases (run in order):
   Phase 4 — **Identity backfill**
       Identity copies ``before.npz`` as both before *and* after for the same
       object.  Finds the first migrated pair of that object.
+
+  Phase 5 — **DINOv2 voxel feature extraction** (all edit types)
+      For each edit pair that has ``after.ply``: render via Blender Cycles GPU
+      (40 views), voxelize, extract DINOv2 features, and write
+      ``dino_voxel_mean`` into the existing ``after.npz``.
+      For ``before``: load pre-saved ``{obj_id}_dino_voxel_mean.pt`` from
+      ``slat_dir`` (produced by ``encode_into_SLAT`` with ``save_dino_voxel_mean=True``).
 
 Existing ``*.npz`` files are never overwritten (idempotent).
 
@@ -123,12 +131,16 @@ def encode_ss(encoder, coords: torch.Tensor, device: str = "cuda") -> torch.Tens
     return z_s.squeeze(0)
 
 
-def _save_npz(path: Path, feats, coords, z_s):
+def _save_npz(path: Path, feats, coords, z_s, dino_voxel_mean=None):
     data = {
         "slat_feats": feats.detach().cpu().float().numpy(),
         "slat_coords": coords.detach().cpu().int().numpy(),
         "ss": z_s.detach().cpu().float().numpy(),
     }
+    if dino_voxel_mean is not None:
+        if isinstance(dino_voxel_mean, torch.Tensor):
+            dino_voxel_mean = dino_voxel_mean.detach().cpu().numpy()
+        data["dino_voxel_mean"] = dino_voxel_mean.astype(np.float16)
     np.savez(path, **data)
 
 
@@ -477,6 +489,191 @@ def phase4_identity(
     return stats
 
 
+# ──────────────────────────── PLY render+encode ───────────────────────────────
+
+def _render_and_extract_dino(
+    ply_path: Path,
+    name: str,
+    work_dir: Path,
+    num_views: int = 40,
+    blender_path: str | None = None,
+) -> np.ndarray:
+    """Render a PLY with Blender Cycles, voxelize, extract DINOv2 features.
+
+    Returns ``dino_voxel_mean [N, 1024]`` float16.
+    """
+    import tempfile
+
+    render_out = work_dir / name
+    render_out.mkdir(parents=True, exist_ok=True)
+
+    # ── render ──
+    from encode_asset.render_img_for_enc import render, voxelize
+
+    if blender_path:
+        os.environ["BLENDER_PATH"] = blender_path
+    ret = render(str(ply_path), name, str(work_dir) + os.sep, num_views=num_views)
+    if ret != 0:
+        raise RuntimeError(f"Blender render failed (exit {ret}) for {ply_path}")
+
+    mesh_ply = render_out / "mesh.ply"
+    if not mesh_ply.exists():
+        raise FileNotFoundError(f"Blender produced no mesh.ply for {name}")
+
+    # ── voxelize ──
+    voxelize(str(mesh_ply), name, str(render_out))
+
+    # ── DINOv2 feature extraction ──
+    from encode_asset.encode_into_SLAT import extract_dino_voxel_mean
+
+    dino_voxel_mean, _indices = extract_dino_voxel_mean(str(render_out), num_views)
+    return dino_voxel_mean
+
+
+def _inject_dino_into_npz(npz_path: Path, dino_voxel_mean: np.ndarray) -> None:
+    """Add or update ``dino_voxel_mean`` key in an existing NPZ file."""
+    existing = dict(np.load(npz_path))
+    existing["dino_voxel_mean"] = dino_voxel_mean.astype(np.float16)
+    np.savez(npz_path, **existing)
+
+
+# ──────────────────────────── Phase 5: DINOv2 feature extraction ──────────
+
+def phase5_dino_features(
+    pair_dirs: list[Path],
+    specs_by_type: dict[str, list[SpecInfo]],
+    slat_dir: Path | None,
+    work_dir: Path,
+    *,
+    num_views: int = 40,
+    blender_path: str | None = None,
+    dry_run: bool,
+) -> dict[str, int]:
+    """Extract DINOv2 voxel features for all edit pairs via PLY rendering.
+
+    For **after** side: render ``after.ply`` → Blender → DINOv2 → inject into
+    ``after.npz``.
+
+    For **before** side: load ``{obj_id}_dino_voxel_mean.pt`` from ``slat_dir``
+    (produced by ``encode_into_SLAT``). If not available, render ``before.ply``
+    as fallback.
+
+    Skips pairs whose NPZ already contains ``dino_voxel_mean``.
+    """
+    stats = {
+        "after_rendered": 0, "after_skipped": 0, "after_no_ply": 0,
+        "after_error": 0,
+        "before_loaded": 0, "before_rendered": 0, "before_skipped": 0,
+        "before_no_src": 0, "before_error": 0,
+        "before_hardlinked": 0,
+    }
+
+    # Group by obj_id for before sharing
+    obj_groups: dict[str, list[Path]] = defaultdict(list)
+    for d in pair_dirs:
+        obj_id = _obj_id_from_edit_id(d.name)
+        obj_groups[obj_id].append(d)
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    total_dirs = len(pair_dirs)
+    processed = 0
+
+    for obj_id, dirs in obj_groups.items():
+        # ── before side (shared per object) ──
+        before_dino: np.ndarray | None = None
+        canonical_before_npz: Path | None = None
+
+        # Try loading pre-saved dino_voxel_mean from slat_dir
+        if slat_dir is not None:
+            dvm_candidates = [
+                slat_dir / f"{obj_id}_dino_voxel_mean.pt",
+            ]
+            # Also search shard subdirectories
+            if slat_dir.is_dir():
+                for sub in sorted(slat_dir.iterdir()):
+                    if sub.is_dir():
+                        dvm_candidates.append(sub / f"{obj_id}_dino_voxel_mean.pt")
+            for cand in dvm_candidates:
+                if cand.exists():
+                    if not dry_run:
+                        t = torch.load(str(cand), map_location="cpu", weights_only=True)
+                        before_dino = t.numpy().astype(np.float16)
+                    stats["before_loaded"] += 1
+                    break
+
+        for d in dirs:
+            # ── after side ──
+            a_npz = d / "after.npz"
+            if a_npz.exists() and not dry_run:
+                try:
+                    existing = np.load(a_npz)
+                    if "dino_voxel_mean" in existing.files:
+                        stats["after_skipped"] += 1
+                        processed += 1
+                        continue
+                except Exception:
+                    pass
+
+            a_ply = d / "after.ply"
+            if not a_ply.exists() or not a_npz.exists():
+                stats["after_no_ply"] += 1
+            elif dry_run:
+                stats["after_rendered"] += 1
+            else:
+                try:
+                    dvm = _render_and_extract_dino(
+                        a_ply, f"after_{d.name}", work_dir,
+                        num_views=num_views, blender_path=blender_path,
+                    )
+                    _inject_dino_into_npz(a_npz, dvm)
+                    stats["after_rendered"] += 1
+                except Exception as e:
+                    log.warning("Phase5 after error %s: %s", d.name, e)
+                    stats["after_error"] += 1
+
+            # ── before side ──
+            b_npz = d / "before.npz"
+            if b_npz.exists() and not dry_run:
+                try:
+                    existing = np.load(b_npz)
+                    if "dino_voxel_mean" in existing.files:
+                        stats["before_skipped"] += 1
+                        processed += 1
+                        continue
+                except Exception:
+                    pass
+
+            if not b_npz.exists():
+                stats["before_no_src"] += 1
+            elif before_dino is not None and not dry_run:
+                _inject_dino_into_npz(b_npz, before_dino)
+                stats["before_loaded"] += 1
+            elif dry_run:
+                stats["before_rendered"] += 1
+            else:
+                # Fallback: render before.ply
+                b_ply = d / "before.ply"
+                if b_ply.exists():
+                    try:
+                        before_dino = _render_and_extract_dino(
+                            b_ply, f"before_{d.name}", work_dir,
+                            num_views=num_views, blender_path=blender_path,
+                        )
+                        _inject_dino_into_npz(b_npz, before_dino)
+                        stats["before_rendered"] += 1
+                    except Exception as e:
+                        log.warning("Phase5 before error %s: %s", d.name, e)
+                        stats["before_error"] += 1
+                else:
+                    stats["before_no_src"] += 1
+
+            processed += 1
+            if processed % 100 == 0:
+                log.info("  Phase5 progress: %d / %d dirs", processed, total_dirs)
+
+    return stats
+
+
 # ──────────────────────────── spec loading ──────────────────────────────────
 
 def _load_specs(specs_path: Path) -> list[SpecInfo]:
@@ -566,12 +763,20 @@ def main():
     )
     parser.add_argument(
         "--phase", type=str, default="all",
-        help="Comma-separated phases to run: 1,2,3,4 or 'all' (default: all)",
+        help="Comma-separated phases to run: 1,2,3,4,5 or 'all' (default: all)",
     )
     parser.add_argument("--include-list", type=str, default=None,
                         help="Text file with edit_ids to process (one per line); "
                              "others are skipped. Phase 3/4 auto-includes "
                              "addition/identity whose source deletion is included.")
+    parser.add_argument("--blender-path", type=str, default=None,
+                        help="Blender executable path (Phase 5). "
+                             "Reads BLENDER_PATH env if not set.")
+    parser.add_argument("--dino-views", type=int, default=40,
+                        help="Number of views for Phase 5 DINOv2 rendering (default: 40)")
+    parser.add_argument("--dino-work-dir", type=str, default=None,
+                        help="Working directory for Phase 5 render intermediates "
+                             "(default: <mesh-pairs>/../_dino_render_tmp)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Count only, do not write files or load models")
     parser.add_argument("--device", default="cuda")
@@ -583,7 +788,7 @@ def main():
         sys.exit(1)
 
     phases = (
-        {1, 2, 3, 4} if args.phase == "all"
+        {1, 2, 3, 4, 5} if args.phase == "all"
         else {int(p) for p in args.phase.split(",")}
     )
     log.info("Phases to run: %s  dry_run=%s", sorted(phases), args.dry_run)
@@ -626,9 +831,9 @@ def main():
     # ── Load specs (Phase 2–4) ──
     specs: list[SpecInfo] = []
     specs_by_type: dict[str, list[SpecInfo]] = {}
-    if phases & {2, 3, 4}:
+    if phases & {2, 3, 4, 5}:
         if not args.specs_jsonl:
-            log.error("--specs-jsonl is required for Phase 2/3/4")
+            log.error("--specs-jsonl is required for Phase 2/3/4/5")
             sys.exit(1)
         specs_path = Path(args.specs_jsonl)
         if not specs_path.exists():
@@ -712,6 +917,27 @@ def main():
             specs_by_type, specs, mesh_pairs, dry_run=args.dry_run,
         )
         log.info("Phase 4 done: %s", s)
+
+    # ────────── Phase 5 ──────────
+    if 5 in phases:
+        log.info("=" * 60)
+        log.info("Phase 5: DINOv2 voxel feature extraction (PLY render)")
+        slat_dir = None
+        if cfg is not None:
+            from scripts.pipeline_common import resolve_data_dirs
+            slat_dir = Path(resolve_data_dirs(cfg)[0])
+        dino_work = (
+            Path(args.dino_work_dir) if args.dino_work_dir
+            else mesh_pairs.parent / "_dino_render_tmp"
+        )
+        blender = args.blender_path or os.environ.get("BLENDER_PATH")
+        s = phase5_dino_features(
+            pair_dirs, specs_by_type, slat_dir, dino_work,
+            num_views=args.dino_views,
+            blender_path=blender,
+            dry_run=args.dry_run,
+        )
+        log.info("Phase 5 done: %s", s)
 
     log.info("=" * 60)
     log.info("Migration complete.")

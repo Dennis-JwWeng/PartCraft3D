@@ -12,7 +12,9 @@ object-centric directory layout::
           metadata.json
       manifest.jsonl          # flat index
 
-Each NPZ contains ``slat_feats [N,C]``, ``slat_coords [N,4]``, ``ss [C,R,R,R]``.
+Each NPZ contains ``slat_feats [N,C]``, ``slat_coords [N,4]``, ``ss [C,R,R,R]``,
+and optionally ``dino_voxel_mean [N,1024]`` (float16, multi-view averaged DINOv2
+features projected onto voxels).
 
 Follows the Trellis ``SLat`` dataset conventions for ``collate_fn`` —
 ``SparseTensor`` batching with batch-index prepending and layout slices.
@@ -198,6 +200,10 @@ class EditPairDataset(Dataset):
                 "prompt": edit.get("prompt", ""),
                 "edit_type": etype,
             }
+            if before.get("dino_voxel_mean") is not None:
+                result["before_dino"] = before["dino_voxel_mean"]
+            if after.get("dino_voxel_mean") is not None:
+                result["after_dino"] = after["dino_voxel_mean"]
             return result
         except Exception:
             return self._random_fallback()
@@ -242,6 +248,14 @@ class EditPairDataset(Dataset):
         pack["prompt"] = [b["prompt"] for b in batch]
         pack["edit_type"] = [b["edit_type"] for b in batch]
 
+        # Optional DINOv2 voxel features (same sparse layout as SLAT)
+        for prefix in ("before", "after"):
+            dino_key = f"{prefix}_dino"
+            if dino_key in batch[0]:
+                dino_list = [item[dino_key] for item in batch]
+                pack[dino_key] = torch.cat(dino_list)
+            # else: key absent — dataset has no dino_voxel_mean
+
         return pack
 
     # ─────────────────── internal helpers ─────────────────────────────
@@ -251,7 +265,7 @@ class EditPairDataset(Dataset):
         path = self.root / f"shard_{shard}" / obj_id / "original.npz"
         return self._load_npz(path)
 
-    def _load_npz(self, path: Path) -> dict[str, torch.Tensor]:
+    def _load_npz(self, path: Path) -> dict[str, torch.Tensor | None]:
         data = np.load(path)
         coords = torch.tensor(data["slat_coords"]).int()
         feats = torch.tensor(data["slat_feats"]).float()
@@ -260,7 +274,14 @@ class EditPairDataset(Dataset):
         if self.normalization is not None:
             feats = (feats - self._mean) / self._std
 
-        return {"coords": coords, "feats": feats, "ss": ss}
+        result: dict[str, torch.Tensor | None] = {
+            "coords": coords, "feats": feats, "ss": ss,
+        }
+        if "dino_voxel_mean" in data.files:
+            result["dino_voxel_mean"] = torch.tensor(data["dino_voxel_mean"]).float()
+        else:
+            result["dino_voxel_mean"] = None
+        return result
 
     def _random_fallback(self) -> dict[str, Any]:
         """Return a random valid item (error recovery, matches Trellis convention)."""
