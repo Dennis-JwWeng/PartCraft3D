@@ -4,6 +4,38 @@
 
 ---
 
+## 2026-04-04 — Deletion SLAT 改为 PLY 渲染重编码 + 全类型 `dino_voxel_mean`
+
+**问题 1**：Deletion 的 SLAT 之前通过从原始 SLAT 按 mask 过滤 `feats[keep]` 产出。由于 SLAT 特征在完整物体上下文中编码（DINOv2 多视角聚合 + SLAT encoder），直接子集化后剩余体素的特征不再自洽，TRELLIS Gaussian decode 时出现严重毛边/模糊。PLY 直接渲染验证确认 mesh 本身是干净的，问题出在 SLAT latent 层。
+
+**问题 2**：训练侧需要 `dino_voxel_mean`（SLAT encoder 的输入，多视角 DINOv2 patch 特征投影到体素后取均值，`[N, 1024]` float16），但之前编码流程未持久化该中间产物。
+
+**决策**：
+
+- Deletion after：走与原始物体完全相同的编码路径 — `after.ply → Blender Cycles 渲染 40 views → Open3D 体素化 64³ → DINOv2 → SLAT encoder → SS encoder`，产出完整 `after.npz`（slat_feats + slat_coords + ss + dino_voxel_mean）
+- 其他类型 after：保留 TRELLIS 生成的 SLAT+SS，通过 `after.ply → Blender 渲染 → DINOv2` 提取 `dino_voxel_mean` 注入已有 NPZ
+- Before 侧：从 `slat_dir` 加载预存的 `{obj_id}_dino_voxel_mean.pt`（需在有 `img_Enc` 的机器上重跑 `encode_into_SLAT`），或 fallback 渲染 `before.ply`
+
+**代码变更**：
+
+| 文件 | 改动 |
+|------|------|
+| `third_party/encode_asset/encode_into_SLAT.py` | 抽出 `extract_dino_voxel_mean(render_dir, num_views)` 可复用函数；`encode_into_SLAT()` 新增 `save_dino_voxel_mean=True` 参数 |
+| `scripts/tools/migrate_slat_to_npz.py` | `_save_npz()` 增加 `dino_voxel_mean` 参数；新增 `_render_and_extract_dino()`、`_inject_dino_into_npz()`；新增 **Phase 5**（PLY 渲染 + DINOv2 提取，deletion 含 SLAT+SS 完整重编码） |
+| `partcraft/phase2_assembly/trellis_refine.py` | `_save_npz()` 增加 `dino_voxel_mean` 参数 |
+| `partcraft/io/edit_pair_dataset.py` | `_load_npz()` 加载 `dino_voxel_mean`；`__getitem__` 返回 `before_dino`/`after_dino`；`collate_fn` 对 dino 做 `torch.cat`（与 SLAT 共享稀疏布局）|
+
+**NPZ 格式扩展**（向后兼容）：
+
+```python
+{"slat_feats": [N, 8], "slat_coords": [N, 4], "ss": [C, R, R, R],
+ "dino_voxel_mean": [N, 1024]}  # float16, 可选
+```
+
+**存储开销**：dino_voxel_mean 每个 NPZ 增加约 26 MB（13K voxels × 1024 × 2B），总量级 TB。
+
+---
+
 ## 2026-04-03 — Material/Global 体素匹配策略定稿
 
 **问题**：TRELLIS S2-only 编辑（material/global）理论上不改变几何，但实际产出会有 1-2 个体素的微小差异。之前的 `coords_match`（`np.array_equal`）和 `voxel_count_match`（精确相等）导致 material 类型全部被误杀（0% 通过率）。

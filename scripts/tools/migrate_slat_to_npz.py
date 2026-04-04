@@ -491,23 +491,17 @@ def phase4_identity(
 
 # ──────────────────────────── PLY render+encode ───────────────────────────────
 
-def _render_and_extract_dino(
+def _render_ply_views(
     ply_path: Path,
     name: str,
     work_dir: Path,
     num_views: int = 40,
     blender_path: str | None = None,
-) -> np.ndarray:
-    """Render a PLY with Blender Cycles, voxelize, extract DINOv2 features.
-
-    Returns ``dino_voxel_mean [N, 1024]`` float16.
-    """
-    import tempfile
-
+) -> Path:
+    """Render a PLY with Blender Cycles and voxelize. Returns render output dir."""
     render_out = work_dir / name
     render_out.mkdir(parents=True, exist_ok=True)
 
-    # ── render ──
     from encode_asset.render_img_for_enc import render, voxelize
 
     if blender_path:
@@ -520,14 +514,70 @@ def _render_and_extract_dino(
     if not mesh_ply.exists():
         raise FileNotFoundError(f"Blender produced no mesh.ply for {name}")
 
-    # ── voxelize ──
     voxelize(str(mesh_ply), name, str(render_out))
+    return render_out
 
-    # ── DINOv2 feature extraction ──
+
+def _render_and_extract_dino(
+    ply_path: Path,
+    name: str,
+    work_dir: Path,
+    num_views: int = 40,
+    blender_path: str | None = None,
+) -> np.ndarray:
+    """Render a PLY, voxelize, extract DINOv2 features.
+
+    Returns ``dino_voxel_mean [N, 1024]`` float16.
+    """
+    render_out = _render_ply_views(ply_path, name, work_dir, num_views, blender_path)
     from encode_asset.encode_into_SLAT import extract_dino_voxel_mean
-
     dino_voxel_mean, _indices = extract_dino_voxel_mean(str(render_out), num_views)
     return dino_voxel_mean
+
+
+def _render_and_full_encode(
+    ply_path: Path,
+    name: str,
+    work_dir: Path,
+    ss_encoder,
+    device: str,
+    num_views: int = 40,
+    blender_path: str | None = None,
+) -> dict[str, np.ndarray]:
+    """Render PLY → DINOv2 → SLAT encoder → SS encoder. Full re-encode.
+
+    Returns dict with ``slat_feats``, ``slat_coords``, ``ss``,
+    ``dino_voxel_mean`` — all numpy arrays ready for ``np.savez``.
+    """
+    from trellis.modules import sparse as sp
+    from encode_asset.encode_into_SLAT import (
+        extract_dino_voxel_mean, _get_slat_encoder, validate_slat,
+    )
+
+    render_out = _render_ply_views(ply_path, name, work_dir, num_views, blender_path)
+    dino_voxel_mean, indices = extract_dino_voxel_mean(str(render_out), num_views)
+
+    # SLAT encode
+    encoder = _get_slat_encoder()
+    aggregated = sp.SparseTensor(
+        feats=torch.from_numpy(dino_voxel_mean).float(),
+        coords=torch.cat([
+            torch.zeros(dino_voxel_mean.shape[0], 1).int(),
+            indices.cpu().int(),
+        ], dim=1),
+    ).cuda()
+    latent = encoder(aggregated, sample_posterior=False)
+    validate_slat(latent.feats, latent.coords, name)
+
+    # SS encode
+    z_s = encode_ss(ss_encoder, latent.coords.to(device), device)
+
+    return {
+        "slat_feats": latent.feats.detach().cpu().float().numpy(),
+        "slat_coords": latent.coords.detach().cpu().int().numpy(),
+        "ss": z_s.detach().cpu().float().numpy(),
+        "dino_voxel_mean": dino_voxel_mean.astype(np.float16),
+    }
 
 
 def _inject_dino_into_npz(npz_path: Path, dino_voxel_mean: np.ndarray) -> None:
@@ -544,29 +594,37 @@ def phase5_dino_features(
     specs_by_type: dict[str, list[SpecInfo]],
     slat_dir: Path | None,
     work_dir: Path,
+    ss_encoder,
+    device: str = "cuda",
     *,
     num_views: int = 40,
     blender_path: str | None = None,
     dry_run: bool,
 ) -> dict[str, int]:
-    """Extract DINOv2 voxel features for all edit pairs via PLY rendering.
+    """PLY render → DINOv2 → dino_voxel_mean for all types; full SLAT+SS re-encode for deletion.
 
-    For **after** side: render ``after.ply`` → Blender → DINOv2 → inject into
-    ``after.npz``.
+    For **after** side:
+      - **deletion**: ``after.ply`` → full re-encode (SLAT + SS + dino_voxel_mean),
+        **overwrites** existing ``after.npz``.
+      - **other types**: ``after.ply`` → DINOv2 only, inject ``dino_voxel_mean``
+        into existing ``after.npz`` (preserve TRELLIS-generated SLAT+SS).
 
     For **before** side: load ``{obj_id}_dino_voxel_mean.pt`` from ``slat_dir``
     (produced by ``encode_into_SLAT``). If not available, render ``before.ply``
     as fallback.
 
-    Skips pairs whose NPZ already contains ``dino_voxel_mean``.
+    Skips pairs whose NPZ already contains ``dino_voxel_mean`` (unless deletion
+    re-encode is needed).
     """
     stats = {
-        "after_rendered": 0, "after_skipped": 0, "after_no_ply": 0,
-        "after_error": 0,
+        "after_full_encoded": 0, "after_dino_injected": 0,
+        "after_skipped": 0, "after_no_ply": 0, "after_error": 0,
         "before_loaded": 0, "before_rendered": 0, "before_skipped": 0,
         "before_no_src": 0, "before_error": 0,
-        "before_hardlinked": 0,
     }
+
+    # Build set of deletion edit_ids for fast lookup
+    del_ids = {s.edit_id for s in specs_by_type.get("deletion", [])}
 
     # Group by obj_id for before sharing
     obj_groups: dict[str, list[Path]] = defaultdict(list)
@@ -581,18 +639,13 @@ def phase5_dino_features(
     for obj_id, dirs in obj_groups.items():
         # ── before side (shared per object) ──
         before_dino: np.ndarray | None = None
-        canonical_before_npz: Path | None = None
 
         # Try loading pre-saved dino_voxel_mean from slat_dir
-        if slat_dir is not None:
-            dvm_candidates = [
-                slat_dir / f"{obj_id}_dino_voxel_mean.pt",
-            ]
-            # Also search shard subdirectories
-            if slat_dir.is_dir():
-                for sub in sorted(slat_dir.iterdir()):
-                    if sub.is_dir():
-                        dvm_candidates.append(sub / f"{obj_id}_dino_voxel_mean.pt")
+        if slat_dir is not None and slat_dir.is_dir():
+            dvm_candidates = [slat_dir / f"{obj_id}_dino_voxel_mean.pt"]
+            for sub in sorted(slat_dir.iterdir()):
+                if sub.is_dir():
+                    dvm_candidates.append(sub / f"{obj_id}_dino_voxel_mean.pt")
             for cand in dvm_candidates:
                 if cand.exists():
                     if not dry_run:
@@ -602,34 +655,57 @@ def phase5_dino_features(
                     break
 
         for d in dirs:
+            edit_id = d.name
+            is_deletion = edit_id in del_ids
+
             # ── after side ──
             a_npz = d / "after.npz"
-            if a_npz.exists() and not dry_run:
+            a_ply = d / "after.ply"
+
+            if not a_ply.exists():
+                stats["after_no_ply"] += 1
+            elif not is_deletion and a_npz.exists() and not dry_run:
+                # Non-deletion: skip if already has dino_voxel_mean
                 try:
                     existing = np.load(a_npz)
                     if "dino_voxel_mean" in existing.files:
                         stats["after_skipped"] += 1
                         processed += 1
-                        continue
+                        # Still handle before side below
+                        self_skip = True
+                    else:
+                        self_skip = False
                 except Exception:
-                    pass
-
-            a_ply = d / "after.ply"
-            if not a_ply.exists() or not a_npz.exists():
-                stats["after_no_ply"] += 1
-            elif dry_run:
-                stats["after_rendered"] += 1
-            else:
+                    self_skip = False
+                if not self_skip:
+                    try:
+                        dvm = _render_and_extract_dino(
+                            a_ply, f"after_{edit_id}", work_dir,
+                            num_views=num_views, blender_path=blender_path,
+                        )
+                        _inject_dino_into_npz(a_npz, dvm)
+                        stats["after_dino_injected"] += 1
+                    except Exception as e:
+                        log.warning("Phase5 after dino error %s: %s", edit_id, e)
+                        stats["after_error"] += 1
+            elif is_deletion and not dry_run:
+                # Deletion: full re-encode (SLAT + SS + dino)
                 try:
-                    dvm = _render_and_extract_dino(
-                        a_ply, f"after_{d.name}", work_dir,
+                    result = _render_and_full_encode(
+                        a_ply, f"after_{edit_id}", work_dir,
+                        ss_encoder, device,
                         num_views=num_views, blender_path=blender_path,
                     )
-                    _inject_dino_into_npz(a_npz, dvm)
-                    stats["after_rendered"] += 1
+                    np.savez(a_npz, **result)
+                    stats["after_full_encoded"] += 1
                 except Exception as e:
-                    log.warning("Phase5 after error %s: %s", d.name, e)
+                    log.warning("Phase5 after full-encode error %s: %s", edit_id, e)
                     stats["after_error"] += 1
+            elif dry_run:
+                if is_deletion:
+                    stats["after_full_encoded"] += 1
+                else:
+                    stats["after_dino_injected"] += 1
 
             # ── before side ──
             b_npz = d / "before.npz"
@@ -647,7 +723,7 @@ def phase5_dino_features(
                 stats["before_no_src"] += 1
             elif before_dino is not None and not dry_run:
                 _inject_dino_into_npz(b_npz, before_dino)
-                stats["before_loaded"] += 1
+                # before_dino already counted above
             elif dry_run:
                 stats["before_rendered"] += 1
             else:
@@ -656,20 +732,21 @@ def phase5_dino_features(
                 if b_ply.exists():
                     try:
                         before_dino = _render_and_extract_dino(
-                            b_ply, f"before_{d.name}", work_dir,
+                            b_ply, f"before_{edit_id}", work_dir,
                             num_views=num_views, blender_path=blender_path,
                         )
                         _inject_dino_into_npz(b_npz, before_dino)
                         stats["before_rendered"] += 1
                     except Exception as e:
-                        log.warning("Phase5 before error %s: %s", d.name, e)
+                        log.warning("Phase5 before error %s: %s", edit_id, e)
                         stats["before_error"] += 1
                 else:
                     stats["before_no_src"] += 1
 
             processed += 1
-            if processed % 100 == 0:
-                log.info("  Phase5 progress: %d / %d dirs", processed, total_dirs)
+            if processed % 50 == 0:
+                log.info("  Phase5 progress: %d / %d dirs  %s",
+                         processed, total_dirs, stats)
 
     return stats
 
@@ -921,7 +998,7 @@ def main():
     # ────────── Phase 5 ──────────
     if 5 in phases:
         log.info("=" * 60)
-        log.info("Phase 5: DINOv2 voxel feature extraction (PLY render)")
+        log.info("Phase 5: PLY render → DINOv2 + SLAT re-encode (deletion)")
         slat_dir = None
         if cfg is not None:
             from scripts.pipeline_common import resolve_data_dirs
@@ -931,8 +1008,12 @@ def main():
             else mesh_pairs.parent / "_dino_render_tmp"
         )
         blender = args.blender_path or os.environ.get("BLENDER_PATH")
+        ss_enc = None
+        if not args.dry_run:
+            ss_enc = _load_ss_encoder(Path(ckpt_root), args.device)
         s = phase5_dino_features(
             pair_dirs, specs_by_type, slat_dir, dino_work,
+            ss_enc, args.device,
             num_views=args.dino_views,
             blender_path=blender,
             dry_run=args.dry_run,
