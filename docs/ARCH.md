@@ -229,7 +229,7 @@ flowchart TD
 
 以下文件虽非双入口直接 import，但属于可选路径或潜在配置分支，当前保留：
 
-- `partcraft/phase3_filter/filter.py`
+- `partcraft/phase3_filter/_mesh_metrics.py`（原 `filter.py`，仅 vlm_filter 的 mesh prefilter 使用）
 - `partcraft/phase2_assembly/alignment.py`
 
 ## Batch 管线运行器
@@ -520,8 +520,13 @@ CUDA_VISIBLE_DEVICES=3 python scripts/tools/run_vlm_cleaning.py \
     --output-root outputs/partverse \
     --shards 01 --only-types modification scale material global
 
-# 2c. 多 GPU 并行
+# 2c. 多 GPU 并行（共享单个 VLM）
 GPUS=3,4,5,6,7 SHARD=01 bash scripts/tools/run_vlm_cleaning_multi_gpu.sh
+
+# 2d. 多 GPU 并行（每 GPU 独立 VLM 实例，6x 吞吐）
+VLM_URLS="http://localhost:8002/v1,http://localhost:8003/v1,http://localhost:8004/v1,http://localhost:8005/v1,http://localhost:8006/v1,http://localhost:8007/v1" \
+GPUS=0,3,4,5,6,7 SHARD=01 ONLY_TYPES=deletion \
+    bash scripts/tools/run_vlm_cleaning_multi_gpu.sh
 ```
 
 **resume 支持**：评分增量写入 `vlm_scores.jsonl`（含 `improved_prompt` / `improved_after_desc`），重启自动跳过已评项。渲染结果缓存在 `_vlm_render_cache/`。
@@ -547,7 +552,7 @@ GPUS=3,4,5,6,7 SHARD=01 bash scripts/tools/run_vlm_cleaning_multi_gpu.sh
 |------|---------|------|---------|------|
 | `render_edit_gallery.py` | Object-centric `shard_XX/` **或** 旧平铺 `mesh_pairs/` | 静态 PNG（N 视角 before/after 对比） | TRELLIS Gaussian | **快速浏览编辑合理性** |
 | `render_gs_pairs.py` | 旧平铺 `mesh_pairs/` | MP4 旋转视频 | TRELLIS Gaussian | 深度查看编辑效果 |
-| `render_ply_pairs.py` | PLY 文件 | PNG（4 正交视角） | Blender Cycles | mesh 质量对比 |
+| `render_ply_pairs.py` | PLY 文件 | PNG（3 或 4 视角） | Blender Cycles | mesh 质量对比 / VLM 清洗输入 |
 | `visualize_edit_pair.py` | PLY 文件 | MP4 旋转视频 | Open3D | mesh 旋转动画 |
 
 ### render_edit_gallery.py（推荐）

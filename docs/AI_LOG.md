@@ -21,14 +21,20 @@
 - `improved_after_desc`：VLM 描述的 AFTER 物体（始终填写）
 
 **代码变更**：
-- `partcraft/phase3_filter/vlm_filter.py`：`VLMScore` 加 3 字段，`build_judge_prompt` 改为双部分统一 prompt，`render_views` / `render_ply_views` 默认 3 views + 最优角度
-- `scripts/tools/run_vlm_cleaning.py`：`_render_ply_pair` 改用 `render_3views`，`_render_slat_views` 使用匹配的 3-view 角度，`_score_one` 捕获新字段
+- `partcraft/phase3_filter/vlm_filter.py`：`VLMScore` 加 3 字段，`build_judge_prompt` 改为双部分统一 prompt，`render_views` / `render_ply_views` 默认 3 views + 最优角度，`call_vlm_judge` 通过 `extra_body` 禁用 thinking（含 `TypeError` fallback 兼容非 SGLang 后端），`_VLM_YAWS` / `_VLM_PITCHES` 作为统一角度定义导出
+- `scripts/tools/run_vlm_cleaning.py`：`_render_ply_pair` 改用 `render_3views`，`_render_slat_views` 从 `vlm_filter` 导入角度，`_score_one` 捕获新字段
 - `scripts/vis/render_ply_pairs.py`：新增 `_THREE_VIEWS` + `render_3views()` + 通用 `_render_views()`
+- `scripts/tools/run_vlm_cleaning_multi_gpu.sh`：新增 `VLM_URLS` 支持每 GPU 独立 VLM 实例（6x 吞吐），默认 3 views + 1024 max_tokens
 
 **先清洗后编码流程**（详见 `ARCH.md`）：
 ```
 Step4 → repack → Phase 1 → VLM 清洗 → Phase 5（仅通过的 deletion）→ Phase 3,4
 ```
+
+**实测结果**（shard01 deletion，6× A800 并行）：
+- 1442/2039 已评，73.8% high / 22.9% negative / 3.1% low / 0% rejected
+- 速率 5.7 条/min（6 GPU），~63s/条/GPU（Blender 渲染 ~20s + VLM ~40s）
+- `improved_prompt` 全部正确填写，`prompt_quality=1` 的 203 条与空 prompt 统计一致
 
 ---
 
