@@ -35,25 +35,7 @@ import pipeline_common as _pipeline_common  # noqa: E402
 # Edit ID → type (fallback when jsonl has no edit_type)
 # ---------------------------------------------------------------------------
 
-_PREFIX_TO_EDIT_TYPE: tuple[tuple[str, str], ...] = (
-    ("gdel", "deletion"),
-    ("gadd", "addition"),
-    ("del", "deletion"),
-    ("add", "addition"),
-    ("mod", "modification"),
-    ("scl", "scale"),
-    ("mat", "material"),
-    ("glb", "global"),
-    ("idt", "identity"),
-)
-
-
-def infer_edit_type_from_id(edit_id: str) -> str:
-    """Infer PartCraft edit_type from edit_id prefix (see planner._make_edit_id)."""
-    for prefix, etype in _PREFIX_TO_EDIT_TYPE:
-        if edit_id.startswith(prefix + "_"):
-            return etype
-    return "unknown"
+from _vis_common import infer_edit_type as infer_edit_type_from_id  # noqa: E402
 
 
 def _resolve_mesh_pairs_dir(
@@ -137,91 +119,20 @@ def sample_pairs_by_type(
 # SLAT / Gaussian helpers
 # ---------------------------------------------------------------------------
 
-def load_slat(path: Path, device: str = "cuda"):
-    """Load SLAT from npz or legacy feats.pt + coords.pt directory."""
-    from trellis.modules import sparse as sp
-    npz_path = path if path.suffix == ".npz" else path.with_suffix(".npz")
-    if npz_path.exists():
-        data = np.load(str(npz_path))
-        feats = torch.from_numpy(data["slat_feats"]).to(device)
-        coords = torch.from_numpy(data["slat_coords"]).to(device)
-        return sp.SparseTensor(feats=feats, coords=coords)
-    resolved = path.resolve()
-    feats = torch.load(resolved / "feats.pt", weights_only=True)
-    coords = torch.load(resolved / "coords.pt", weights_only=True)
-    return sp.SparseTensor(feats=feats.to(device), coords=coords.to(device))
+from _vis_common import load_slat  # noqa: E402 (shared SLAT loader)
 
 
-def render_gaussian_turntable(gaussian, n_frames: int = 120,
-                              pitch: float = 0.45) -> list[np.ndarray]:
-    """Render a smooth turntable video from a Gaussian."""
-    from trellis.utils import render_utils
-    yaws = torch.linspace(0, 2 * np.pi, n_frames + 1)[:-1]
-    pitches = torch.tensor([pitch] * n_frames)
-    imgs = render_utils.Trellis_render_multiview_images(
-        gaussian, yaws.tolist(), pitches.tolist())['color']
-    return imgs
+from _vis_common import render_gaussian_views  # noqa: E402
 
-
-def render_gaussian_views(gaussian, num_views: int = 16,
-                          pitch: float = 0.45) -> list[np.ndarray]:
-    """Render multiview images from a Gaussian."""
-    from trellis.utils import render_utils
-    yaws = torch.linspace(0, 2 * np.pi, num_views + 1)[:-1]
-    pitches = torch.tensor([pitch] * num_views)
-    return render_utils.Trellis_render_multiview_images(
-        gaussian, yaws.tolist(), pitches.tolist())['color']
+# Alias for turntable (just more frames)
+render_gaussian_turntable = render_gaussian_views
 
 
 # ---------------------------------------------------------------------------
 # Video composition
 # ---------------------------------------------------------------------------
 
-def wrap_text(text: str, max_chars: int = 60) -> list[str]:
-    """Word-wrap text into lines."""
-    lines = []
-    for raw_line in text.split("\n"):
-        remaining = raw_line
-        while remaining:
-            if len(remaining) <= max_chars:
-                lines.append(remaining)
-                break
-            split = remaining[:max_chars].rfind(" ")
-            if split <= 0:
-                split = max_chars
-            lines.append(remaining[:split])
-            remaining = remaining[split:].strip()
-    return lines
-
-
-def make_text_bar(text: str, width: int, bar_height: int = 60,
-                  bg_color: tuple = (30, 30, 30),
-                  fg_color: tuple = (255, 255, 255)) -> np.ndarray:
-    """Create a text bar image with prompt text."""
-    bar = np.full((bar_height, width, 3), bg_color, dtype=np.uint8)
-    lines = wrap_text(text, max_chars=width // 8)
-
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.55
-    thickness = 1
-    y = 20
-    for line in lines[:3]:  # max 3 lines
-        cv2.putText(bar, line, (10, y), font, font_scale,
-                    fg_color, thickness, cv2.LINE_AA)
-        y += 18
-    return bar
-
-
-def make_label_bar(label: str, width: int, height: int = 32,
-                   bg_color: tuple = (240, 240, 240),
-                   fg_color: tuple = (40, 40, 40)) -> np.ndarray:
-    """Create a 'Before' / 'After' label bar."""
-    bar = np.full((height, width, 3), bg_color, dtype=np.uint8)
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    tw = cv2.getTextSize(label, font, 0.7, 2)[0][0]
-    cv2.putText(bar, label, ((width - tw) // 2, 24),
-                font, 0.7, fg_color, 2, cv2.LINE_AA)
-    return bar
+from _vis_common import wrap_text, make_text_bar, make_label_bar  # noqa: E402
 
 
 def compose_comparison_frame(before_img: np.ndarray, after_img: np.ndarray,

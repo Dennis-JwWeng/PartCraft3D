@@ -67,52 +67,10 @@ logger = logging.getLogger(__name__)
 
 
 # =========================================================================
-# SLAT loading (supports .npz and legacy feats.pt/coords.pt)
+# SLAT loading & rendering (shared)
 # =========================================================================
 
-def load_slat(path: Path | str, device: str = "cuda"):
-    """Load SLAT from NPZ or legacy directory."""
-    from trellis.modules import sparse as sp
-
-    path = Path(path)
-    npz = path if path.suffix == ".npz" else path.with_suffix(".npz")
-    if npz.exists():
-        data = np.load(str(npz))
-        feats = torch.from_numpy(data["slat_feats"]).to(device)
-        coords = torch.from_numpy(data["slat_coords"]).to(device)
-        return sp.SparseTensor(feats=feats, coords=coords)
-    # Legacy: directory with feats.pt + coords.pt
-    if path.is_dir():
-        feats = torch.load(path / "feats.pt", weights_only=True).to(device)
-        coords = torch.load(path / "coords.pt", weights_only=True).to(device)
-        return sp.SparseTensor(feats=feats, coords=coords)
-    raise FileNotFoundError(f"No SLAT found at {path}")
-
-
-# =========================================================================
-# Rendering
-# =========================================================================
-
-def render_orbit_views(
-    pipeline,
-    slat,
-    num_views: int = 8,
-    pitch: float = 0.4,
-) -> list[np.ndarray]:
-    """Decode SLAT → Gaussian → render orbiting views.
-
-    Returns list of [H, W, 3] uint8 arrays.
-    """
-    from trellis.utils import render_utils
-
-    outputs = pipeline.decode_slat(slat, ["gaussian"])
-    gaussian = outputs["gaussian"][0]
-    yaws = torch.linspace(0, 2 * np.pi, num_views + 1)[:-1]
-    pitches = torch.tensor([pitch] * num_views)
-    imgs = render_utils.Trellis_render_multiview_images(
-        gaussian, yaws.tolist(), pitches.tolist()
-    )["color"]
-    return imgs
+from _vis_common import load_slat, decode_and_render as render_orbit_views
 
 
 # =========================================================================

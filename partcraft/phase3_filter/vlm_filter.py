@@ -558,7 +558,7 @@ def mesh_prefilter_before_vlm(
 
     try:
         import trimesh
-        from partcraft.phase3_filter.filter import (
+        from partcraft.phase3_filter._mesh_metrics import (
             MetricResult,
             QualityReport,
             evaluate_pair,

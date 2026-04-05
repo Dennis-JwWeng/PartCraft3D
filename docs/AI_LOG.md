@@ -4,6 +4,48 @@
 
 ---
 
+## 2026-04-05 — 代码库精简：消除重复、删除死代码
+
+**问题**：清洗/过滤管线有 3 个独立入口 + 4 套重复指标体系，NPZ 保存和 SS 编码函数在 2 处重复实现，4 个 vis 工具共享 ~300 行重复代码。
+
+**删除**（~1200 行）：
+- `partcraft/phase4_filter/filter.py` — 死代码，指标与 phase3 完全重复
+- `scripts/tools/run_postprocess.py` — Phase A-D 被独立工具替代
+- `partcraft/cleaning/ply_checks.py` — 仅被 run_postprocess 引用，5 个指标重复实现
+- `migrate_slat_to_npz.py` Phase 2 函数 + `_create_refiner` — 已被 Phase 5 替代
+
+**重构**：
+- `phase3_filter/filter.py` → `_mesh_metrics.py`（内部模块，仅 vlm_filter 的 mesh prefilter 使用）
+- 提取 `partcraft/io/npz_utils.py`：`save_npz()` / `encode_ss()` / `load_ss_encoder()`，`migrate_slat_to_npz.py` 和 `trellis_refine.py` 改为 import
+- 提取 `scripts/vis/_vis_common.py`：`load_slat()` / `render_gaussian_views()` / `make_text_bar()` / `make_label_bar()`，4 个 vis 脚本改为 import
+- `hy3d_loader.py` 加 DeprecationWarning
+
+**精简后管线**：
+```
+Step 1-6 → migrate (Phase 1,3,4,5) → repack → run_vlm_cleaning → 训练
+```
+
+---
+
+## 2026-04-04 — VLM 独立清洗 `run_vlm_cleaning.py`
+
+**问题**：计算型 Layer 2 pair checks（`pair_checks.py`）使用间接几何代理指标（connected_components ≤ 3、edit_locality、center_drift 等），与人眼视觉判断相关性弱。deletion 仅 39.1% 通过率，大量视觉合理的编辑被误杀。
+
+**决策**：新增 `scripts/tools/run_vlm_cleaning.py`，用本地 Qwen3.5-27B VLM 替代 Layer 2 计算检查。渲染 before/after 4 视角对比图 → VLM 结构化评分 → tier 分类。
+
+**关键设计**：
+- deletion：有真实 PLY → Blender 渲染（无需 TRELLIS GPU）
+- mod/scl/mat/glb：PLY 是点云（0 faces，TRELLIS 导出）→ 从 NPZ 加载 SLAT → TRELLIS decode → Gaussian 渲染
+- addition：不评，继承 deletion 分数（before/after 互换，质量等价）
+- identity：自动 high
+- 复用 `partcraft/phase3_filter/vlm_filter.py` 的 `call_vlm_judge` + `build_judge_prompt` + 5 维评分
+
+**多 GPU 调度**：`scripts/tools/run_vlm_cleaning_multi_gpu.sh`，GPU 0 跑 Qwen SGLang，其余 GPU 跑 TRELLIS 渲染 worker。Resume 支持：增量 JSONL + 渲染缓存。
+
+**有效 VLM 调用量**：~48K（跳过 identity 2.4K + addition 4.2K 继承）
+
+---
+
 ## 2026-04-04 — Phase 5：Deletion PLY 渲染 → SLAT+SS 重编码
 
 **问题**：Deletion 的 SLAT 之前通过 mask 过滤 `feats[keep]` 产出（旧 Phase 2），特征在缺失零件的上下文中不自洽，Gaussian decode 时有严重毛边/模糊。

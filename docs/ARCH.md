@@ -386,54 +386,36 @@ for batch in loader:
 
 对 `repack_to_object_dirs.py` 产出的 object-centric 训练数据进行质量过滤。
 
-### 三层过滤
+### 过滤架构（2026-04-05 精简）
 
-1. **Layer 1（NPZ/SLAT 健全性）**：`partcraft/cleaning/npz_checks.py`
+**主路径：VLM 清洗**（`scripts/tools/run_vlm_cleaning.py`）
+- 渲染 before/after 4 视角对比图 → Qwen VLM 结构化评分 → tier 分类
+- 5 维评分：edit_executed、correct_region、preserve_other、visual_quality、artifact_free
+- 两种渲染路径：PLY → Blender（deletion）/ NPZ → TRELLIS Gaussian（其他类型）
+- 核心函数在 `partcraft/phase3_filter/vlm_filter.py`
+- Mesh prefilter 函数在 `partcraft/phase3_filter/_mesh_metrics.py`（内部模块）
+
+**备用路径：计算型清洗**（`scripts/tools/run_cleaning.py`，无 GPU 时可用）
+1. **Layer 1（NPZ 健全性）**：`partcraft/cleaning/npz_checks.py`
    - 体素数范围、特征值域（NaN/Inf/常量）、SS 值域、坐标合法性/唯一性
-   - 支持 `require_ss=False` 模式，跳过 SS 检查（用于旧格式 `feats.pt+coords.pt`）
-   - `load_slat_dir_arrays()` 支持从旧 `*_slat/` 目录加载
-   - 纯 numpy，无 GPU 依赖
-
 2. **Layer 2（编辑对比）**：`partcraft/cleaning/pair_checks.py`
-   - 按编辑类型分发（7 类各有独立检查函数）
-   - 所有 checker 支持 `require_ss=False`，跳过 SS 相关指标
-   - 关键类型特化：
-     - **deletion/addition**：体素减少/增加比、连通性、退化检测
-     - **modification**：SS 余弦相似度（可选）、编辑局部性、中心漂移
-     - **scale**：更严格的 SS 保持（可选）、轴向 bbox 比
-     - **material/global**：坐标 & SS 必须完全一致（S2-only 约束，`ss_match_tol: 1e-3`，SS 可选），仅特征可变
-     - **identity**：天然有效（引用同一 `original.npz`）
-   - 纯 numpy + scipy，无 GPU 依赖
+   - 按编辑类型分发 7 类检查（体素比、连通性、SS 相似度等）
 
-3. **Layer 2-PLY（PLY 几何检查）**：`partcraft/cleaning/ply_checks.py`（**新增**）
-   - 针对仅有 PLY 产物的编辑（如 deletion 直接 mesh 操作）
-   - 检查：水密性、连通性、退化、体积比、中心漂移、顶点数
-   - 复用 `partcraft/phase3_filter/filter.py` 的 trimesh 指标
-   - 纯 CPU（trimesh），无 GPU 依赖
+**共享 NPZ 工具**：`partcraft/io/npz_utils.py`
+- `save_npz()` / `encode_ss()` / `load_ss_encoder()` — 被 `migrate_slat_to_npz.py` 和 `trellis_refine.py` 共用
 
-4. **Layer 3（VLM 语义）**：`partcraft/phase3_filter/vlm_filter.py`
-   - **所有编辑类型**都需要 VLM 评判 prompt 对齐度
-   - 5 维评分：edit_executed、correct_region、preserve_other、visual_quality、artifact_free
-   - 支持两种渲染路径：
-     - SLAT 编辑：SLAT → TRELLIS Gaussian → 多视角渲染（`render_views`）
-     - PLY 编辑：PLY → Blender Cycles → 多视角渲染（`render_ply_views`，**新增**）
-   - `evaluate_edit_from_ply()` / `evaluate_edit_from_slat_dir()`（**新增**）
+### NPZ 迁移 `migrate_slat_to_npz.py`（2026-04-05 精简）
 
-### NPZ 迁移与后处理管线 `migrate_slat_to_npz.py`（2026-04-04 对齐）
-
-`scripts/tools/migrate_slat_to_npz.py` 是将 Step4 产出统一为训练就绪 NPZ 的核心工具，分 5 个 Phase：
+`scripts/tools/migrate_slat_to_npz.py` 将 Step4 产出统一为训练就绪 NPZ，4 个 Phase：
 
 | Phase | 功能 | 处理对象 | 资源 |
 |-------|------|---------|------|
 | **1** | 旧 `*_slat/` → NPZ 转换 | mod/scale/mat/glb 的旧 `feats.pt+coords.pt` → 编码 SS → 写 NPZ | GPU（SS encoder） |
-| **2** | Deletion SLAT mask 过滤（**已废弃，被 Phase 5 替代**） | — | — |
 | **3** | Addition backfill | 复制 deletion 的 `before.npz` ↔ `after.npz` 互换（硬链接） | CPU |
 | **4** | Identity backfill | 硬链接同物体已有 `before.npz` 作为 before 和 after | CPU |
 | **5** | **Deletion PLY → SLAT+SS 重编码** | 仅 deletion 的 `after.ply` | GPU（Blender + DINOv2 + SLAT enc + SS enc） |
 
-Phase 5 仅处理 **deletion**：`after.ply` → Blender Cycles 40 views → Open3D voxelize → DINOv2 → SLAT encoder → SS encoder → 重写 `after.npz`。其他类型已有 TRELLIS 产出的有效 SLAT+SS，不需要处理。
-
-推荐执行顺序：`--phase 1,3,4,5`（跳过已废弃的 Phase 2）。
+推荐执行：`--phase 1,3,4,5`。
 
 ```bash
 # 旧格式转换 + addition/identity 回填 + deletion 重编码
@@ -448,20 +430,55 @@ python scripts/tools/migrate_slat_to_npz.py \
 GPUS=0,3,4,5,6,7 SHARD=01 bash scripts/tools/run_phase5_multi_gpu.sh
 ```
 
-### 上游预筛管线 `run_postprocess.py`（可选）
+### VLM 清洗 `run_vlm_cleaning.py`
 
-`scripts/tools/run_postprocess.py` 在 migrate 之前做质量预筛，减少无效编码：
+`scripts/tools/run_vlm_cleaning.py` 直接对 repacked 数据做 VLM 质量筛选（主路径）。
 
-| Phase | 功能 | 资源 |
-|-------|------|------|
-| **A** | 几何预筛：SLAT 编辑用 feats+coords 检查，PLY 编辑用 mesh 检查 | CPU |
-| **B** | VLM 语义评分 | GPU + VLM API |
+**编辑类型处理策略**：
 
-通过 `--include-list` 将预筛结果传给 `migrate_slat_to_npz.py`，仅对通过子集执行 Phase 1/3/4/5。
+| 类型 | 渲染路径 | 是否需要 TRELLIS GPU | 备注 |
+|------|---------|---------------------|------|
+| **deletion** | PLY → Blender 4 views | 否（Blender CPU/GPU） | before.ply + after.ply 均有真实网格 |
+| **addition** | 不评（继承 deletion 分数） | — | before/after 互换，质量等价 |
+| **modification** | NPZ → TRELLIS decode → Gaussian render | 是 | PLY 是点云（0 面），无法 Blender 渲染 |
+| **scale** | 同 modification | 是 | |
+| **material** | 同 modification | 是 | |
+| **global** | 同 modification | 是 | |
+| **identity** | 不评（自动 high） | — | 引用同一 `original.npz` |
+
+**评分维度**（复用 `partcraft/phase3_filter/vlm_filter.py`）：
+- `edit_executed` / `correct_region` / `preserve_other` / `visual_quality` / `artifact_free`
+- 加权合成 → tier 分类（high / medium / low / negative / rejected）
+
+**运行方式**：
+
+```bash
+# 1. 启动 Qwen VLM 服务（GPU 0）
+conda activate qwen_test
+CUDA_VISIBLE_DEVICES=0 VLM_MODEL=/Node11_nvme/zsn/checkpoints/Qwen3.5-27B \
+    bash scripts/tools/launch_local_vlm.sh
+
+# 2a. 仅 deletion（无需 TRELLIS，快）
+python scripts/tools/run_vlm_cleaning.py \
+    --root outputs/partverse/partverse_pairs \
+    --output-root outputs/partverse \
+    --shards 01 --only-types deletion
+
+# 2b. 其他类型（TRELLIS on GPU 3）
+CUDA_VISIBLE_DEVICES=3 python scripts/tools/run_vlm_cleaning.py \
+    --root outputs/partverse/partverse_pairs \
+    --output-root outputs/partverse \
+    --shards 01 --only-types modification scale material global
+
+# 2c. 多 GPU 并行
+GPUS=3,4,5,6,7 SHARD=01 bash scripts/tools/run_vlm_cleaning_multi_gpu.sh
+```
+
+**resume 支持**：评分增量写入 `vlm_scores.jsonl`，重启自动跳过已评项。渲染结果缓存在 `_vlm_render_cache/`。
 
 ### 其他入口（仍可用）
 
-- **独立清洗**：`scripts/tools/run_cleaning.py --input-dir partverse_pairs [--shards ...] [--workers N]`
+- **计算型清洗**：`scripts/tools/run_cleaning.py --input-dir partverse_pairs [--shards ...] [--workers N]`
 - **管线集成**：`python scripts/run_pipeline.py --steps 7 --cleaning-input-dir partverse_pairs`
 
 ### 输出
@@ -470,9 +487,11 @@ GPUS=0,3,4,5,6,7 SHARD=01 bash scripts/tools/run_phase5_multi_gpu.sh
 
 ### 训练侧集成
 
-`EditPairDataset(root=..., quality_dir=..., min_tier="medium")` 自动过滤低质量编辑。
+`EditPairDataset(root=..., quality_dir=..., min_tier="medium")` 自动过滤低质量编辑。`quality.json` 格式兼容计算型清洗与 VLM 清洗两种来源。
 
 ## 可视化工具（scripts/vis/）
+
+共享模块 `scripts/vis/_vis_common.py` 提供 SLAT 加载、Gaussian 渲染、文本/标签栏合成等通用函数。
 
 | 工具 | 输入格式 | 输出 | 渲染方式 | 用途 |
 |------|---------|------|---------|------|

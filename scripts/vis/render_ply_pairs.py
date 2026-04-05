@@ -99,26 +99,7 @@ def render_4views(mesh_path: str, resolution: int = 512,
 # Image composition
 # ---------------------------------------------------------------------------
 
-def make_text_bar(text: str, width: int, bar_height: int = 48,
-                  bg_color: tuple = (30, 30, 30),
-                  fg_color: tuple = (255, 255, 255)) -> np.ndarray:
-    bar = np.full((bar_height, width, 3), bg_color, dtype=np.uint8)
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    # Truncate if too long
-    max_chars = width // 10
-    display = text[:max_chars] + ("..." if len(text) > max_chars else "")
-    cv2.putText(bar, display, (10, 32), font, 0.6, fg_color, 1, cv2.LINE_AA)
-    return bar
-
-
-def make_label_bar(label: str, width: int, height: int = 28,
-                   bg_color: tuple = (240, 240, 240),
-                   fg_color: tuple = (40, 40, 40)) -> np.ndarray:
-    bar = np.full((height, width, 3), bg_color, dtype=np.uint8)
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    tw = cv2.getTextSize(label, font, 0.6, 2)[0][0]
-    cv2.putText(bar, label, ((width - tw) // 2, 20), font, 0.6, fg_color, 2, cv2.LINE_AA)
-    return bar
+from _vis_common import make_text_bar, make_label_bar  # noqa: E402
 
 
 def compose_comparison(before_views: list[np.ndarray],

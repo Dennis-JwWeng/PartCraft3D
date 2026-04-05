@@ -340,17 +340,10 @@ class TrellisRefiner:
 
     @torch.no_grad()
     def encode_ss(self, coords: torch.Tensor) -> torch.Tensor:
-        """Encode voxel coords into SS VAE latent z_s.
-
-        Builds a 64^3 binary occupancy from the coord list and runs the
-        sparse-structure encoder.  Returns z_s with batch dim squeezed:
-        shape ``[C, R, R, R]``.
-        """
-        s1_encoder = self.trellis_text.models['sparse_structure_encoder']
-        occ = torch.zeros(1, 1, 64, 64, 64, device=self.device)
-        occ[0, 0, coords[:, 1], coords[:, 2], coords[:, 3]] = 1
-        z_s = s1_encoder(occ)
-        return z_s.squeeze(0)
+        """Encode voxel coords into SS VAE latent z_s [C, R, R, R]."""
+        from partcraft.io.npz_utils import encode_ss
+        encoder = self.trellis_text.models['sparse_structure_encoder']
+        return encode_ss(encoder, coords, self.device)
 
     # ---- Step 3: Part mask (replaces PartField + VLM grounding) ----
 
@@ -1314,15 +1307,8 @@ class TrellisRefiner:
         dino_voxel_mean: np.ndarray | None = None,
     ) -> None:
         """Write a single ``{tag}.npz`` containing SLAT + SS + optional DINOv2."""
-        data = {
-            "slat_feats": slat.feats.detach().cpu().float().numpy(),
-            "slat_coords": slat.coords.detach().cpu().int().numpy(),
-        }
-        if z_s is not None:
-            data["ss"] = z_s.detach().cpu().float().numpy()
-        if dino_voxel_mean is not None:
-            data["dino_voxel_mean"] = np.asarray(dino_voxel_mean).astype(np.float16)
-        np.savez(path, **data)
+        from partcraft.io.npz_utils import save_npz
+        save_npz(path, slat.feats, slat.coords, z_s)
 
     def export_pair(
         self,
