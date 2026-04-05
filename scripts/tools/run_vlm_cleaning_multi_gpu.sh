@@ -28,13 +28,16 @@ cd "$PROJECT_ROOT"
 SHARD="${SHARD:-01}"
 GPUS="${GPUS:-3,4,5,6,7}"
 VLM_URL="${VLM_URL:-http://localhost:8002/v1}"
+# Per-GPU VLM URLs: comma-separated, one per GPU. If set, each worker uses its own VLM.
+# E.g. VLM_URLS="http://localhost:8002/v1,http://localhost:8003/v1,..."
+VLM_URLS="${VLM_URLS:-}"
 VLM_MODEL="${VLM_MODEL:-Qwen3.5-27B}"
 ROOT="${ROOT:-outputs/partverse/partverse_pairs}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/partverse}"
 BLENDER_PATH="${BLENDER_PATH:-/Node11_nvme/artgen/lac/.tools/blender-4.2.0-linux-x64/blender}"
 ONLY_TYPES="${ONLY_TYPES:-}"          # e.g. "deletion" or "modification scale material global"
-NUM_VIEWS="${NUM_VIEWS:-4}"
-VLM_MAX_TOKENS="${VLM_MAX_TOKENS:-4096}"
+NUM_VIEWS="${NUM_VIEWS:-3}"
+VLM_MAX_TOKENS="${VLM_MAX_TOKENS:-1024}"
 TRELLIS_CKPT="${TRELLIS_CKPT:-checkpoints/TRELLIS-image-large}"
 
 # ── conda env ──
@@ -45,10 +48,20 @@ export ATTN_BACKEND="${ATTN_BACKEND:-xformers}"
 IFS=',' read -ra GPU_ARRAY <<< "$GPUS"
 NUM_GPUS=${#GPU_ARRAY[@]}
 
+# Parse per-GPU VLM URLs (if provided)
+if [ -n "$VLM_URLS" ]; then
+    IFS=',' read -ra VLM_URL_ARRAY <<< "$VLM_URLS"
+else
+    VLM_URL_ARRAY=()
+    for i in "${!GPU_ARRAY[@]}"; do
+        VLM_URL_ARRAY+=("$VLM_URL")
+    done
+fi
+
 echo "[INFO] VLM cleaning multi-GPU launcher"
 echo "  Shard:       $SHARD"
 echo "  GPUs:        ${GPU_ARRAY[*]} ($NUM_GPUS workers)"
-echo "  VLM:         $VLM_URL ($VLM_MODEL)"
+echo "  VLM:         ${VLM_URL_ARRAY[*]}"
 echo "  Root:        $ROOT"
 echo "  Output root: $OUTPUT_ROOT"
 echo "  Only types:  ${ONLY_TYPES:-all (del/mod/scl/mat/glb)}"
@@ -104,12 +117,13 @@ for i in "${!GPU_ARRAY[@]}"; do
         ONLY_TYPES_ARG="--only-types $ONLY_TYPES"
     fi
 
-    echo "[GPU $GPU_ID] Starting (log: $LOG_FILE)"
+    WORKER_VLM_URL="${VLM_URL_ARRAY[$i]:-$VLM_URL}"
+    echo "[GPU $GPU_ID] Starting (VLM: $WORKER_VLM_URL, log: $LOG_FILE)"
     CUDA_VISIBLE_DEVICES="$GPU_ID" \
     python scripts/tools/run_vlm_cleaning.py \
         --root "$ROOT" \
         --output-root "$OUTPUT_ROOT" \
-        --vlm-url "$VLM_URL" \
+        --vlm-url "$WORKER_VLM_URL" \
         --vlm-model "$VLM_MODEL" \
         --vlm-max-tokens "$VLM_MAX_TOKENS" \
         --shards "$SHARD" \

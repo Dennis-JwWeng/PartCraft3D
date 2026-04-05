@@ -45,24 +45,34 @@ _FOUR_VIEWS = [
     {"yaw": 3*math.pi/2, "pitch": 0.3, "radius": 2.5, "fov": 1.047},
 ]
 
+# 3-view optimal coverage: front + right-back + high overview.
+# - View 1 (0°, 0.45 rad ≈ 26°): front + sides, slight overhead
+# - View 2 (120°, 0.45 rad):      right-back, same elevation
+# - View 3 (240°, 1.1 rad ≈ 63°): left-back, high overhead → top surface
+_THREE_VIEWS = [
+    {"yaw": 0,              "pitch": 0.45, "radius": 2.5, "fov": 1.047},
+    {"yaw": 2*math.pi/3,    "pitch": 0.45, "radius": 2.5, "fov": 1.047},
+    {"yaw": 4*math.pi/3,    "pitch": 1.1,  "radius": 2.5, "fov": 1.047},
+]
+
 
 # ---------------------------------------------------------------------------
-# Blender 4-view rendering
+# Blender multi-view rendering
 # ---------------------------------------------------------------------------
 
-def render_4views(mesh_path: str, resolution: int = 512,
+def _render_views(mesh_path: str, views: list[dict], resolution: int = 512,
                   blender_path: str = "blender",
                   bg_color: tuple = (1.0, 1.0, 1.0)) -> list[np.ndarray]:
-    """Render 4 orthogonal views of a mesh via Blender Cycles.
+    """Render arbitrary views of a mesh via Blender Cycles.
 
-    Returns list of 4 (H, W, 3) uint8 numpy arrays (RGB).
+    Returns list of (H, W, 3) uint8 numpy arrays (RGB).
     """
     with tempfile.TemporaryDirectory() as tmp_dir:
         cmd = [
             blender_path, "-b", "-P", str(_BLENDER_RENDER_SCRIPT), "--",
             "--object", str(mesh_path),
             "--output_folder", tmp_dir,
-            "--views", json.dumps(_FOUR_VIEWS),
+            "--views", json.dumps(views),
             "--resolution", str(resolution),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -73,7 +83,7 @@ def render_4views(mesh_path: str, resolution: int = 512,
                 f"Blender render failed (exit {result.returncode}) for {mesh_path}")
 
         images = []
-        for i in range(4):
+        for i in range(len(views)):
             png_path = os.path.join(tmp_dir, f"{i:03d}.png")
             if not os.path.exists(png_path):
                 raise FileNotFoundError(f"Render output not found: {png_path}")
@@ -93,6 +103,26 @@ def render_4views(mesh_path: str, resolution: int = 512,
             images.append(img)
 
     return images
+
+
+def render_3views(mesh_path: str, resolution: int = 512,
+                  blender_path: str = "blender",
+                  bg_color: tuple = (1.0, 1.0, 1.0)) -> list[np.ndarray]:
+    """Render 3 optimal-coverage views of a mesh via Blender Cycles.
+
+    Returns list of 3 (H, W, 3) uint8 numpy arrays (RGB).
+    """
+    return _render_views(mesh_path, _THREE_VIEWS, resolution, blender_path, bg_color)
+
+
+def render_4views(mesh_path: str, resolution: int = 512,
+                  blender_path: str = "blender",
+                  bg_color: tuple = (1.0, 1.0, 1.0)) -> list[np.ndarray]:
+    """Render 4 orthogonal views of a mesh via Blender Cycles.
+
+    Returns list of 4 (H, W, 3) uint8 numpy arrays (RGB).
+    """
+    return _render_views(mesh_path, _FOUR_VIEWS, resolution, blender_path, bg_color)
 
 
 # ---------------------------------------------------------------------------

@@ -94,14 +94,18 @@ def _load_existing_scores(path: Path) -> dict[str, dict]:
 
 # ─── Rendering ─────────────────────────────────────────────────────
 
+# Import 3-view angles from the single source of truth.
+from partcraft.phase3_filter.vlm_filter import _VLM_YAWS, _VLM_PITCHES
+
+
 def _render_ply_pair(
     edit_id: str,
     shard: str,
     output_root: Path,
     blender_path: str,
-    num_views: int = 4,
+    num_views: int = 3,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Render deletion edit from PLY via Blender."""
+    """Render deletion edit from PLY via Blender (3 optimal-coverage views)."""
     mesh_dir = (
         output_root / f"shard_{shard}" / f"mesh_pairs_shard{shard}" / edit_id
     )
@@ -114,10 +118,10 @@ def _render_ply_pair(
     vis_dir = str(_PROJECT_ROOT / "scripts" / "vis")
     if vis_dir not in sys.path:
         sys.path.insert(0, vis_dir)
-    from render_ply_pairs import render_4views  # noqa: E402
+    from render_ply_pairs import render_3views  # noqa: E402
 
-    before_imgs = render_4views(str(before_ply), blender_path=blender_path)
-    after_imgs = render_4views(str(after_ply), blender_path=blender_path)
+    before_imgs = render_3views(str(before_ply), blender_path=blender_path)
+    after_imgs = render_3views(str(after_ply), blender_path=blender_path)
     return before_imgs[:num_views], after_imgs[:num_views]
 
 
@@ -125,9 +129,9 @@ def _render_slat_views(
     pipeline,
     npz_path: Path,
     device: str,
-    num_views: int = 4,
+    num_views: int = 3,
 ) -> list[np.ndarray]:
-    """Load NPZ → SparseTensor → TRELLIS decode → Gaussian → render."""
+    """Load NPZ → SparseTensor → TRELLIS decode → Gaussian → render (3 views)."""
     from trellis.modules.sparse.basic import SparseTensor
     from trellis.utils import render_utils
 
@@ -139,8 +143,8 @@ def _render_slat_views(
     outputs = pipeline.decode_slat(slat, ["gaussian"])
     gaussian = outputs["gaussian"][0]
 
-    yaws = torch.linspace(0, 2 * np.pi, num_views + 1)[:-1].tolist()
-    pitches = [0.45] * num_views
+    yaws = _VLM_YAWS[:num_views]
+    pitches = _VLM_PITCHES[:num_views]
     imgs = render_utils.Trellis_render_multiview_images(
         gaussian, yaws, pitches
     )["color"]
@@ -189,6 +193,9 @@ def _score_one(
     score.visual_quality = int(result.get("visual_quality", 0))
     score.artifact_free = bool(result.get("artifact_free", False))
     score.reason = result.get("reason", "")
+    score.prompt_quality = int(result.get("prompt_quality", 0))
+    score.improved_prompt = str(result.get("improved_prompt", ""))
+    score.improved_after_desc = str(result.get("improved_after_desc", ""))
     score.score = compute_composite_score(score)
     score.quality_tier = classify_tier(score)
     return score
@@ -395,7 +402,7 @@ def main():
         default="/Node11_nvme/artgen/lac/.tools/"
         "blender-4.2.0-linux-x64/blender",
     )
-    parser.add_argument("--num-views", type=int, default=4)
+    parser.add_argument("--num-views", type=int, default=3)
     parser.add_argument(
         "--render-cache",
         default=None,

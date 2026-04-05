@@ -386,14 +386,47 @@ for batch in loader:
 
 对 `repack_to_object_dirs.py` 产出的 object-centric 训练数据进行质量过滤。
 
-### 过滤架构（2026-04-05 精简）
+### 推荐流程（2026-04-05 对齐：先清洗后编码）
+
+Step4 产出平铺 `mesh_pairs/` 后，推荐按以下顺序执行：
+
+```
+Step4 flat mesh_pairs/
+  ↓
+repack（object-centric，deletion 此时只有 PLY，无 after.npz）
+  ↓
+Phase 1（mod/scl/mat/glb 旧 SLAT → NPZ，与 deletion 无关）
+  ↓
+VLM 统一清洗（deletion 用 PLY→Blender，其他用 NPZ→TRELLIS Gaussian）
+  ↓
+Phase 5（只 encode 通过清洗的 deletion → SLAT+SS，--include-list 过滤）
+  ↓
+Phase 3/4（addition backfill + identity backfill）
+```
+
+**核心优势**：Phase 5（Blender 40 views + DINOv2 + SLAT enc + SS enc）是最贵的步骤，先清洗可跳过被过滤的 deletion，节省 30-40% 编码量。
+
+### 过滤架构（2026-04-05 统一 VLM prompt + 3-view）
 
 **主路径：VLM 清洗**（`scripts/tools/run_vlm_cleaning.py`）
-- 渲染 before/after 4 视角对比图 → Qwen VLM 结构化评分 → tier 分类
-- 5 维评分：edit_executed、correct_region、preserve_other、visual_quality、artifact_free
+- 渲染 before/after **3 视角**对比图 → Qwen VLM 结构化评分 → tier 分类
+- **8 维评分**（统一 prompt，`partcraft/phase3_filter/vlm_filter.py:build_judge_prompt`）：
+  - Part 1 编辑质量：edit_executed、correct_region、preserve_other、visual_quality、artifact_free
+  - Part 2 Prompt 质量：prompt_quality (1-5)、improved_prompt、improved_after_desc
 - 两种渲染路径：PLY → Blender（deletion）/ NPZ → TRELLIS Gaussian（其他类型）
+- 空 prompt 时 VLM 从图像推断编辑内容并生成 prompt
 - 核心函数在 `partcraft/phase3_filter/vlm_filter.py`
 - Mesh prefilter 函数在 `partcraft/phase3_filter/_mesh_metrics.py`（内部模块）
+
+**3-view 最优覆盖角度**（Blender 与 TRELLIS Gaussian 统一）：
+
+| 视角 | Yaw | Pitch | 覆盖 |
+|------|-----|-------|------|
+| 1 | 0° | 26° (0.45 rad) | 正前 + 两侧 |
+| 2 | 120° | 26° (0.45 rad) | 右后方 |
+| 3 | 240° | 63° (1.1 rad) | 左后方 + 顶部 |
+
+定义：`render_ply_pairs.py:_THREE_VIEWS`、`vlm_filter.py:_VLM_YAWS/_VLM_PITCHES`
 
 **备用路径：计算型清洗**（`scripts/tools/run_cleaning.py`，无 GPU 时可用）
 1. **Layer 1（NPZ 健全性）**：`partcraft/cleaning/npz_checks.py`
@@ -413,21 +446,27 @@ for batch in loader:
 | **1** | 旧 `*_slat/` → NPZ 转换 | mod/scale/mat/glb 的旧 `feats.pt+coords.pt` → 编码 SS → 写 NPZ | GPU（SS encoder） |
 | **3** | Addition backfill | 复制 deletion 的 `before.npz` ↔ `after.npz` 互换（硬链接） | CPU |
 | **4** | Identity backfill | 硬链接同物体已有 `before.npz` 作为 before 和 after | CPU |
-| **5** | **Deletion PLY → SLAT+SS 重编码** | 仅 deletion 的 `after.ply` | GPU（Blender + DINOv2 + SLAT enc + SS enc） |
+| **5** | **Deletion PLY → SLAT+SS 重编码** | 仅 deletion 的 `after.ply`，支持 `--include-list` 过滤 | GPU（Blender + DINOv2 + SLAT enc + SS enc） |
 
-推荐执行：`--phase 1,3,4,5`。
+推荐执行顺序：Phase 1 → VLM 清洗 → Phase 5（仅通过的 deletion）→ Phase 3,4。
 
 ```bash
-# 旧格式转换 + addition/identity 回填 + deletion 重编码
+# Phase 1：旧格式转换（清洗前）
 python scripts/tools/migrate_slat_to_npz.py \
     --config configs/partverse_node39_shard01.yaml \
     --mesh-pairs outputs/partverse/shard_01/mesh_pairs_shard01 \
     --specs-jsonl outputs/partverse/shard_01/cache/phase1/edit_specs_shard01.jsonl \
-    --phase 1,3,4,5 \
-    --blender-path /path/to/blender --dino-views 40
+    --phase 1
 
-# 多 GPU 并行（推荐）
-GPUS=0,3,4,5,6,7 SHARD=01 bash scripts/tools/run_phase5_multi_gpu.sh
+# VLM 清洗（见下方）→ 产出通过的 deletion 列表
+
+# Phase 5：只编码通过清洗的 deletion
+python scripts/tools/migrate_slat_to_npz.py \
+    --phase 5 --include-list passed_deletion_ids.txt \
+    --blender-path /path/to/blender --dino-views 40 ...
+
+# Phase 3,4：addition/identity backfill
+python scripts/tools/migrate_slat_to_npz.py --phase 3,4 ...
 ```
 
 ### VLM 清洗 `run_vlm_cleaning.py`
@@ -438,17 +477,28 @@ GPUS=0,3,4,5,6,7 SHARD=01 bash scripts/tools/run_phase5_multi_gpu.sh
 
 | 类型 | 渲染路径 | 是否需要 TRELLIS GPU | 备注 |
 |------|---------|---------------------|------|
-| **deletion** | PLY → Blender 4 views | 否（Blender CPU/GPU） | before.ply + after.ply 均有真实网格 |
+| **deletion** | PLY → Blender 3 views | 否（Blender CPU/GPU） | before.ply + after.ply 均有真实网格 |
 | **addition** | 不评（继承 deletion 分数） | — | before/after 互换，质量等价 |
-| **modification** | NPZ → TRELLIS decode → Gaussian render | 是 | PLY 是点云（0 面），无法 Blender 渲染 |
+| **modification** | NPZ → TRELLIS decode → Gaussian 3 views | 是 | PLY 是点云（0 面），无法 Blender 渲染 |
 | **scale** | 同 modification | 是 | |
 | **material** | 同 modification | 是 | |
 | **global** | 同 modification | 是 | |
 | **identity** | 不评（自动 high） | — | 引用同一 `original.npz` |
 
-**评分维度**（复用 `partcraft/phase3_filter/vlm_filter.py`）：
-- `edit_executed` / `correct_region` / `preserve_other` / `visual_quality` / `artifact_free`
-- 加权合成 → tier 分类（high / medium / low / negative / rejected）
+**评分维度**（统一 prompt，`partcraft/phase3_filter/vlm_filter.py`）：
+
+| 维度 | 类型 | 说明 |
+|------|------|------|
+| `edit_executed` | bool | 编辑是否可见地发生 |
+| `correct_region` | bool | 是否修改了正确部件 |
+| `preserve_other` | bool | 其他部分是否完好 |
+| `visual_quality` | 1-5 | AFTER 模型视觉质量 |
+| `artifact_free` | bool | 无浮块/破面/缺失 |
+| `prompt_quality` | 1-5 | edit_prompt 与视觉变化的匹配度 |
+| `improved_prompt` | str | VLM 改写的更精确的 edit_prompt |
+| `improved_after_desc` | str | VLM 描述的 AFTER 物体 |
+
+加权合成 → tier 分类（high / medium / low / negative / rejected）。
 
 **运行方式**：
 
@@ -458,7 +508,7 @@ conda activate qwen_test
 CUDA_VISIBLE_DEVICES=0 VLM_MODEL=/Node11_nvme/zsn/checkpoints/Qwen3.5-27B \
     bash scripts/tools/launch_local_vlm.sh
 
-# 2a. 仅 deletion（无需 TRELLIS，快）
+# 2a. 仅 deletion（无需 TRELLIS，快，推荐先跑）
 python scripts/tools/run_vlm_cleaning.py \
     --root outputs/partverse/partverse_pairs \
     --output-root outputs/partverse \
@@ -474,7 +524,7 @@ CUDA_VISIBLE_DEVICES=3 python scripts/tools/run_vlm_cleaning.py \
 GPUS=3,4,5,6,7 SHARD=01 bash scripts/tools/run_vlm_cleaning_multi_gpu.sh
 ```
 
-**resume 支持**：评分增量写入 `vlm_scores.jsonl`，重启自动跳过已评项。渲染结果缓存在 `_vlm_render_cache/`。
+**resume 支持**：评分增量写入 `vlm_scores.jsonl`（含 `improved_prompt` / `improved_after_desc`），重启自动跳过已评项。渲染结果缓存在 `_vlm_render_cache/`。
 
 ### 其他入口（仍可用）
 
@@ -483,7 +533,7 @@ GPUS=3,4,5,6,7 SHARD=01 bash scripts/tools/run_vlm_cleaning_multi_gpu.sh
 
 ### 输出
 
-每个 `shard_XX/{obj_id}/` 下追加 `quality.json`；全局产出 `manifest_clean.jsonl`、`manifest_tiered.jsonl`、`cleaning_summary.json`。
+每个 `shard_XX/{obj_id}/` 下追加 `quality.json`；全局产出 `manifest_clean.jsonl`、`manifest_tiered.jsonl`、`cleaning_summary.json`。`vlm_scores.jsonl` 中的 `improved_prompt` 和 `improved_after_desc` 可直接用于替换原始 prompt。
 
 ### 训练侧集成
 

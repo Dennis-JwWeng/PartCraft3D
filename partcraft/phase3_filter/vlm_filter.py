@@ -21,6 +21,7 @@ import base64
 import io
 import json
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass, asdict
@@ -44,6 +45,8 @@ __all__ = [
     "build_judge_prompt",
     "evaluate_edit_from_ply",
     "evaluate_edit_from_slat_dir",
+    "_VLM_YAWS",
+    "_VLM_PITCHES",
 ]
 
 # Mesh prefilter: full ``evaluate_pair`` (volume / edit ratio / …) only for types
@@ -68,6 +71,9 @@ class VLMScore:
     visual_quality: int = 0        # 1-5
     artifact_free: bool = False
     reason: str = ""
+    prompt_quality: int = 0        # 1-5: how well edit_prompt matches the visual change
+    improved_prompt: str = ""      # VLM-suggested edit_prompt (always filled)
+    improved_after_desc: str = ""  # VLM-suggested after_desc (always filled)
     score: float = 0.0             # composite [0, 1]
     quality_tier: str = "rejected" # "high" / "medium" / "low" / "negative" / "rejected"
 
@@ -148,16 +154,31 @@ def load_slat(slat_dir: Path, device: str = "cuda"):
     return sp.SparseTensor(feats=feats.to(device), coords=coords.to(device))
 
 
-def render_views(pipeline, slat, num_views: int = 4,
+# 3-view optimal coverage angles (shared with run_vlm_cleaning).
+# View 1 (0°, 26°): front + sides;  View 2 (120°, 26°): right-back;
+# View 3 (240°, 63°): left-back + top surface.
+_VLM_YAWS   = [0.0, 2 * math.pi / 3, 4 * math.pi / 3]
+_VLM_PITCHES = [0.45, 0.45, 1.1]
+
+
+def render_views(pipeline, slat, num_views: int = 3,
                  pitch: float = 0.45) -> list[np.ndarray]:
-    """Render multiview images from SLAT via pipeline.decode_slat → Gaussian."""
+    """Render multiview images from SLAT via pipeline.decode_slat → Gaussian.
+
+    Default 3 views use the optimal-coverage angles (_VLM_YAWS / _VLM_PITCHES).
+    If *num_views* differs from 3, falls back to uniform yaw with constant pitch.
+    """
     from trellis.utils import render_utils
     outputs = pipeline.decode_slat(slat, ['gaussian'])
     gaussian = outputs['gaussian'][0]
-    yaws = torch.linspace(0, 2 * np.pi, num_views + 1)[:-1]
-    pitches = torch.tensor([pitch] * num_views)
+    if num_views == 3:
+        yaws = _VLM_YAWS
+        pitches = _VLM_PITCHES
+    else:
+        yaws = torch.linspace(0, 2 * math.pi, num_views + 1)[:-1].tolist()
+        pitches = [pitch] * num_views
     imgs = render_utils.Trellis_render_multiview_images(
-        gaussian, yaws.tolist(), pitches.tolist())['color']
+        gaussian, yaws, pitches)['color']
     return imgs
 
 
@@ -207,12 +228,13 @@ def compose_comparison(before_imgs: list[np.ndarray],
 
 def render_ply_views(
     ply_path: str | Path,
-    num_views: int = 4,
+    num_views: int = 3,
     blender_path: str = "blender",
     resolution: int = 512,
 ) -> list[np.ndarray]:
     """Render multiview images from a PLY mesh via Blender.
 
+    Default 3 views use optimal-coverage angles.
     Returns list of (H, W, 3) uint8 numpy arrays — same format as
     ``render_views()`` for drop-in compatibility.
     """
@@ -221,12 +243,16 @@ def render_ply_views(
     vis_dir = str(_project_root / "scripts" / "vis")
     if vis_dir not in sys.path:
         sys.path.insert(0, vis_dir)
-    from render_ply_pairs import render_4views  # noqa: E402
+    from render_ply_pairs import render_3views, render_4views  # noqa: E402
 
-    imgs = render_4views(str(ply_path), resolution=resolution,
-                         blender_path=blender_path)
-    if num_views < len(imgs):
-        imgs = imgs[:num_views]
+    if num_views == 3:
+        imgs = render_3views(str(ply_path), resolution=resolution,
+                             blender_path=blender_path)
+    else:
+        imgs = render_4views(str(ply_path), resolution=resolution,
+                             blender_path=blender_path)
+        if num_views < len(imgs):
+            imgs = imgs[:num_views]
     return imgs
 
 
@@ -245,7 +271,7 @@ def evaluate_edit_from_ply(
     vlm_client,
     vlm_model: str,
     *,
-    num_views: int = 4,
+    num_views: int = 3,
     blender_path: str = "blender",
     vlm_max_tokens: int = 4096,
     vlm_json_object_mode: bool = False,
@@ -293,7 +319,7 @@ def evaluate_edit_from_slat_dir(
     vlm_client,
     vlm_model: str,
     *,
-    num_views: int = 4,
+    num_views: int = 3,
     device: str = "cuda",
     vlm_max_tokens: int = 4096,
     vlm_json_object_mode: bool = False,
@@ -331,7 +357,13 @@ def build_judge_prompt(edit_prompt: str, edit_type: str,
     """Build the VLM judge prompt.
 
     Public API — reused by partcraft.cleaning for Layer 3 VLM evaluation.
+
+    The prompt asks the VLM to:
+    1. Evaluate edit quality (5 criteria)
+    2. Rate the edit_prompt quality and provide an improved version
     """
+    prompt_section = f'- Edit prompt: "{edit_prompt}"' if edit_prompt.strip() else \
+        "- Edit prompt: (none provided — you MUST infer what happened from the images)"
     return f"""You are a quality judge for 3D object editing.
 
 The image shows two rows of multi-view renders of a 3D object:
@@ -342,23 +374,27 @@ Edit information:
 - Object: {object_desc}
 - Edit type: {edit_type}
 - Target part: {part_label}
-- Edit prompt: "{edit_prompt}"
+{prompt_section}
 
-Evaluate the edit quality. Your entire reply MUST be one JSON object only: no prose,
-no markdown fences, no numbered analysis, no text before or after the object.
-First character must be "{{" and the last must be "}}".
+Your entire reply MUST be one JSON object only: no prose, no markdown fences, no text before or after. First character must be "{{" and the last must be "}}".
+
 Example shape:
-{{"edit_executed":true,"correct_region":true,"preserve_other":true,"visual_quality":4,"artifact_free":true,"reason":"brief explanation"}}
+{{"edit_executed":true,"correct_region":true,"preserve_other":true,"visual_quality":4,"artifact_free":true,"reason":"brief explanation","prompt_quality":3,"improved_prompt":"Remove the red wheel from the car","improved_after_desc":"A blue car without its front wheel"}}
 
-Scoring criteria:
-- edit_executed: Did the described edit visibly happen? (true/false)
+## Part 1: Edit quality (judge the 3D edit result)
+- edit_executed: Did the described edit visibly happen? (true/false). If no prompt was provided, judge whether ANY meaningful edit is visible.
 - correct_region: Was the change applied to the correct part ({part_label})? (true/false)
 - preserve_other: Are all other parts of the object preserved and intact? (true/false)
 - visual_quality: Overall visual quality of the AFTER model (1=terrible, 2=poor, 3=acceptable, 4=good, 5=excellent)
 - artifact_free: Is the AFTER model free of obvious artifacts like floating blobs, broken surfaces, or missing geometry? (true/false)
-- reason: One sentence explaining your assessment
+- reason: One sentence explaining your quality assessment
 
-Be strict but fair. Minor imperfections are acceptable (quality=3-4). Only fail edit_executed if there is NO visible change matching the prompt."""
+## Part 2: Prompt quality (judge and improve the edit prompt)
+- prompt_quality: How well does the edit prompt describe the actual visual change? (1=completely wrong or missing, 2=vague/misleading, 3=roughly correct, 4=accurate, 5=precise and natural)
+- improved_prompt: Write a better edit prompt that precisely describes the visual change you observe. Use natural English, imperative form (e.g. "Remove the ...", "Change the ... to ..."). Always fill this even if the original is good.
+- improved_after_desc: Write a concise description of the AFTER object as seen in the images. Always fill this.
+
+Be strict but fair. Minor imperfections are acceptable (quality=3-4). Only fail edit_executed if there is NO visible change."""
 
 
 def _balanced_brace_object(s: str, start: int) -> str | None:
@@ -454,7 +490,7 @@ def call_vlm_judge(client, model: str, img_bytes: bytes,
                    edit_prompt: str, edit_type: str,
                    object_desc: str, part_label: str,
                    max_retries: int = 4,
-                   max_tokens: int = 4096,
+                   max_tokens: int = 1024,
                    json_object_mode: bool = False) -> dict | None:
     """Call VLM to judge edit quality. Returns parsed JSON or None."""
     import time
@@ -494,9 +530,18 @@ def call_vlm_judge(client, model: str, img_bytes: bytes,
                 "max_tokens": max_tokens,
                 "timeout": 120,
             }
+            # Disable thinking/CoT for models that support it (e.g. Qwen3.5
+            # via SGLang). Silently dropped if the backend doesn't recognise it.
+            create_kw["extra_body"] = {
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
             if json_object_mode and attempt == 0:
                 create_kw["response_format"] = {"type": "json_object"}
             try:
+                resp = client.chat.completions.create(**create_kw)
+            except TypeError:
+                # OpenAI SDK < 1.x or backends that reject extra_body
+                create_kw.pop("extra_body", None)
                 resp = client.chat.completions.create(**create_kw)
             except Exception as e0:
                 if json_object_mode and attempt == 0 and create_kw.pop(
@@ -647,7 +692,7 @@ def evaluate_edit(
     part_label: str,
     vlm_client,
     vlm_model: str,
-    num_views: int = 4,
+    num_views: int = 3,
     device: str = "cuda",
     vlm_max_tokens: int = 4096,
     vlm_json_object_mode: bool = False,
@@ -705,7 +750,7 @@ def run_vlm_filter(
     mesh_pairs_dir: str | Path,
     output_dir: str | Path | None = None,
     limit: int | None = None,
-    num_views: int = 4,
+    num_views: int = 3,
     device: str = "cuda",
 ) -> list[dict]:
     """Run Phase 3 VLM filter on Phase 2.5 edit results.

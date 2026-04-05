@@ -4,6 +4,34 @@
 
 ---
 
+## 2026-04-05 — 统一 VLM 评分 prompt + 3-view 渲染方案
+
+**问题**：
+1. VLM 清洗只评编辑质量（5 维），不评 prompt 质量。shard01/03 的 deletion 有 ~13% 空 prompt + ~0.5% 零部件删除，浪费 VLM 调用且无法修正低质量 prompt。
+2. 4 视角对比图拥挤，VLM 难以看清细节；4 个等高 pitch 视角无法看到物体顶部。
+
+**决策**：
+
+- **统一 prompt**（`vlm_filter.py:build_judge_prompt`）：单次 VLM 调用同时完成质量评分 + prompt 评价 + prompt 改写，零额外成本。分 Part 1（编辑质量 5 维）和 Part 2（prompt 质量 3 维）。空 prompt 时提示 VLM 从图像推断。
+- **3-view 最优覆盖**：(0°, 26°) + (120°, 26°) + (240°, 63°)。前两个视角覆盖正面和右后侧面，第三个高俯角补顶部。Blender 和 TRELLIS Gaussian 使用完全一致的角度。
+
+**新增字段**（`VLMScore`）：
+- `prompt_quality` (1-5)：edit_prompt 与实际视觉变化的匹配度
+- `improved_prompt`：VLM 改写的 edit_prompt（始终填写）
+- `improved_after_desc`：VLM 描述的 AFTER 物体（始终填写）
+
+**代码变更**：
+- `partcraft/phase3_filter/vlm_filter.py`：`VLMScore` 加 3 字段，`build_judge_prompt` 改为双部分统一 prompt，`render_views` / `render_ply_views` 默认 3 views + 最优角度
+- `scripts/tools/run_vlm_cleaning.py`：`_render_ply_pair` 改用 `render_3views`，`_render_slat_views` 使用匹配的 3-view 角度，`_score_one` 捕获新字段
+- `scripts/vis/render_ply_pairs.py`：新增 `_THREE_VIEWS` + `render_3views()` + 通用 `_render_views()`
+
+**先清洗后编码流程**（详见 `ARCH.md`）：
+```
+Step4 → repack → Phase 1 → VLM 清洗 → Phase 5（仅通过的 deletion）→ Phase 3,4
+```
+
+---
+
 ## 2026-04-05 — 代码库精简：消除重复、删除死代码
 
 **问题**：清洗/过滤管线有 3 个独立入口 + 4 套重复指标体系，NPZ 保存和 SS 编码函数在 2 处重复实现，4 个 vis 工具共享 ~300 行重复代码。
