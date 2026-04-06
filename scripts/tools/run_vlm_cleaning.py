@@ -419,6 +419,11 @@ def main():
         help="File listing obj_ids to process (for multi-GPU splitting)",
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--render-only",
+        action="store_true",
+        help="Only render comparison PNGs to cache, skip VLM scoring",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -486,8 +491,14 @@ def main():
             edit = meta["edits"][rec["edit_idx"]]
             edit_id = edit["edit_id"]
 
-            if edit_id in existing:
+            if not args.render_only and edit_id in existing:
                 continue
+
+            # In render-only mode, skip if cache PNG already exists
+            if args.render_only:
+                cache_png = render_cache / f"{edit_id}.png"
+                if cache_png.exists():
+                    continue
 
             entries.append(
                 {
@@ -536,11 +547,14 @@ def main():
         pipeline.to(args.device)
         logger.info("TRELLIS loaded on %s", args.device)
 
-    # ── VLM client ─────────────────────────────────────────────────
-    from openai import OpenAI
-
-    client = OpenAI(base_url=args.vlm_url, api_key="dummy")
-    logger.info("VLM: %s model=%s", args.vlm_url, args.vlm_model)
+    # ── VLM client (skip in render-only mode) ────────────────────
+    client = None
+    if not args.render_only:
+        from openai import OpenAI
+        client = OpenAI(base_url=args.vlm_url, api_key="dummy")
+        logger.info("VLM: %s model=%s", args.vlm_url, args.vlm_model)
+    else:
+        logger.info("Render-only mode — skipping VLM client")
 
     # ── Process ────────────────────────────────────────────────────
     scored = 0
@@ -601,7 +615,12 @@ def main():
                     else:
                         raise ValueError(f"Unsupported type: {etype}")
 
-                    # ── VLM score ──────────────────────────────────
+                    # ── VLM score (skip in render-only mode) ─────
+                    if args.render_only:
+                        scored += 1
+                        pbar.update(1)
+                        continue
+
                     score = _score_one(
                         client,
                         args.vlm_model,

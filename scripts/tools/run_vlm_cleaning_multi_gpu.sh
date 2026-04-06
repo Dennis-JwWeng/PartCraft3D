@@ -36,6 +36,7 @@ ROOT="${ROOT:-outputs/partverse/partverse_pairs}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/partverse}"
 BLENDER_PATH="${BLENDER_PATH:-/Node11_nvme/artgen/lac/.tools/blender-4.2.0-linux-x64/blender}"
 ONLY_TYPES="${ONLY_TYPES:-}"          # e.g. "deletion" or "modification scale material global"
+RENDER_ONLY="${RENDER_ONLY:-}"        # set to "1" to only render comparison PNGs, skip VLM
 NUM_VIEWS="${NUM_VIEWS:-3}"
 VLM_MAX_TOKENS="${VLM_MAX_TOKENS:-1024}"
 TRELLIS_CKPT="${TRELLIS_CKPT:-checkpoints/TRELLIS-image-large}"
@@ -111,10 +112,14 @@ for i in "${!GPU_ARRAY[@]}"; do
         continue
     fi
 
-    # Build --only-types argument
+    # Build optional arguments
     ONLY_TYPES_ARG=""
     if [ -n "$ONLY_TYPES" ]; then
         ONLY_TYPES_ARG="--only-types $ONLY_TYPES"
+    fi
+    RENDER_ONLY_ARG=""
+    if [ -n "$RENDER_ONLY" ]; then
+        RENDER_ONLY_ARG="--render-only"
     fi
 
     WORKER_VLM_URL="${VLM_URL_ARRAY[$i]:-$VLM_URL}"
@@ -133,7 +138,7 @@ for i in "${!GPU_ARRAY[@]}"; do
         --include-objects "$CHUNK_FILE" \
         --scores-file "$SCORES_FILE" \
         --render-cache "$RENDER_CACHE" \
-        $ONLY_TYPES_ARG \
+        $ONLY_TYPES_ARG $RENDER_ONLY_ARG \
         > "$LOG_FILE" 2>&1 &
 
     PIDS+=($!)
