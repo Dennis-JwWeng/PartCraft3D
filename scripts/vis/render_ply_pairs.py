@@ -45,24 +45,34 @@ _FOUR_VIEWS = [
     {"yaw": 3*math.pi/2, "pitch": 0.3, "radius": 2.5, "fov": 1.047},
 ]
 
+# 3-view optimal coverage: front + right-back + high overview.
+# - View 1 (0°, 0.45 rad ≈ 26°): front + sides, slight overhead
+# - View 2 (120°, 0.45 rad):      right-back, same elevation
+# - View 3 (240°, 1.1 rad ≈ 63°): left-back, high overhead → top surface
+_THREE_VIEWS = [
+    {"yaw": 0,              "pitch": 0.45, "radius": 2.5, "fov": 1.047},
+    {"yaw": 2*math.pi/3,    "pitch": 0.45, "radius": 2.5, "fov": 1.047},
+    {"yaw": 4*math.pi/3,    "pitch": 1.1,  "radius": 2.5, "fov": 1.047},
+]
+
 
 # ---------------------------------------------------------------------------
-# Blender 4-view rendering
+# Blender multi-view rendering
 # ---------------------------------------------------------------------------
 
-def render_4views(mesh_path: str, resolution: int = 512,
+def _render_views(mesh_path: str, views: list[dict], resolution: int = 512,
                   blender_path: str = "blender",
                   bg_color: tuple = (1.0, 1.0, 1.0)) -> list[np.ndarray]:
-    """Render 4 orthogonal views of a mesh via Blender Cycles.
+    """Render arbitrary views of a mesh via Blender Cycles.
 
-    Returns list of 4 (H, W, 3) uint8 numpy arrays (RGB).
+    Returns list of (H, W, 3) uint8 numpy arrays (RGB).
     """
     with tempfile.TemporaryDirectory() as tmp_dir:
         cmd = [
             blender_path, "-b", "-P", str(_BLENDER_RENDER_SCRIPT), "--",
             "--object", str(mesh_path),
             "--output_folder", tmp_dir,
-            "--views", json.dumps(_FOUR_VIEWS),
+            "--views", json.dumps(views),
             "--resolution", str(resolution),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -73,7 +83,7 @@ def render_4views(mesh_path: str, resolution: int = 512,
                 f"Blender render failed (exit {result.returncode}) for {mesh_path}")
 
         images = []
-        for i in range(4):
+        for i in range(len(views)):
             png_path = os.path.join(tmp_dir, f"{i:03d}.png")
             if not os.path.exists(png_path):
                 raise FileNotFoundError(f"Render output not found: {png_path}")
@@ -95,30 +105,31 @@ def render_4views(mesh_path: str, resolution: int = 512,
     return images
 
 
+def render_3views(mesh_path: str, resolution: int = 512,
+                  blender_path: str = "blender",
+                  bg_color: tuple = (1.0, 1.0, 1.0)) -> list[np.ndarray]:
+    """Render 3 optimal-coverage views of a mesh via Blender Cycles.
+
+    Returns list of 3 (H, W, 3) uint8 numpy arrays (RGB).
+    """
+    return _render_views(mesh_path, _THREE_VIEWS, resolution, blender_path, bg_color)
+
+
+def render_4views(mesh_path: str, resolution: int = 512,
+                  blender_path: str = "blender",
+                  bg_color: tuple = (1.0, 1.0, 1.0)) -> list[np.ndarray]:
+    """Render 4 orthogonal views of a mesh via Blender Cycles.
+
+    Returns list of 4 (H, W, 3) uint8 numpy arrays (RGB).
+    """
+    return _render_views(mesh_path, _FOUR_VIEWS, resolution, blender_path, bg_color)
+
+
 # ---------------------------------------------------------------------------
 # Image composition
 # ---------------------------------------------------------------------------
 
-def make_text_bar(text: str, width: int, bar_height: int = 48,
-                  bg_color: tuple = (30, 30, 30),
-                  fg_color: tuple = (255, 255, 255)) -> np.ndarray:
-    bar = np.full((bar_height, width, 3), bg_color, dtype=np.uint8)
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    # Truncate if too long
-    max_chars = width // 10
-    display = text[:max_chars] + ("..." if len(text) > max_chars else "")
-    cv2.putText(bar, display, (10, 32), font, 0.6, fg_color, 1, cv2.LINE_AA)
-    return bar
-
-
-def make_label_bar(label: str, width: int, height: int = 28,
-                   bg_color: tuple = (240, 240, 240),
-                   fg_color: tuple = (40, 40, 40)) -> np.ndarray:
-    bar = np.full((height, width, 3), bg_color, dtype=np.uint8)
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    tw = cv2.getTextSize(label, font, 0.6, 2)[0][0]
-    cv2.putText(bar, label, ((width - tw) // 2, 20), font, 0.6, fg_color, 2, cv2.LINE_AA)
-    return bar
+from _vis_common import make_text_bar, make_label_bar  # noqa: E402
 
 
 def compose_comparison(before_views: list[np.ndarray],

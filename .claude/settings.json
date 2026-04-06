@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /Node11_nvme/wjw/3D_Editing/PartCraft3D/outputs/partverse/shard_01/ -name *.jsonl -o -name *.json)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(cat /Node11_nvme/wjw/3D_Editing/PartCraft3D/outputs/partverse/shard_01/cache/phase2_5/edit_results_shard01_gpu*.jsonl /Node11_nvme/wjw/3D_Editing/PartCraft3D/outputs/partverse/shard_01/cache/phase2_5/edit_results_shard01_nongpu.jsonl)"
+    ]
+  }
+}

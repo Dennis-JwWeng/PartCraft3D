@@ -126,48 +126,23 @@ def build_prompt_text(entry: dict) -> str:
         return f"[{etype.upper()}] {obj_desc}"
 
 
+from _vis_common import make_text_bar, make_label_bar  # noqa: E402
+
+
 def add_text_bar(frame: np.ndarray, text: str, bar_height: int = 50) -> np.ndarray:
     """Add a prompt text bar on top of the frame."""
-    h, w, _ = frame.shape
-    bar = np.ones((bar_height, w, 3), dtype=np.uint8) * 30
-
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.50
-    max_chars = w // 7
-    lines = []
-    remaining = text
-    while remaining:
-        if len(remaining) <= max_chars:
-            lines.append(remaining)
-            break
-        split = remaining[:max_chars].rfind(" ")
-        if split <= 0:
-            split = max_chars
-        lines.append(remaining[:split])
-        remaining = remaining[split:].strip()
-
-    y = 16
-    for line in lines[:3]:
-        cv2.putText(bar, line, (8, y), font, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
-        y += 16
-
+    _, w, _ = frame.shape
+    bar = make_text_bar(text, w, bar_height=bar_height)
     return np.vstack([bar, frame])
 
 
 def add_labels(before_frame: np.ndarray, after_frame: np.ndarray,
                label_height: int = 30) -> tuple[np.ndarray, np.ndarray]:
-    """Add 'Before' / 'After' labels at the bottom."""
-    h, w, _ = before_frame.shape
-    for frame, label in [(before_frame, "Before"), (after_frame, "After")]:
-        bar = np.ones((label_height, w, 3), dtype=np.uint8) * 240
-        tw = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0][0]
-        cv2.putText(bar, label, ((w - tw) // 2, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 40, 40), 2, cv2.LINE_AA)
-        if label == "Before":
-            before_frame = np.vstack([bar, frame])
-        else:
-            after_frame = np.vstack([bar, frame])
-    return before_frame, after_frame
+    """Add 'Before' / 'After' labels at the top."""
+    _, w, _ = before_frame.shape
+    b_bar = make_label_bar("Before", w, height=label_height)
+    a_bar = make_label_bar("After", w, height=label_height)
+    return np.vstack([b_bar, before_frame]), np.vstack([a_bar, after_frame])
 
 
 def generate_video(entry: dict, output_path: str,

@@ -1,4 +1,7 @@
 from typing import *
+import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -7,6 +10,32 @@ import open3d as o3d
 from .base import Pipeline
 from . import samplers
 from ..modules import sparse as sp
+
+
+def _resolve_clip_pretrained_id(name: str) -> str:
+    """Use local ``checkpoints/clip-vit-large-patch14`` when Hub is unreachable.
+
+    Resolves ``openai/clip-vit-large-patch14`` to a directory that contains
+    ``config.json`` (and weights), so streaming works offline after a one-time
+    download. Override with env ``PARTCRAFT_CLIP_MODEL_DIR``.
+    """
+    if os.path.isdir(name) and (Path(name) / "config.json").is_file():
+        return name
+    hub = "openai/clip-vit-large-patch14"
+    if name != hub:
+        return name
+    env_p = os.environ.get("PARTCRAFT_CLIP_MODEL_DIR", "").strip()
+    if env_p:
+        p = Path(env_p)
+        if p.is_dir() and (p / "config.json").is_file():
+            return str(p)
+    # PartCraft3D/third_party/trellis/pipelines/this_file.py -> repo root
+    root = Path(__file__).resolve().parents[3]
+    local = root / "checkpoints" / "clip-vit-large-patch14"
+    if (local / "config.json").is_file():
+        return str(local.resolve())
+    return name
+
 
 class TrellisTextTo3DPipeline(Pipeline):
     """
@@ -66,7 +95,7 @@ class TrellisTextTo3DPipeline(Pipeline):
         """
         Initialize the text conditioning model.
         """
-        # load model
+        name = _resolve_clip_pretrained_id(name)
         model = CLIPTextModel.from_pretrained(name)
         tokenizer = AutoTokenizer.from_pretrained(name)
         model.eval()

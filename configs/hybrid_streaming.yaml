@@ -1,4 +1,9 @@
 # PartCraft3D Configuration — Hybrid Streaming
+#
+# TRELLIS weights: default under project checkpoints/ (see ckpt_root).
+#
+ckpt_root: "checkpoints"
+
 # Image editing: local GPU (FLUX.2-klein-9B via diffusers HTTP server, 4-step)
 # VLM calls:     remote API (Gemini 2.5 Flash)
 # Mode:          --streaming (per-object full pipeline, no cross-object swaps)
@@ -24,7 +29,7 @@ phase0:
   vlm_model: "gemini-3.1-flash-lite-preview"
   vlm_base_url: "https://llm-api.mmchat.xyz/v1"
   vlm_api_key: "sk-live-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJNZXRhQ2hhdCIsInN1YiI6IjY5YWViNjBjMTk2MzA4YzNlNDJiZTlhYyIsImNsaWVudF9pZCI6IjdmZGFkZDY1MDM5MGU0ZDZiZTg3OGQ0NzFiNGFkMjY5IiwiaWF0IjoxNzczMDYwODE1fQ.gohorU2KohC_lBq2DzGG9S4oGnIVbhB9R-g4nIVlwKA"
-  views_for_labeling: [0, 10, 20, 30]
+  views_for_labeling: [32, 33, 34, 35]
   max_workers: 8
   batch_size: 50
   cache_dir: "cache/phase0"

@@ -21,6 +21,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -46,6 +47,8 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if cfg.get("ckpt_root"):
+        os.environ.setdefault("PARTCRAFT_CKPT_ROOT", cfg["ckpt_root"])
     logger = setup_logging(cfg, "reconstruct")
     p25_cfg = cfg.get("phase2_5", {})
 
@@ -110,6 +113,7 @@ def main():
     refiner = TrellisRefiner(
         device="cuda",
         cache_dir=str(cache_dir),
+        ckpt_dir=cfg.get("ckpt_root"),
     )
     refiner.load_models()
 

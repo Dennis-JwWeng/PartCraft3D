@@ -9,6 +9,12 @@ import glob
 
 """=============== BLENDER ==============="""
 
+def _ply_import_op():
+    """Blender 4.x moved PLY import to bpy.ops.wm.ply_import."""
+    if hasattr(bpy.ops.wm, 'ply_import'):
+        return bpy.ops.wm.ply_import
+    return bpy.ops.import_mesh.ply
+
 IMPORT_FUNCTIONS: Dict[str, Callable] = {
     "obj": bpy.ops.import_scene.obj,
     "glb": bpy.ops.import_scene.gltf,
@@ -18,7 +24,7 @@ IMPORT_FUNCTIONS: Dict[str, Callable] = {
     "stl": bpy.ops.import_mesh.stl,
     "usda": bpy.ops.import_scene.usda,
     "dae": bpy.ops.wm.collada_import,
-    "ply": bpy.ops.import_mesh.ply,
+    "ply": _ply_import_op(),
     "abc": bpy.ops.wm.alembic_import,
     "blend": bpy.ops.wm.append,
 }
@@ -50,7 +56,7 @@ def init_render(engine='CYCLES', resolution=512, geo_mode=False):
     bpy.context.scene.cycles.glossy_bounces = 1
     bpy.context.scene.cycles.transparent_max_bounces = 3 if not geo_mode else 0
     bpy.context.scene.cycles.transmission_bounces = 3 if not geo_mode else 1
-    bpy.context.scene.cycles.use_denoising = True
+    bpy.context.scene.cycles.use_denoising = False
         
     bpy.context.preferences.addons['cycles'].preferences.get_devices()
     bpy.context.preferences.addons['cycles'].preferences.compute_device_type = 'CUDA'
@@ -458,29 +464,36 @@ def main(arg):
     }
     views = json.loads(arg.views)
     for i, view in enumerate(views):
+        # Always set camera position — needed for transform matrix even when skipping
         cam.location = (
             view['radius'] * np.cos(view['yaw']) * np.cos(view['pitch']),
             view['radius'] * np.sin(view['yaw']) * np.cos(view['pitch']),
             view['radius'] * np.sin(view['pitch'])
         )
         cam.data.lens = 16 / np.tan(view['fov'] / 2)
-        
-        if arg.save_depth:
-            spec_nodes['depth_map'].inputs[1].default_value = view['radius'] - 0.5 * np.sqrt(3)
-            spec_nodes['depth_map'].inputs[2].default_value = view['radius'] + 0.5 * np.sqrt(3)
-        
-        bpy.context.scene.render.filepath = os.path.join(arg.output_folder, f'{i:03d}.png')
-        for name, output in outputs.items():
-            output.file_slots[0].path = os.path.join(arg.output_folder, f'{i:03d}_{name}')
-            
-        # Render the scene
-        bpy.ops.render.render(write_still=True)
-        bpy.context.view_layer.update()
-        for name, output in outputs.items():
-            ext = EXT[output.format.file_format]
-            path = glob.glob(f'{output.file_slots[0].path}*.{ext}')[0]
-            os.rename(path, f'{output.file_slots[0].path}.{ext}')
-            
+
+        out_png = os.path.join(arg.output_folder, f'{i:03d}.png')
+        if not os.path.exists(out_png):
+            if arg.save_depth:
+                spec_nodes['depth_map'].inputs[1].default_value = view['radius'] - 0.5 * np.sqrt(3)
+                spec_nodes['depth_map'].inputs[2].default_value = view['radius'] + 0.5 * np.sqrt(3)
+
+            bpy.context.scene.render.filepath = out_png
+            for name, output in outputs.items():
+                output.file_slots[0].path = os.path.join(arg.output_folder, f'{i:03d}_{name}')
+
+            # Render the scene
+            bpy.ops.render.render(write_still=True)
+            bpy.context.view_layer.update()
+            for name, output in outputs.items():
+                ext = EXT[output.format.file_format]
+                path = glob.glob(f'{output.file_slots[0].path}*.{ext}')[0]
+                os.rename(path, f'{output.file_slots[0].path}.{ext}')
+        else:
+            # PNG cached — update view layer so transform matrix is correct
+            print(f"Cached: '{out_png}'")
+            bpy.context.view_layer.update()
+
         # Save camera parameters
         metadata = {
             "file_path": f'{i:03d}.png',
@@ -505,8 +518,28 @@ def main(arg):
         triangulate_meshes()
         print('[INFO] Meshes triangulated.')
         
-        # export ply mesh
-        bpy.ops.export_mesh.ply(filepath=os.path.join(arg.output_folder, 'mesh.ply'))
+        # export ply mesh (API changed in Blender 4.x)
+        ply_path = os.path.join(arg.output_folder, 'mesh.ply')
+        if hasattr(bpy.ops, 'wm') and hasattr(bpy.ops.wm, 'ply_export'):
+            # Blender 4.x: disable non-geometry data to avoid PLY header tokens
+            # (custom attribute names like 'pm0017_00_01') that break Open3D's
+            # RPly parser.
+            try:
+                bpy.ops.wm.ply_export(
+                    filepath=ply_path,
+                    export_selected_objects=False,
+                    export_uv=False,
+                    export_normals=False,
+                    export_colors='NONE',
+                    export_attributes=False,
+                )
+            except Exception as e:
+                # Some builds expose bpy.ops.wm.ply_export symbol but do not
+                # register the operator at runtime. Fall back to legacy export.
+                print(f"[WARN] wm.ply_export unavailable ({e}), fallback to export_mesh.ply")
+                bpy.ops.export_mesh.ply(filepath=ply_path)
+        else:
+            bpy.ops.export_mesh.ply(filepath=ply_path)
 
         
 if __name__ == '__main__':

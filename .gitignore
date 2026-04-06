@@ -1,17 +1,49 @@
 __pycache__/
 *.pyc
+*.pyo
 *.egg-info/
 dist/
 build/
+*.so
+
 outputs/
 cache/
 logs/
-*.tar.gz
-.env
 checkpoints/
 data/
 archive_v1/
 
-# Config files contain API keys — use .example versions
+# Symlink created at runtime by prerender scripts
+third_party/outputs
+
+# Runtime logs
+*.out
+*.log
+
+# Dependency snapshots
+*-pip.txt
+*-pip-all.txt
+
+# Archives
+*.tar.gz
+*.zip
+
+# Secrets and local env
+.env
+.env.*
+
+# Config files contain API keys or are local-only
 configs/default.yaml
 configs/partobjaverse.yaml
+qwen.yaml
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

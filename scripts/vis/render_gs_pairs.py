@@ -1,30 +1,9 @@
 #!/usr/bin/env python3
-"""Render before/after comparison turntable videos from Phase 2.5 edit pairs.
+"""SLAT → Gaussian turntable; side-by-side MP4 with prompt overlay (Phase 2.5).
 
-Loads SLAT files saved by export_pair, decodes to Gaussian via TRELLIS,
-renders side-by-side turntable video with edit prompt overlay.
-
-Usage:
-    # Render all pairs as side-by-side comparison videos
-    ATTN_BACKEND=xformers python scripts/vis/render_gs_pairs.py \
-        --config configs/partobjaverse.yaml
-
-    # Render specific tag (e.g. multiview experiment)
-    ATTN_BACKEND=xformers python scripts/vis/render_gs_pairs.py \
-        --config configs/partobjaverse.yaml --tag multiview
-
-    # Render specific edit IDs (new format: {type}_{obj_id}_{seq})
-    ATTN_BACKEND=xformers python scripts/vis/render_gs_pairs.py \
-        --config configs/partobjaverse.yaml --edit-ids del_my-chair-001_000
-
-    # Also save individual views (16 per model)
-    ATTN_BACKEND=xformers python scripts/vis/render_gs_pairs.py \
-        --config configs/partobjaverse.yaml --save-views --num-views 16
-
-    # Skip comparison video, only render individual before/after videos
-    ATTN_BACKEND=xformers python scripts/vis/render_gs_pairs.py \
-        --config configs/partobjaverse.yaml --no-compare
-"""
+``--config`` required. Common: ``--tag``, ``--edit-ids``, ``--sample-per-type N``,
+``--save-views``, ``--no-compare``. Sharded runs: single ``mesh_pairs_*`` infers
+``--tag``; else pass ``--tag`` / ``--pairs-dir``."""
 
 import argparse
 import glob as _glob
@@ -46,90 +25,114 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from partcraft.utils.config import load_config
 from partcraft.utils.logging import setup_logging
 
+_SCRIPTS_DIR = str(_PROJECT_ROOT / "scripts")
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+import pipeline_common as _pipeline_common  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Edit ID → type (fallback when jsonl has no edit_type)
+# ---------------------------------------------------------------------------
+
+from _vis_common import infer_edit_type as infer_edit_type_from_id  # noqa: E402
+
+
+def _resolve_mesh_pairs_dir(
+    output_base: Path, user_tag: str, logger,
+) -> tuple[Path, str]:
+    """Resolve ``mesh_pairs[_tag]``; if untagged, use sole ``mesh_pairs_*`` → infer tag."""
+    ut = (user_tag or "").strip()
+    tag_suffix = f"_{ut}" if ut else ""
+    rel = f"mesh_pairs{tag_suffix}"
+    primary = output_base / rel
+    if primary.is_dir():
+        return primary, ut
+
+    tried: list[Path] = [primary]
+    if output_base.name.startswith("shard_"):
+        alt = output_base.parent / rel
+        tried.append(alt)
+        if alt.is_dir():
+            logger.warning(
+                "mesh_pairs not under %s; using %s (export may predate shard layout).",
+                output_base,
+                alt,
+            )
+            return alt, ut
+
+    if not ut:
+        scan_roots = [output_base]
+        if output_base.name.startswith("shard_"):
+            scan_roots.append(output_base.parent)
+        for root in scan_roots:
+            if not root.is_dir():
+                continue
+            tagged = sorted(
+                p for p in root.iterdir()
+                if p.is_dir()
+                and p.name.startswith("mesh_pairs_")
+                and len(p.name) > len("mesh_pairs_")
+            )
+            if len(tagged) == 1:
+                inferred = tagged[0].name[len("mesh_pairs_") :]
+                logger.warning("Using %s (inferred tag %r).", tagged[0], inferred)
+                return tagged[0], inferred
+            if len(tagged) > 1:
+                logger.error("Multiple mesh_pairs_* under %s: %s (use --tag).",
+                             root, [p.name for p in tagged])
+                sys.exit(1)
+
+    logger.error("No mesh_pairs: tried %s", tried)
+    if output_base.exists():
+        subs = sorted(p.name for p in output_base.iterdir() if p.is_dir())
+        logger.error("%s contains: %s", output_base, subs or "(none)")
+    else:
+        logger.error("Missing output dir: %s", output_base)
+    logger.error("Need Phase 2.5 export, --pairs-dir, or matching --tag.")
+    sys.exit(1)
+
+
+def sample_pairs_by_type(
+    pair_dirs: list[Path],
+    prompts: dict[str, dict],
+    per_type: int,
+) -> list[Path]:
+    """Keep up to ``per_type`` pairs per edit_type (stable sort by edit_id)."""
+    from collections import defaultdict
+
+    by_type: dict[str, list[Path]] = defaultdict(list)
+    for d in sorted(pair_dirs, key=lambda p: p.name):
+        info = prompts.get(d.name, {})
+        et = (info.get("edit_type") or info.get("effective_edit_type") or "").strip()
+        if not et:
+            et = infer_edit_type_from_id(d.name)
+        by_type[et].append(d)
+    out: list[Path] = []
+    for et in sorted(by_type.keys()):
+        chunk = by_type[et][:per_type]
+        out.extend(chunk)
+    return out
+
 
 # ---------------------------------------------------------------------------
 # SLAT / Gaussian helpers
 # ---------------------------------------------------------------------------
 
-def load_slat(slat_dir: Path, device: str = "cuda"):
-    """Load SLAT from feats.pt + coords.pt (follows symlinks)."""
-    from trellis.modules import sparse as sp
-    resolved = slat_dir.resolve()
-    feats = torch.load(resolved / "feats.pt", weights_only=True)
-    coords = torch.load(resolved / "coords.pt", weights_only=True)
-    return sp.SparseTensor(feats=feats.to(device), coords=coords.to(device))
+from _vis_common import load_slat  # noqa: E402 (shared SLAT loader)
 
 
-def render_gaussian_turntable(gaussian, n_frames: int = 120,
-                              pitch: float = 0.45) -> list[np.ndarray]:
-    """Render a smooth turntable video from a Gaussian."""
-    from trellis.utils import render_utils
-    yaws = torch.linspace(0, 2 * np.pi, n_frames + 1)[:-1]
-    pitches = torch.tensor([pitch] * n_frames)
-    imgs = render_utils.Trellis_render_multiview_images(
-        gaussian, yaws.tolist(), pitches.tolist())['color']
-    return imgs
+from _vis_common import render_gaussian_views  # noqa: E402
 
-
-def render_gaussian_views(gaussian, num_views: int = 16,
-                          pitch: float = 0.45) -> list[np.ndarray]:
-    """Render multiview images from a Gaussian."""
-    from trellis.utils import render_utils
-    yaws = torch.linspace(0, 2 * np.pi, num_views + 1)[:-1]
-    pitches = torch.tensor([pitch] * num_views)
-    return render_utils.Trellis_render_multiview_images(
-        gaussian, yaws.tolist(), pitches.tolist())['color']
+# Alias for turntable (just more frames)
+render_gaussian_turntable = render_gaussian_views
 
 
 # ---------------------------------------------------------------------------
 # Video composition
 # ---------------------------------------------------------------------------
 
-def wrap_text(text: str, max_chars: int = 60) -> list[str]:
-    """Word-wrap text into lines."""
-    lines = []
-    for raw_line in text.split("\n"):
-        remaining = raw_line
-        while remaining:
-            if len(remaining) <= max_chars:
-                lines.append(remaining)
-                break
-            split = remaining[:max_chars].rfind(" ")
-            if split <= 0:
-                split = max_chars
-            lines.append(remaining[:split])
-            remaining = remaining[split:].strip()
-    return lines
-
-
-def make_text_bar(text: str, width: int, bar_height: int = 60,
-                  bg_color: tuple = (30, 30, 30),
-                  fg_color: tuple = (255, 255, 255)) -> np.ndarray:
-    """Create a text bar image with prompt text."""
-    bar = np.full((bar_height, width, 3), bg_color, dtype=np.uint8)
-    lines = wrap_text(text, max_chars=width // 8)
-
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.55
-    thickness = 1
-    y = 20
-    for line in lines[:3]:  # max 3 lines
-        cv2.putText(bar, line, (10, y), font, font_scale,
-                    fg_color, thickness, cv2.LINE_AA)
-        y += 18
-    return bar
-
-
-def make_label_bar(label: str, width: int, height: int = 32,
-                   bg_color: tuple = (240, 240, 240),
-                   fg_color: tuple = (40, 40, 40)) -> np.ndarray:
-    """Create a 'Before' / 'After' label bar."""
-    bar = np.full((height, width, 3), bg_color, dtype=np.uint8)
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    tw = cv2.getTextSize(label, font, 0.7, 2)[0][0]
-    cv2.putText(bar, label, ((width - tw) // 2, 24),
-                font, 0.7, fg_color, 2, cv2.LINE_AA)
-    return bar
+from _vis_common import wrap_text, make_text_bar, make_label_bar  # noqa: E402
 
 
 def compose_comparison_frame(before_img: np.ndarray, after_img: np.ndarray,
@@ -236,8 +239,7 @@ def load_edit_prompts(cache_dir: Path, tag: str = "") -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Render before/after comparison from Phase 2.5 pairs")
+    parser = argparse.ArgumentParser(description="Phase 2.5 SLAT → compare MP4")
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--tag", type=str, default=None,
                         help="Experiment tag (matches --tag from run_phase2_5.py)")
@@ -261,23 +263,33 @@ def main():
                         help="Number of view images (only with --save-views)")
     parser.add_argument("--force", action="store_true",
                         help="Re-render even if cached")
+    parser.add_argument("--sample-per-type", type=int, default=None, metavar="N",
+                        help="Cap at N pairs per edit_type after SLAT check")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    _pipeline_common.normalize_cache_dirs(cfg)
+    _pipeline_common.set_attn_backend(cfg)
     logger = setup_logging(cfg, "render_gs_pairs")
 
     output_base = Path(cfg["data"]["output_dir"])
-    tag_suffix = f"_{args.tag}" if args.tag else ""
+    user_tag = (args.tag or "").strip()
 
     # Locate pairs directory
     if args.pairs_dir:
         pairs_dir = Path(args.pairs_dir)
+        if not pairs_dir.is_dir():
+            logger.error("Pairs directory not found or not a directory: %s", pairs_dir)
+            sys.exit(1)
+        effective_tag = user_tag
+        if not effective_tag and pairs_dir.name.startswith("mesh_pairs_") and len(
+                pairs_dir.name) > len("mesh_pairs_"):
+            effective_tag = pairs_dir.name[len("mesh_pairs_") :]
+            logger.info("Inferred --tag %r from pairs directory name.", effective_tag)
     else:
-        pairs_dir = output_base / f"mesh_pairs{tag_suffix}"
+        pairs_dir, effective_tag = _resolve_mesh_pairs_dir(output_base, user_tag, logger)
 
-    if not pairs_dir.exists():
-        logger.error(f"Pairs directory not found: {pairs_dir}")
-        sys.exit(1)
+    tag_suffix = f"_{effective_tag}" if effective_tag else ""
 
     # Output directory for comparison videos
     if args.output_dir:
@@ -295,11 +307,14 @@ def main():
 
     valid_pairs = []
     for d in pair_dirs:
-        before_slat = d / "before_slat"
-        after_slat = d / "after_slat"
-        # Resolve symlinks (before_slat may be a relative symlink to shared dir)
-        has_before = (before_slat.resolve() / "feats.pt").exists()
-        has_after = (after_slat.resolve() / "feats.pt").exists()
+        has_before = (d / "before.npz").exists()
+        has_after = (d / "after.npz").exists()
+        if not has_before:
+            bs = d / "before_slat"
+            has_before = (bs.resolve() / "feats.pt").exists() if bs.exists() else False
+        if not has_after:
+            a_s = d / "after_slat"
+            has_after = (a_s.resolve() / "feats.pt").exists() if a_s.exists() else False
         if has_before and has_after:
             valid_pairs.append(d)
         else:
@@ -310,10 +325,24 @@ def main():
         logger.error("No valid pairs found with SLAT files")
         sys.exit(1)
 
-    # Load edit prompts — resolve cache_dir relative to project root
+    # edit_results*.jsonl under phase2_5 cache (post-normalize_cache_dirs).
     raw_cache = cfg.get("phase2_5", {}).get("cache_dir", "cache/phase2_5")
-    cache_dir = _resolve_path(raw_cache)
-    edit_prompts = load_edit_prompts(cache_dir, args.tag or "")
+    cache_dir = Path(raw_cache) if os.path.isabs(raw_cache) else _resolve_path(
+        raw_cache)
+    edit_prompts = load_edit_prompts(cache_dir, effective_tag)
+
+    if args.sample_per_type is not None:
+        if args.sample_per_type <= 0:
+            logger.error("--sample-per-type must be positive")
+            sys.exit(1)
+        if args.edit_ids:
+            logger.error("Use either --edit-ids or --sample-per-type, not both")
+            sys.exit(1)
+        before_n = len(valid_pairs)
+        valid_pairs = sample_pairs_by_type(valid_pairs, edit_prompts,
+                                           args.sample_per_type)
+        logger.info(f"Sampled {len(valid_pairs)} / {before_n} pairs "
+                    f"(<= {args.sample_per_type} per edit_type)")
 
     logger.info(f"Rendering {len(valid_pairs)} pairs -> {vis_dir}")
 
@@ -324,7 +353,8 @@ def main():
     if third_party not in sys.path:
         sys.path.insert(0, third_party)
 
-    ckpt_dir = Path(p25_cfg.get("ckpt_dir", str(project_root / "checkpoints")))
+    ckpt_dir = Path(cfg.get("ckpt_root") or p25_cfg.get(
+        "ckpt_dir", str(project_root / "checkpoints")))
     text_ckpt = str(ckpt_dir / "TRELLIS-text-xlarge")
 
     from trellis.pipelines import TrellisTextTo3DPipeline
@@ -355,7 +385,8 @@ def main():
         # Decode both SLATs to Gaussian
         gaussians = {}
         for tag in ['before', 'after']:
-            slat = load_slat(pair_dir / f"{tag}_slat")
+            npz_path = pair_dir / f"{tag}.npz"
+            slat = load_slat(npz_path if npz_path.exists() else pair_dir / f"{tag}_slat")
             outputs = pipeline.decode_slat(slat, ['gaussian'])
             gaussians[tag] = outputs['gaussian'][0]
 

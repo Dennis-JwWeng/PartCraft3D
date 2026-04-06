@@ -67,6 +67,18 @@ def render(viewpoint_camera, pc : Gaussian, pipe, bg_color : torch.Tensor, scali
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
     
+    # kernel_size / subpixel_offset are required by the mip-gaussian fork of
+    # diff_gaussian_rasterization but absent in the original version.
+    _extra = {}
+    import inspect as _inspect
+    _sig = _inspect.signature(GaussianRasterizationSettings)
+    if 'kernel_size' in _sig.parameters:
+        import torch as _torch
+        _extra['kernel_size'] = getattr(pipe, 'kernel_size', 0.1)
+        _extra['subpixel_offset'] = _torch.zeros(
+            (int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), 2),
+            dtype=_torch.float32, device='cuda')
+
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
@@ -79,7 +91,8 @@ def render(viewpoint_camera, pc : Gaussian, pipe, bg_color : torch.Tensor, scali
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
-        debug=pipe.debug
+        debug=pipe.debug,
+        **_extra
     )
     
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)

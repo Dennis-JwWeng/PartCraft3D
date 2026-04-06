@@ -34,7 +34,9 @@ import base64
 import io
 import json
 import logging
+import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 
 import torch
 from PIL import Image
@@ -141,8 +143,8 @@ def main():
                         help="Model backend (default: flux-klein)")
     parser.add_argument("--model", default=None,
                         help="Model path override. Defaults: "
-                             "flux-klein → /Node11_nvme/wjw/checkpoints/FLUX.2-klein-9B, "
-                             "qwen → /Node11_nvme/wjw/checkpoints/Qwen-Image-Edit-2511")
+                             "flux-klein → /mnt/zsn/ckpts/FLUX.2-klein-9B, "
+                             "qwen → /mnt/zsn/ckpts/Qwen-Image-Edit-2511")
     parser.add_argument("--gpu", type=int, default=None)
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--steps", type=int, default=None,
@@ -157,15 +159,22 @@ def main():
     global PIPE, BACKEND, STEPS, CFG_SCALE
     BACKEND = args.backend
 
-    # Resolve defaults per backend
+    # Resolve defaults per backend (same default order as load_config ckpt_root)
+    _proj = Path(__file__).resolve().parents[2]
+    _mnt = Path("/mnt/zsn/ckpts")
+    _default_root = (
+        os.environ.get("PARTCRAFT_CKPT_ROOT", "").strip()
+        or (str(_mnt) if _mnt.is_dir() else str(_proj / "checkpoints"))
+    )
+    _ckpt_root = _default_root
     model_defaults = {
         "flux-klein": {
-            "model": "/Node11_nvme/wjw/checkpoints/FLUX.2-klein-9B",
+            "model": os.path.join(_ckpt_root, "FLUX.2-klein-9B"),
             "steps": 4,
             "cfg_scale": 1.0,
         },
         "qwen": {
-            "model": "/Node11_nvme/wjw/checkpoints/Qwen-Image-Edit-2511",
+            "model": os.path.join(_ckpt_root, "Qwen-Image-Edit-2511"),
             "steps": 50,
             "cfg_scale": 5.0,
         },

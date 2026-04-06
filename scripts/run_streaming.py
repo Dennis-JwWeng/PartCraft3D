@@ -28,6 +28,8 @@ Usage:
     ATTN_BACKEND=xformers python scripts/run_streaming.py \\
         --config configs/hybrid_streaming.yaml --tag v1 \\
         --num-workers 2 --worker-id 1   # GPU 1
+
+  # Overlap: pipeline.lookahead_objects or --lookahead-objects N (0=serial).
 """
 
 import argparse
@@ -50,6 +52,7 @@ from scripts.pipeline_common import (
     load_config, setup_logging,
     PartCraftDataset, EditSpec,
     resolve_api_key, normalize_cache_dirs, set_attn_backend, create_dataset,
+    resolve_data_dirs,
 )
 
 
@@ -98,7 +101,8 @@ def run_streaming(cfg, dataset, logger, args):
     mesh_pairs_dir = output_dir / f"mesh_pairs{tag_suffix}"
 
     # ---- Resolve object list from dataset (NPZ files) ----
-    uid_info: dict[str, tuple[str, list[str], list[int]]] = {}
+    # uid_info: obj_id -> (category, labels, actual_pids, shard_id)
+    uid_info: dict[str, tuple[str, list[str], list[int], str]] = {}
     if dataset._index is None:
         dataset._build_index()
     for shard_id, obj_id in dataset._index:
@@ -113,7 +117,7 @@ def run_streaming(cfg, dataset, logger, args):
                 label = p.cluster_name
             labels.append(label)
             actual_pids.append(p.part_id)
-        uid_info[obj_id] = ("object", labels, actual_pids)
+        uid_info[obj_id] = ("object", labels, actual_pids, shard_id)
         obj_rec.close()
     logger.info(f"Discovered {len(uid_info)} objects from dataset")
 
@@ -134,27 +138,41 @@ def run_streaming(cfg, dataset, logger, args):
         logger.error("No API key for VLM enrichment")
         return
     vlm_model = p0.get("vlm_model", "gemini-3.1-flash-lite-preview")
-    vlm_base_url = p0.get("vlm_base_url", "")
+    vlm_base_url = str(p0.get("vlm_base_url", "")).strip()
+    if not vlm_base_url:
+        raise ValueError(
+            "[CONFIG_ERROR] phase0.vlm_base_url <missing> config "
+            "streaming requires explicit VLM endpoint"
+        )
     vlm_client = OpenAI(base_url=vlm_base_url, api_key=api_key)
 
     # ---- Image edit setup ----
     image_edit_backend = p25.get("image_edit_backend", "api")
     edit_vlm_client = None
+    image_edit_url = str(p25.get("image_edit_base_url", "")).strip()
+    if not image_edit_url:
+        raise ValueError(
+            "[CONFIG_ERROR] phase2_5.image_edit_base_url <missing> config "
+            "streaming requires explicit image edit endpoint"
+        )
     if image_edit_backend != "local_diffusers":
-        image_edit_url = p25.get("image_edit_base_url") or vlm_base_url
         edit_vlm_client = OpenAI(base_url=image_edit_url, api_key=api_key)
 
     # ---- TRELLIS setup ----
     from partcraft.phase2_assembly.trellis_refine import (
         TrellisRefiner, build_prompts_from_spec)
 
+    slat_dir, img_enc_dir = resolve_data_dirs(cfg)
     refiner = TrellisRefiner(
         cache_dir=str(_resolve(p25["cache_dir"])),
         device="cuda",
         image_edit_model=p25.get("image_edit_model", "gemini-2.5-flash-image"),
+        ckpt_dir=cfg.get("ckpt_root"),
         image_edit_backend=image_edit_backend,
-        image_edit_base_url=p25.get("image_edit_base_url", "http://localhost:8001"),
+        image_edit_base_url=image_edit_url,
         debug=args.debug,
+        slat_dir=slat_dir,
+        img_enc_dir=img_enc_dir,
     )
     refiner.load_models()
 
@@ -184,22 +202,24 @@ def run_streaming(cfg, dataset, logger, args):
 
     # ---- Image source ----
     npz_dir = _resolve(cfg["data"]["image_npz_dir"])
-    shard = cfg["data"].get("shards", ["00"])[0]
 
     # Import 2D edit helpers
     from scripts.run_2d_edit import (
         prepare_input_image, call_local_edit, call_vlm_edit)
+    pipeline_cfg = cfg.get("pipeline", {})
+    la = getattr(args, "lookahead_objects", None)
+    if la is None:
+        lookahead = int(pipeline_cfg.get("lookahead_objects", 0) or 0)
+    else:
+        lookahead = int(la)
+    if lookahead < 0:
+        lookahead = 0
+    logger.info(f"streaming lookahead_objects={lookahead}")
 
-    # ---- Main loop ----
-    # Edit IDs are now per-object unique (obj_id hash embedded), no global
-    # counters needed. Same object always produces identical edit IDs, making
-    # resume deterministic and multi-worker safe.
-    glb_tmp_dir = tempfile.mkdtemp(prefix="partcraft_stream_")
-    total_specs = 0
-    total_success = 0
-    total_fail = 0
 
-    # Load existing specs for resume (reuse instead of re-planning)
+    # ---- Main loop (optional lookahead prefetch) ----
+    from partcraft.streaming_lookahead import run_streaming_with_lookahead
+
     existing_specs_by_obj: dict[str, list] = {}
     if specs_path.exists():
         with open(specs_path) as f:
@@ -209,386 +229,42 @@ def run_streaming(cfg, dataset, logger, args):
                 d = json.loads(line)
                 existing_specs_by_obj.setdefault(d["obj_id"], []).append(d)
 
-    with open(labels_path, "a") as lbl_fp, \
-         open(specs_path, "a") as spec_fp, \
-         open(results_path, "a") as res_fp:
-
-        for obj_idx, uid in enumerate(all_uids):
-            category, labels, actual_pids = uid_info[uid]
-            logger.info(f"\n{'='*60}")
-            logger.info(f"[{obj_idx+1}/{len(all_uids)}] Object: {uid}")
-            logger.info(f"  Category: {category}, Parts: {len(labels)}")
-
-            # ---- Step 1: Enrich ----
-            record = None
-            if uid in done_labels:
-                logger.info("  Resuming (already enriched), loading...")
-                with open(labels_path) as _lf:
-                    for _line in _lf:
-                        if not _line.strip():
-                            continue
-                        try:
-                            _rec = json.loads(_line)
-                            if _rec["obj_id"] == uid:
-                                record = _rec
-                                break
-                        except (json.JSONDecodeError, KeyError):
-                            pass
-            else:
-                # Fresh VLM enrichment
-                try:
-                    obj = dataset.load_object(shard, uid)
-                    result = _enrich_one_object_visual(
-                        vlm_client, vlm_model, obj, category, labels)
-                    obj.close()
-                except Exception as e:
-                    logger.warning(f"  Visual enrichment failed: {e}")
-                    result = None
-
-                if result is None:
-                    npz_path = npz_dir / shard / f"{uid}.npz"
-                    thumb = None
-                    if npz_path.exists():
-                        thumb = load_thumbnail_from_npz(str(npz_path),
-                                                        view_id=0)
-                    result = _call_vlm(vlm_client, vlm_model,
-                                       category, labels, thumb)
-
-                if result is None:
-                    result = _fallback_enrichment(category, labels)
-                    logger.warning(f"  Using fallback enrichment for {uid}")
-
-                record = _result_to_phase0_record(
-                    result, uid, category, shard,
-                    actual_part_ids=actual_pids)
-                lbl_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
-                lbl_fp.flush()
-
-            if record is None:
-                logger.warning(f"  No record for {uid}, skipping")
-                continue
-
-            n_grp = len(record.get("group_edits", []))
-            n_glb = len(record.get("global_edits", []))
-            logger.info(f"  Enriched: {n_grp} groups, {n_glb} global edits")
-
-            # ---- Step 2: Plan edits for this object ----
-            if uid in existing_specs_by_obj:
-                obj_specs = [EditSpec(**d)
-                             for d in existing_specs_by_obj[uid]]
-                logger.info(f"  Reusing {len(obj_specs)} existing specs "
-                            f"(resume)")
-            else:
-                obj_specs = plan_edits_for_record(record, cfg)
-                for spec in obj_specs:
-                    spec_fp.write(json.dumps(spec.to_dict(),
-                                             ensure_ascii=False) + "\n")
-                spec_fp.flush()
-
-            n_del = sum(1 for s in obj_specs if s.edit_type == "deletion")
-            n_add = sum(1 for s in obj_specs if s.edit_type == "addition")
-            n_mod = sum(1 for s in obj_specs if s.edit_type == "modification")
-            n_g = sum(1 for s in obj_specs if s.edit_type == "global")
-            logger.info(f"  Planned: {len(obj_specs)} specs "
-                        f"(del={n_del} add={n_add} mod={n_mod} glb={n_g})")
-            total_specs += len(obj_specs)
-
-            if not obj_specs:
-                continue
-
-            # ---- Step 3+4: 3D edit (with inline 2D) ----
-            run_specs = [s for s in obj_specs
-                         if s.edit_id not in done_edits
-                         and s.edit_type != "addition"]
-            add_specs = [s for s in obj_specs if s.edit_type == "addition"]
-
-            if not run_specs and not add_specs:
-                logger.info("  All edits already done, skipping")
-                continue
-
-            # Prepare object for TRELLIS
-            try:
-                ori_slat = refiner.encode_object(None, uid)
-                ori_gaussian = refiner.decode_to_gaussian(ori_slat)
-                obj_record = dataset.load_object(shard, uid)
-            except Exception as e:
-                logger.error(f"  Failed to prepare for TRELLIS: {e}")
-                for spec in run_specs:
-                    res_fp.write(json.dumps({
-                        "edit_id": spec.edit_id, "status": "failed",
-                        "reason": f"Preparation failed: {e}",
-                    }) + "\n")
-                    total_fail += 1
-                res_fp.flush()
-                continue
-
-            # Sort: deletion → modification → global
-            type_order = {"deletion": 0, "modification": 1, "global": 2}
-            run_specs.sort(key=lambda s: type_order.get(s.edit_type, 9))
-
-            first_pair_dir = None
-
-            for spec in run_specs:
-                if spec.edit_id in done_edits:
-                    continue
-
-                logger.info(f"\n  [{spec.edit_id}] {spec.edit_type}: "
-                            f"\"{spec.edit_prompt[:60]}\"")
-
-                try:
-                    edit_type = spec.edit_type.capitalize()
-
-                    if edit_type == "Deletion":
-                        # Direct GT mesh deletion — no SLAT/generation needed
-                        from partcraft.phase2_assembly.trellis_refine import TrellisRefiner
-                        pair_dir = mesh_pairs_dir / spec.edit_id
-                        export_paths = TrellisRefiner.direct_delete_mesh(
-                            obj_record, spec.remove_part_ids, pair_dir)
-                        rec = {
-                            "edit_id": spec.edit_id,
-                            "edit_type": spec.edit_type,
-                            "effective_edit_type": "DirectDeletion",
-                            "obj_id": uid,
-                            "edit_prompt": spec.edit_prompt,
-                            **export_paths,
-                            "status": "success",
-                        }
-                        res_fp.write(json.dumps(rec,
-                                                ensure_ascii=False) + "\n")
-                        res_fp.flush()
-                        total_success += 1
-                        done_edits.add(spec.edit_id)
-                        if first_pair_dir is None:
-                            first_pair_dir = pair_dir
-                        logger.info(f"    OK (direct deletion, GT mesh) "
-                                    f"→ {pair_dir}")
-                        continue
-                    elif edit_type == "Modification":
-                        if spec.remove_part_ids:
-                            edit_part_ids = spec.remove_part_ids
-                        else:
-                            edit_part_ids = [spec.old_part_id]
-                    elif edit_type == "Global":
-                        edit_part_ids = []
-                    else:
-                        continue
-
-                    # Build mask
-                    mask, effective_type = refiner.build_part_mask(
-                        uid, obj_record, edit_part_ids, ori_slat, edit_type)
-                    if effective_type != edit_type:
-                        logger.info(f"    Auto-promoted → {effective_type}")
-                        edit_type = effective_type
-                    if mask.sum() == 0:
-                        raise RuntimeError("Empty mask")
-
-                    # Build prompts
-                    prompts = build_prompts_from_spec(spec)
-                    if prompts["edit_type"] != edit_type:
-                        prompts["edit_type"] = edit_type
-
-                    # Inline 2D edit (with cache read/write)
-                    img_cond = None
-                    if args.use_2d:
-                        num_edit_views = p25.get("num_edit_views", 4)
-                        edit_strength = p25.get("edit_strength", 1.0)
-                        prerender_img = None
-
-                        # Check 2D edit cache first
-                        cached_2d_path = (edit_2d_dir
-                                          / f"{spec.edit_id}_edited.png")
-                        if cached_2d_path.exists():
-                            try:
-                                cached_edited = Image.open(
-                                    str(cached_2d_path))
-                                cached_edited.load()  # force full decode
-                                cached_edited = cached_edited.convert(
-                                    "RGB").resize((518, 518))
-                                img_bytes, pil_img = prepare_input_image(
-                                    obj_record, spec.best_view
-                                    if hasattr(spec, 'best_view')
-                                    and spec.best_view >= 0 else 0)
-                                prerender_img = (
-                                    pil_img.resize((518, 518)),
-                                    cached_edited)
-                                logger.info(
-                                    f"    2D edit loaded from cache: "
-                                    f"{cached_2d_path.name}")
-                            except Exception as e:
-                                logger.warning(
-                                    f"    Corrupt cached 2D edit "
-                                    f"(deleting): {e}")
-                                cached_2d_path.unlink(missing_ok=True)
-                                prerender_img = None
-
-                        if (prerender_img is None
-                                and hasattr(spec, 'best_view')
-                                and spec.best_view >= 0):
-                            try:
-                                img_bytes, pil_img = prepare_input_image(
-                                    obj_record, spec.best_view)
-                                after_desc = (spec.after_desc
-                                              or spec.after_part_desc or "")
-                                before_desc = (
-                                    getattr(spec, 'before_part_desc', '')
-                                    or '')
-                                remove_labels = getattr(
-                                    spec, 'remove_labels', [])
-                                old_label = getattr(
-                                    spec, 'old_label', '') or ''
-                                if (remove_labels
-                                        and len(remove_labels) > 1):
-                                    part_label = ", ".join(remove_labels)
-                                elif remove_labels:
-                                    part_label = remove_labels[0]
-                                else:
-                                    part_label = old_label
-
-                                if image_edit_backend == "local_diffusers":
-                                    edit_url = p25.get(
-                                        "image_edit_base_url",
-                                        "http://localhost:8001")
-                                    edited = call_local_edit(
-                                        edit_url, img_bytes,
-                                        spec.edit_prompt, after_desc,
-                                        old_part_label=part_label,
-                                        before_part_desc=before_desc,
-                                        edit_type=spec.edit_type)
-                                elif edit_vlm_client is not None:
-                                    edited = call_vlm_edit(
-                                        edit_vlm_client, img_bytes,
-                                        spec.edit_prompt, after_desc,
-                                        p25.get("image_edit_model", ""),
-                                        old_part_label=part_label,
-                                        before_part_desc=before_desc,
-                                        edit_type=spec.edit_type)
-                                else:
-                                    edited = None
-                                if edited is not None:
-                                    edited = edited.resize((518, 518))
-                                    # Atomic save: write to temp then rename
-                                    tmp_path = cached_2d_path.with_suffix(
-                                        ".tmp.png")
-                                    edited.save(str(tmp_path))
-                                    tmp_path.rename(cached_2d_path)
-                                    prerender_img = (
-                                        pil_img.resize((518, 518)),
-                                        edited)
-                                    logger.info(
-                                        f"    2D edit from view "
-                                        f"{spec.best_view} "
-                                        f"(saved to cache)")
-                            except Exception as e:
-                                logger.warning(
-                                    f"    Prerender 2D edit failed: {e}")
-
-                        if prerender_img is not None:
-                            original_images = [prerender_img[0]]
-                            edited_images = [prerender_img[1]]
-                        else:
-                            original_images, edited_images = \
-                                refiner.obtain_edited_images(
-                                    ori_gaussian, prompts, edit_vlm_client,
-                                    uid, spec.edit_id,
-                                    num_views=num_edit_views)
-                        if edited_images:
-                            img_cond = refiner.encode_multiview_cond(
-                                edited_images, original_images,
-                                edit_strength=edit_strength)
-
-                    # Run TRELLIS
-                    slats_edited = refiner.edit(
-                        ori_slat, mask, prompts,
-                        img_cond=img_cond, seed=args.seed)
-                    if not slats_edited:
-                        raise RuntimeError("No edited SLATs produced")
-
-                    # Export (reuse shared before for same object)
-                    pair_dir = mesh_pairs_dir / spec.edit_id
-                    export_paths = refiner.export_pair_shared_before(
-                        ori_slat, slats_edited[0], pair_dir,
-                        shared_before_dir=first_pair_dir)
-
-                    rec = {
-                        "edit_id": spec.edit_id,
-                        "edit_type": spec.edit_type,
-                        "effective_edit_type": edit_type,
-                        "obj_id": uid,
-                        "edit_prompt": spec.edit_prompt,
-                        **export_paths,
-                        "status": "success",
-                    }
-                    res_fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    res_fp.flush()
-                    total_success += 1
-                    done_edits.add(spec.edit_id)
-                    if first_pair_dir is None:
-                        first_pair_dir = pair_dir
-                    logger.info(f"    OK → {pair_dir}")
-
-                except Exception as e:
-                    import traceback
-                    logger.error(f"    Failed: {e}")
-                    traceback.print_exc()
-                    res_fp.write(json.dumps({
-                        "edit_id": spec.edit_id, "status": "failed",
-                        "reason": str(e),
-                    }) + "\n")
-                    res_fp.flush()
-                    total_fail += 1
-
-            # Handle additions (swap from deletion)
-            for spec in add_specs:
-                if spec.edit_id in done_edits:
-                    continue
-                del_pair = mesh_pairs_dir / spec.source_del_id
-                add_pair = mesh_pairs_dir / spec.edit_id
-                del_has_output = ((del_pair / "before_slat").exists()
-                                  or (del_pair / "before.ply").exists())
-                if del_has_output:
-                    # Clean up any partial previous copy
-                    if add_pair.exists():
-                        shutil.rmtree(str(add_pair))
-                    add_pair.mkdir(parents=True, exist_ok=True)
-                    for src, dst in [
-                        (del_pair / "before_slat", add_pair / "after_slat"),
-                        (del_pair / "after_slat", add_pair / "before_slat"),
-                        (del_pair / "before.ply", add_pair / "after.ply"),
-                        (del_pair / "after.ply", add_pair / "before.ply"),
-                    ]:
-                        if src.exists():
-                            if src.is_dir():
-                                shutil.copytree(str(src), str(dst))
-                            else:
-                                shutil.copy2(str(src), str(dst))
-                    res_fp.write(json.dumps({
-                        "edit_id": spec.edit_id, "edit_type": "addition",
-                        "obj_id": uid, "status": "success",
-                        "edit_prompt": spec.edit_prompt,
-                        "source_del_id": spec.source_del_id,
-                    }, ensure_ascii=False) + "\n")
-                    res_fp.flush()
-                    done_edits.add(spec.edit_id)
-                    total_success += 1
-                else:
-                    res_fp.write(json.dumps({
-                        "edit_id": spec.edit_id, "status": "failed",
-                        "reason": f"Source deletion {spec.source_del_id} "
-                                  f"output not found",
-                    }) + "\n")
-                    res_fp.flush()
-                    total_fail += 1
-
-            obj_record.close()
-
-    shutil.rmtree(glb_tmp_dir, ignore_errors=True)
-    logger.info(f"\n{'='*60}")
-    logger.info(f"Streaming complete: {total_specs} specs planned, "
-                f"{total_success} ok, {total_fail} fail")
-    logger.info(f"  Labels:  {labels_path}")
-    logger.info(f"  Specs:   {specs_path}")
-    logger.info(f"  Results: {results_path}")
-    logger.info("=" * 60)
+    run_streaming_with_lookahead(
+        all_uids=all_uids,
+        uid_info=uid_info,
+        lookahead=lookahead,
+        p0=p0,
+        p25=p25,
+        labels_path=labels_path,
+        specs_path=specs_path,
+        results_path=results_path,
+        edit_2d_dir=edit_2d_dir,
+        mesh_pairs_dir=mesh_pairs_dir,
+        npz_dir=npz_dir,
+        dataset=dataset,
+        cfg=cfg,
+        args=args,
+        logger=logger,
+        refiner=refiner,
+        build_prompts_from_spec=build_prompts_from_spec,
+        vlm_client=vlm_client,
+        vlm_model=vlm_model,
+        image_edit_backend=image_edit_backend,
+        edit_vlm_client=edit_vlm_client,
+        done_labels=done_labels,
+        done_edits=done_edits,
+        existing_specs_by_obj=existing_specs_by_obj,
+        prepare_input_image=prepare_input_image,
+        call_local_edit=call_local_edit,
+        call_vlm_edit=call_vlm_edit,
+        EditSpec=EditSpec,
+        plan_edits_for_record=plan_edits_for_record,
+        _enrich_one_object_visual=_enrich_one_object_visual,
+        _call_vlm=_call_vlm,
+        _fallback_enrichment=_fallback_enrichment,
+        _result_to_phase0_record=_result_to_phase0_record,
+        load_thumbnail_from_npz=load_thumbnail_from_npz,
+    )
 
 
 # =========================================================================
@@ -630,11 +306,18 @@ Examples:
                              "(for multi-GPU)")
     parser.add_argument("--worker-id", type=int, default=0,
                         help="This worker's ID (0-indexed)")
+    parser.add_argument(
+        "--lookahead-objects", type=int, default=None,
+        dest="lookahead_objects",
+        help="Prefetch N upcoming objects (VLM/plan/2D) while GPU runs TRELLIS; "
+             "0 disables. Overrides pipeline.lookahead_objects in config.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     normalize_cache_dirs(cfg)
     set_attn_backend(cfg)
+    if cfg.get("ckpt_root"):
+        os.environ.setdefault("PARTCRAFT_CKPT_ROOT", cfg["ckpt_root"])
 
     logger = setup_logging(cfg, "streaming")
 

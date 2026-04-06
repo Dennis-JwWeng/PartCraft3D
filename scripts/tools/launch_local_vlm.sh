@@ -33,14 +33,16 @@ MODE="${MODE:-vlm}"
 BACKEND="${BACKEND:-sglang}"
 
 # ---- VLM server settings (Qwen3.5-VL-27B) ----
-VLM_MODEL="${VLM_MODEL:-/Node11_nvme/zsn/checkpoints/Qwen3.5-27B}"
+_CKPT_ROOT="${PARTCRAFT_CKPT_ROOT:-/mnt/zsn/ckpts}"
+VLM_MODEL="${VLM_MODEL:-${_CKPT_ROOT}/Qwen3.5-27B}"
 VLM_PORT="${VLM_PORT:-8002}"
 VLM_TP="${VLM_TP:-1}"
 VLM_GPUS="${VLM_GPUS:-0}"
 VLM_MAX_LEN="${VLM_MAX_LEN:-32768}"
+VLM_MEM_FRAC="${VLM_MEM_FRAC:-0.5}"
 
 # ---- Image edit server settings (qwen-image-2511) ----
-IMG_MODEL="${IMG_MODEL:-/Node11_nvme/wjw/checkpoints/Qwen-Image-Edit-2511}"
+IMG_MODEL="${IMG_MODEL:-${_CKPT_ROOT}/Qwen-Image-Edit-2511}"
 IMG_PORT="${IMG_PORT:-8001}"
 IMG_TP="${IMG_TP:-1}"
 IMG_GPUS="${IMG_GPUS:-2}"
@@ -66,7 +68,7 @@ launch_sglang() {
     # Auto-detect CUDA_HOME from nvcc location (fixes FlashInfer JIT)
     if [ -z "$CUDA_HOME" ]; then
         local nvcc_path
-        nvcc_path=$(which nvcc 2>/dev/null)
+        nvcc_path=$(which nvcc 2>/dev/null) || true
         if [ -n "$nvcc_path" ]; then
             export CUDA_HOME="$(dirname "$(dirname "$(readlink -f "$nvcc_path")")")"
             echo "  Auto-detected CUDA_HOME=$CUDA_HOME"
@@ -86,7 +88,7 @@ launch_sglang() {
         --port "$port" \
         --tp "$tp" \
         --max-total-tokens "$max_len" \
-        --mem-fraction-static 0.5 \
+        --mem-fraction-static "$VLM_MEM_FRAC" \
         --attention-backend triton
 }
 

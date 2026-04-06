@@ -114,10 +114,19 @@ def build_prompts_from_spec(spec) -> dict:
     structure (s1) and appearance (s2) channels locally, matching VD's
     decompose_prompt() which uses an LLM to strip shape-adjectives
     for s2 and color/material-adjectives for s1.
+
+    Supports all edit types from partcraft.edit_types:
+      - modification/scale → Modification (S1+S2 repaint)
+      - material           → TextureOnly (S2 only, part mask)
+      - global             → TextureOnly (S2 only, full mask)
+      - deletion           → Deletion (voxel removal)
+      - addition           → Addition (S1+S2 generation)
+      - identity           → not routed here (handled by pipeline)
     """
-    edit_type = spec.edit_type.capitalize()
-    if edit_type not in ("Modification", "Deletion", "Addition", "Global"):
-        edit_type = "Modification"
+    from partcraft.edit_types import trellis_effective_type
+
+    raw_type = spec.edit_type
+    edit_type = trellis_effective_type(raw_type)
 
     obj_desc = spec.object_desc or ""
     after_desc = spec.after_desc or obj_desc
@@ -141,7 +150,8 @@ def build_prompts_from_spec(spec) -> dict:
 
     return {
         "edit_prompt": edit_prompt,
-        "edit_type": edit_type,
+        "edit_type": edit_type,         # TRELLIS-level type
+        "raw_edit_type": raw_type,      # PartCraft-level type
         "editing_part": old_label,
         "target_part": after_part,
         # Complete descriptions (ori = before, new = after)
@@ -183,6 +193,8 @@ class TrellisRefiner:
         image_edit_backend: str = "api",
         image_edit_base_url: str | None = None,
         debug: bool = False,
+        slat_dir: str | Path | None = None,
+        img_enc_dir: str | Path | None = None,
         # Legacy: ignored, kept for config compat
         vinedresser_path: str | None = None,
     ):
@@ -195,14 +207,31 @@ class TrellisRefiner:
         self.image_edit_backend = image_edit_backend
         self.image_edit_base_url = image_edit_base_url
 
-        # Checkpoint directory: default to PartCraft3D/checkpoints
         if ckpt_dir is None:
-            ckpt_dir = str(self._project_root / "checkpoints")
+            raise ValueError(
+                "[CONFIG_ERROR] ckpt_root <missing> config "
+                "must be explicitly provided to TrellisRefiner"
+            )
         self.ckpt_dir = Path(ckpt_dir)
+        if not self.ckpt_dir.is_dir():
+            raise ValueError(
+                f"[CONFIG_ERROR] ckpt_root {self.ckpt_dir} config directory does not exist"
+            )
 
-        # Data directories (SLAT, img_Enc)
-        self.slat_dir = self._project_root / "data" / "partobjaverse_tiny" / "slat"
-        self.img_enc_dir = self._project_root / "data" / "partobjaverse_tiny" / "img_Enc"
+        if not slat_dir:
+            raise ValueError(
+                "[CONFIG_ERROR] data.slat_dir <missing> config "
+                "must be explicitly provided to TrellisRefiner"
+            )
+        self.slat_dir = Path(slat_dir)
+        self.img_enc_dir = Path(img_enc_dir) if img_enc_dir else None
+        if not self.slat_dir.exists():
+            raise ValueError(
+                f"[CONFIG_ERROR] data.slat_dir {self.slat_dir} config path does not exist"
+            )
+        if self.img_enc_dir and not self.img_enc_dir.exists():
+            logger.warning("data.img_enc_dir %s does not exist; will use mesh NPZ fallback", self.img_enc_dir)
+            self.img_enc_dir = None
 
         self.debug = debug or os.environ.get("PARTCRAFT_DEBUG", "").lower() in ("1", "true")
 
@@ -243,30 +272,63 @@ class TrellisRefiner:
 
     # ---- Step 1: Load pre-encoded SLAT ----
 
+    def _find_slat_file(self, obj_id: str, suffix: str) -> str:
+        """Locate a SLAT file, supporting both flat and sharded layouts.
+
+        Flat:    slat_dir/{obj_id}_{suffix}.pt
+        Sharded: slat_dir/{shard}/{obj_id}_{suffix}.pt
+        """
+        fname = f"{obj_id}_{suffix}.pt"
+        flat = self.slat_dir / fname
+        if flat.exists():
+            return str(flat)
+        # Search shard subdirectories (00, 01, ...)
+        for entry in sorted(self.slat_dir.iterdir()):
+            if entry.is_dir():
+                candidate = entry / fname
+                if candidate.exists():
+                    return str(candidate)
+        return str(flat)  # return flat path for error message
+
     def encode_object(self, glb_path: str, obj_id: str) -> Any:
         """Load pre-encoded SLAT for an object.
 
-        Requires prerender.py to have been run first (Blender 150 views +
-        Open3D voxelization + DINOv2 + SLAT encoding).
+        Supports both flat (slat/{oid}_feats.pt) and sharded
+        (slat/{shard}/{oid}_feats.pt) directory layouts.
 
-        SLAT files are stored in data/slat/ directory.
+        Raises FileNotFoundError if files are missing, RuntimeError if
+        files are corrupted or contain invalid data.
         """
         from trellis.modules import sparse as sp
 
-        feats_path = str(self.slat_dir / f"{obj_id}_feats.pt")
-        coords_path = str(self.slat_dir / f"{obj_id}_coords.pt")
+        feats_path = self._find_slat_file(obj_id, "feats")
+        coords_path = self._find_slat_file(obj_id, "coords")
 
         if not os.path.exists(feats_path) or not os.path.exists(coords_path):
             raise FileNotFoundError(
                 f"Pre-encoded SLAT not found for {obj_id}. "
-                f"Run 'python scripts/prerender.py' first.\n"
+                f"Run prerender.py first.\n"
                 f"  Expected: {feats_path}")
 
         logger.info(f"Loading pre-encoded SLAT for {obj_id}")
-        slat = sp.SparseTensor(
-            feats=torch.load(feats_path, weights_only=True),
-            coords=torch.load(coords_path, weights_only=True),
-        )
+        try:
+            feats = torch.load(feats_path, weights_only=True)
+            coords = torch.load(coords_path, weights_only=True)
+        except Exception as e:
+            raise RuntimeError(
+                f"Corrupted SLAT file for {obj_id} — delete and re-encode: "
+                f"{feats_path}"
+            ) from e
+
+        if feats.shape[0] != coords.shape[0]:
+            raise RuntimeError(
+                f"SLAT shape mismatch for {obj_id}: feats {feats.shape} "
+                f"vs coords {coords.shape}")
+        if not torch.isfinite(feats).all():
+            raise RuntimeError(
+                f"Non-finite SLAT feats for {obj_id} — re-encode needed")
+
+        slat = sp.SparseTensor(feats=feats, coords=coords)
         return slat
 
     # ---- Step 2: Decode SLAT → Gaussian ----
@@ -275,6 +337,13 @@ class TrellisRefiner:
         """SLAT → Gaussian (same as main.py line 291)."""
         outputs = self.trellis_text.decode_slat(slat, ['gaussian'])
         return outputs['gaussian'][0]
+
+    @torch.no_grad()
+    def encode_ss(self, coords: torch.Tensor) -> torch.Tensor:
+        """Encode voxel coords into SS VAE latent z_s [C, R, R, R]."""
+        from partcraft.io.npz_utils import encode_ss
+        encoder = self.trellis_text.models['sparse_structure_encoder']
+        return encode_ss(encoder, coords, self.device)
 
     # ---- Step 3: Part mask (replaces PartField + VLM grounding) ----
 
@@ -286,6 +355,8 @@ class TrellisRefiner:
         slat,
         edit_type: str = "Modification",
         large_part_threshold: float = 0.35,
+        promote_scale_to_global: bool = False,
+        scale_large_part_threshold: float | None = None,
     ) -> tuple[torch.Tensor, str]:
         """Build 64x64x64 voxel mask from HY3D-Part ground-truth parts.
 
@@ -309,15 +380,25 @@ class TrellisRefiner:
             return mask, "Global"
 
         import open3d as o3d
+        import tempfile
 
-        # Load VD's normalized mesh.ply for reference frame
-        vd_mesh_path = str(self.img_enc_dir / obj_id / "mesh.ply")
-        if not os.path.exists(vd_mesh_path):
-            raise FileNotFoundError(
-                f"VD mesh.ply not found at {vd_mesh_path}. "
-                "Run encode_object first.")
-
-        vd_mesh = o3d.io.read_triangle_mesh(vd_mesh_path)
+        # Load VD's normalized mesh for reference frame.
+        # Prefer img_Enc/mesh.ply; fall back to full.ply packed in mesh NPZ
+        # (mesh.ply is deleted after packing, but full.ply is equivalent).
+        vd_mesh_path = str(self.img_enc_dir / obj_id / "mesh.ply") if self.img_enc_dir else None
+        if vd_mesh_path and os.path.exists(vd_mesh_path):
+            vd_mesh = o3d.io.read_triangle_mesh(vd_mesh_path)
+        else:
+            npz = np.load(obj_record.mesh_npz_path, allow_pickle=False)
+            if "full.ply" not in npz:
+                raise FileNotFoundError(
+                    f"VD mesh.ply not found at {vd_mesh_path} and "
+                    f"full.ply not found in {obj_record.mesh_npz_path}.")
+            _tmp = tempfile.NamedTemporaryFile(suffix=".ply", delete=False)
+            _tmp.write(npz["full.ply"].tobytes())
+            _tmp.close()
+            vd_mesh = o3d.io.read_triangle_mesh(_tmp.name)
+            os.unlink(_tmp.name)
         vd_verts = np.asarray(vd_mesh.vertices)
         vd_center = (vd_verts.max(0) + vd_verts.min(0)) / 2
         vd_extent = (vd_verts.max(0) - vd_verts.min(0)).max()
@@ -417,26 +498,44 @@ class TrellisRefiner:
                 f"reliable editing at 64³ resolution.")
 
         # ---- Large part auto-promotion to Global ----
-        # If the edit part covers >threshold of SLAT voxels, part-level
-        # del/mod will cause severe artifacts (too much geometry removed).
-        # Promote to Global: full mask + Inverse Flow preserves structure,
-        # TRELLIS regenerates the whole object guided by the edit prompt.
+        # Modification keeps the historical behavior: very large local edits
+        # are promoted to global to avoid severe artifacts.
+        # Scale is handled separately because auto-promotion often suppresses
+        # part-level resize intent; disabled by default, opt-in via config.
         n_slat_total = slat.coords.shape[0]
-        if n_slat_total > 0 and edit_type == "Modification":
+        if n_slat_total > 0 and edit_type in ("Modification", "Scale"):
             part_ratio = n_edit_slat / n_slat_total
-            if part_ratio > large_part_threshold:
+            if edit_type == "Modification" and part_ratio > large_part_threshold:
                 logger.warning(
                     f"Large part detected: edit covers {part_ratio:.1%} of "
                     f"SLAT voxels (>{large_part_threshold:.0%} threshold). "
                     f"Promoting {edit_type} → Global to avoid severe artifacts.")
                 edit_type = "Global"
+            elif edit_type == "Scale":
+                scale_threshold = (
+                    scale_large_part_threshold
+                    if scale_large_part_threshold is not None
+                    else max(large_part_threshold, 0.60)
+                )
+                if promote_scale_to_global and part_ratio > scale_threshold:
+                    logger.warning(
+                        f"Large scale region: edit covers {part_ratio:.1%} of "
+                        f"SLAT voxels (>{scale_threshold:.0%} threshold). "
+                        "Promoting Scale → Global by configuration.")
+                    edit_type = "Global"
+                elif (not promote_scale_to_global) and part_ratio > large_part_threshold:
+                    logger.info(
+                        "Large scale region detected (%.1f%% of SLAT voxels) "
+                        "but keeping Scale local (promote_scale_to_global=false).",
+                        part_ratio * 100.0,
+                    )
 
         # ---- Build final mask per edit type ----
         # Strategy: keep the hard mask tight (just the edit part itself),
         # and rely on soft S1/S2 blending for smooth transitions.
         # TRELLIS generation fills the edit region; soft mask handles
         # boundary continuity without cutting into preserved geometry.
-        if edit_type == "Modification":
+        if edit_type in ("Modification", "Scale"):
             # Expanded mask: edit_parts + surrounding empty space (pad=3).
             # S1 repaint needs room to generate a replacement part that
             # may differ in size/shape from the original.  Using only
@@ -444,6 +543,12 @@ class TrellisRefiner:
             # in the exact same footprint, producing near-identical output.
             mask = self._compute_editing_region(
                 slat, edit_parts, preserved_parts, pad=3)
+        elif edit_type == "Material":
+            # Material: S2 only within part mask. Tight mask (no expansion)
+            # since geometry is unchanged — only texture gets repainted.
+            mask = edit_parts.clone()
+            logger.info(f"Material mask: {int(mask.sum())} voxels "
+                        f"(S2 texture-only, no geometry change)")
         elif edit_type == "Deletion":
             # Direct deletion: mask = exact edit part, no dilation needed.
             # Voxels in mask are directly removed from SLAT; remaining
@@ -892,7 +997,12 @@ class TrellisRefiner:
 
     def _get_edit_server_url(self) -> str:
         """Return the base URL of the image edit HTTP server."""
-        return self.image_edit_base_url or "http://localhost:8001"
+        if not self.image_edit_base_url:
+            raise ValueError(
+                "[CONFIG_ERROR] phase2_5.image_edit_base_url <missing> config "
+                "local_diffusers backend requires explicit URL"
+            )
+        return self.image_edit_base_url
 
     def _call_vlm_edit(
         self, client, img_pil: Image.Image,
@@ -1020,12 +1130,13 @@ class TrellisRefiner:
         obj_record,
         remove_part_ids: list[int],
         output_dir: str | Path,
+        *,
+        export_ply: bool = True,
     ) -> dict:
         """Delete parts by assembling remaining GT meshes directly.
 
         No SLAT encoding, no generation — just removes the target parts
-        from the ground-truth mesh and exports before/after PLY with
-        original vertex colors preserved.
+        from the ground-truth mesh. PLY export is optional.
 
         Returns dict of exported file paths.
         """
@@ -1046,26 +1157,29 @@ class TrellisRefiner:
                     f"{remove_part_ids} ({n_remove}/{n_all}), "
                     f"keeping {n_keep} parts")
 
-        # Before: full mesh with all parts
-        before_mesh = obj_record.get_assembled_mesh(
-            all_part_ids, colored=True)
-        before_path = output_dir / "before.ply"
-        before_mesh.export(str(before_path))
-        paths['before_ply'] = str(before_path)
+        if export_ply:
+            # Before: full mesh with all parts
+            before_mesh = obj_record.get_assembled_mesh(
+                all_part_ids, colored=True)
+            before_path = output_dir / "before.ply"
+            before_mesh.export(str(before_path))
+            paths['before_ply'] = str(before_path)
 
-        # After: remaining parts only
-        if keep_ids:
-            after_mesh = obj_record.get_assembled_mesh(
-                keep_ids, colored=True)
+            # After: remaining parts only
+            if keep_ids:
+                after_mesh = obj_record.get_assembled_mesh(
+                    keep_ids, colored=True)
+            else:
+                logger.warning("DirectDeletion: all parts removed!")
+                after_mesh = _trimesh.Trimesh()
+            after_path = output_dir / "after.ply"
+            after_mesh.export(str(after_path))
+            paths['after_ply'] = str(after_path)
+
+            logger.info(f"Exported GT mesh pair: before={before_path}, "
+                        f"after={after_path}")
         else:
-            logger.warning("DirectDeletion: all parts removed!")
-            after_mesh = _trimesh.Trimesh()
-        after_path = output_dir / "after.ply"
-        after_mesh.export(str(after_path))
-        paths['after_ply'] = str(after_path)
-
-        logger.info(f"Exported GT mesh pair: before={before_path}, "
-                    f"after={after_path}")
+            logger.info("Skipping GT mesh PLY export")
         return paths
 
     def edit(
@@ -1077,7 +1191,7 @@ class TrellisRefiner:
         img_new: Image.Image | None = None,
         seed: int = 1,
         combinations: list[dict] | None = None,
-    ) -> list:
+    ) -> list[dict]:
         """Run TRELLIS Flow Inversion + Repaint.
 
         Same as Vinedresser3D main.py lines 320-348.
@@ -1088,6 +1202,10 @@ class TrellisRefiner:
                       from encode_multiview_cond(). Takes priority over img_new.
             img_new: Single PIL image (legacy fallback, used if img_cond is None).
 
+        Returns:
+            List of dicts, each with keys ``slat`` (SparseTensor),
+            ``z_s_before`` (Tensor), ``z_s_after`` (Tensor).
+
         For Modification/Addition: alternates text/image conditioning.
         For Global: routed through TextureOnly — S1 is skipped entirely
             (original shape preserved), only S2 repaint changes texture.
@@ -1096,32 +1214,33 @@ class TrellisRefiner:
         """
         from interweave_Trellis import interweave_Trellis_TI
         from trellis.modules import sparse as sp
+        from partcraft.edit_types import (
+            MODIFICATION, SCALE, MATERIAL, GLOBAL,
+            S1_S2_TYPES, S2_ONLY_TYPES, trellis_effective_type,
+        )
 
-        edit_type = prompts.get('edit_type', 'Modification')
+        trellis_type = prompts.get('edit_type', 'Modification')
+        raw_type = prompts.get('raw_edit_type', '')
 
         # --- Route edit types ---
-        is_global = (edit_type == "Global")
-
         if combinations is None:
-            if is_global:
+            if raw_type in S2_ONLY_TYPES or trellis_type == "TextureOnly":
+                # Material (part-level) / Global (full mask): S2 only
                 combinations = [
                     {"s1_pos_cond": "ori_s1_cpl", "s1_neg_cond": "ori_s1_cpl",
                      "s2_pos_cond": "new_s2_cpl", "s2_neg_cond": "ori_s2_cpl",
                      "cnt": 1, "cfg_strength": 5.0},
                 ]
             else:
-                # Modification/Addition
+                # Modification / Scale / Addition: S1+S2 repaint
                 combinations = [
                     {"s1_pos_cond": "new_s1_cpl", "s1_neg_cond": "ori_s1_cpl",
                      "s2_pos_cond": "new_s2_cpl", "s2_neg_cond": "ori_s2_cpl",
                      "cnt": 1, "cfg_strength": 7.5},
                 ]
 
-        # Global → "TextureOnly": skip S1, keep original coords, S2 only.
-        if is_global:
-            effective_edit_type = "TextureOnly"
-        else:
-            effective_edit_type = edit_type
+        # Map to interweave_Trellis_TI's understood types
+        effective_edit_type = trellis_effective_type(raw_type) if raw_type else trellis_type
 
         # Setup image conditioning
         # Priority: img_cond (multi-view averaged) > img_new (single) > blank
@@ -1155,10 +1274,22 @@ class TrellisRefiner:
                             f"edit_type={effective_edit_type}, "
                             f"cfg={combo['cfg_strength']}")
 
-                slat_new = interweave_Trellis_TI(
+                result = interweave_Trellis_TI(
                     args, self.trellis_text, self.trellis_img,
                     slat, mask, prompts, effective_img, seed=seed)
-                slats_edited.append(slat_new)
+                # Squeeze batch dim from interweave z_s tensors
+                # to match encode_ss() output shape [C, R, R, R]
+                z_s_b = result["z_s_before"]
+                z_s_a = result["z_s_after"]
+                if z_s_b.dim() == 5:
+                    z_s_b = z_s_b.squeeze(0)
+                if z_s_a.dim() == 5:
+                    z_s_a = z_s_a.squeeze(0)
+                slats_edited.append({
+                    "slat": result["slat"],
+                    "z_s_before": z_s_b,
+                    "z_s_after": z_s_a,
+                })
         finally:
             if _patched:
                 self.trellis_img.preprocess_image = _orig_preprocess
@@ -1168,37 +1299,49 @@ class TrellisRefiner:
 
     # ---- Step 6: Export ----
 
+    @staticmethod
+    def _save_npz(
+        path: Path,
+        slat,
+        z_s: torch.Tensor | None,
+        dino_voxel_mean: np.ndarray | None = None,
+    ) -> None:
+        """Write a single ``{tag}.npz`` containing SLAT + SS + optional DINOv2."""
+        from partcraft.io.npz_utils import save_npz
+        save_npz(path, slat.feats, slat.coords, z_s)
+
     def export_pair(
         self,
         slat_before,
         slat_edited,
         output_dir: str | Path,
+        *,
+        z_s_before: torch.Tensor | None = None,
+        z_s_after: torch.Tensor | None = None,
     ) -> dict:
-        """Export before/after pair as Gaussian PLY only.
+        """Export before/after pair as ``before.npz`` / ``after.npz``.
 
-        Multiview rendering and video generation are decoupled into
-        scripts/vis/render_gs_pairs.py for faster editing throughput.
+        Each npz contains keys ``slat_feats``, ``slat_coords``, ``ss``.
+        If ``z_s_before``/``z_s_after`` are not provided the SS latent is
+        computed on the fly via :meth:`encode_ss`.
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         paths = {}
 
-        for tag, slat in [('before', slat_before), ('after', slat_edited)]:
-            gaussian = self.decode_to_gaussian(slat)
+        if z_s_before is None:
+            z_s_before = self.encode_ss(slat_before.coords)
+        if z_s_after is None:
+            z_s_after = self.encode_ss(slat_edited.coords)
 
-            # Save Gaussian PLY
-            ply_path = output_dir / f"{tag}.ply"
-            gaussian.save_ply(str(ply_path))
-            paths[f'{tag}_ply'] = str(ply_path)
-
-            # Save SLAT for visualization tool
-            slat_path = output_dir / f"{tag}_slat"
-            slat_path.mkdir(parents=True, exist_ok=True)
-            torch.save(slat.feats, slat_path / "feats.pt")
-            torch.save(slat.coords, slat_path / "coords.pt")
-            paths[f'{tag}_slat'] = str(slat_path)
-
-            logger.info(f"Exported {tag}: {ply_path}")
+        for tag, slat, z_s in [
+            ('before', slat_before, z_s_before),
+            ('after', slat_edited, z_s_after),
+        ]:
+            npz_path = output_dir / f"{tag}.npz"
+            self._save_npz(npz_path, slat, z_s)
+            paths[f'{tag}_npz'] = str(npz_path)
+            logger.info("Exported %s: %s", tag, npz_path)
 
         return paths
 
@@ -1208,79 +1351,127 @@ class TrellisRefiner:
         slat_edited,
         output_dir: str | Path,
         shared_before_dir: str | Path | None = None,
+        *,
+        z_s_before: torch.Tensor | None = None,
+        z_s_after: torch.Tensor | None = None,
     ) -> dict:
-        """Export before/after pair, reusing a shared 'before' directory.
+        """Export before/after pair, reusing a shared ``before.npz``.
 
-        When multiple edits share the same original object, the 'before'
-        PLY + SLAT only needs to be saved once. Pass ``shared_before_dir``
-        pointing to the already-exported before data to create symlinks
-        instead of re-exporting.
+        When multiple edits share the same original object the 'before'
+        data only needs to be saved once.  Pass ``shared_before_dir`` to
+        create a symlink instead of re-exporting.
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         paths = {}
 
         # ---- Before: reuse or export ----
+        before_npz = output_dir / "before.npz"
         if shared_before_dir and Path(shared_before_dir).exists():
             src = Path(shared_before_dir)
-            src_has_slat = (src / "before_slat").exists()
-
-            if src_has_slat:
-                # Source has GS before — symlink both PLY and SLAT
-                before_ply = output_dir / "before.ply"
-                if not before_ply.exists():
-                    src_ply = src / "before.ply"
-                    if src_ply.exists():
-                        rel = os.path.relpath(src_ply, output_dir)
-                        before_ply.symlink_to(rel)
-                paths['before_ply'] = str(before_ply)
-
-                before_slat = output_dir / "before_slat"
-                if not before_slat.exists():
-                    rel = os.path.relpath(src / "before_slat", output_dir)
-                    before_slat.symlink_to(rel)
-                paths['before_slat'] = str(before_slat)
+            src_npz = src / "before.npz"
+            if src_npz.exists() and not before_npz.exists():
+                rel = os.path.relpath(src_npz, output_dir)
+                before_npz.symlink_to(rel)
+                paths['before_npz'] = str(before_npz)
+            elif before_npz.exists():
+                paths['before_npz'] = str(before_npz)
             else:
-                # Source has no SLAT (e.g. deletion used direct mesh
-                # removal).  Export GS before PLY + SLAT from scratch.
-                gaussian = self.decode_to_gaussian(slat_before)
-                ply_path = output_dir / "before.ply"
-                gaussian.save_ply(str(ply_path))
-                paths['before_ply'] = str(ply_path)
-
-                before_slat = output_dir / "before_slat"
-                before_slat.mkdir(parents=True, exist_ok=True)
-                torch.save(slat_before.feats, before_slat / "feats.pt")
-                torch.save(slat_before.coords, before_slat / "coords.pt")
-                paths['before_slat'] = str(before_slat)
+                if z_s_before is None:
+                    z_s_before = self.encode_ss(slat_before.coords)
+                self._save_npz(before_npz, slat_before, z_s_before)
+                paths['before_npz'] = str(before_npz)
         else:
-            # First edit for this object: export before
-            gaussian = self.decode_to_gaussian(slat_before)
-            ply_path = output_dir / "before.ply"
-            gaussian.save_ply(str(ply_path))
-            paths['before_ply'] = str(ply_path)
-            slat_path = output_dir / "before_slat"
-            slat_path.mkdir(parents=True, exist_ok=True)
-            torch.save(slat_before.feats, slat_path / "feats.pt")
-            torch.save(slat_before.coords, slat_path / "coords.pt")
-            paths['before_slat'] = str(slat_path)
+            if z_s_before is None:
+                z_s_before = self.encode_ss(slat_before.coords)
+            self._save_npz(before_npz, slat_before, z_s_before)
+            paths['before_npz'] = str(before_npz)
 
         # ---- After: always export ----
-        gaussian = self.decode_to_gaussian(slat_edited)
-        ply_path = output_dir / "after.ply"
-        gaussian.save_ply(str(ply_path))
-        paths['after_ply'] = str(ply_path)
-        slat_path = output_dir / "after_slat"
-        slat_path.mkdir(parents=True, exist_ok=True)
-        torch.save(slat_edited.feats, slat_path / "feats.pt")
-        torch.save(slat_edited.coords, slat_path / "coords.pt")
-        paths['after_slat'] = str(slat_path)
+        if z_s_after is None:
+            z_s_after = self.encode_ss(slat_edited.coords)
+        after_npz = output_dir / "after.npz"
+        self._save_npz(after_npz, slat_edited, z_s_after)
+        paths['after_npz'] = str(after_npz)
 
-        logger.info(f"Exported: after={ply_path}, "
-                    f"before={'shared' if shared_before_dir else 'new'}")
+        logger.info(
+            "Exported pair (%s before): npz",
+            "shared" if shared_before_dir else "new",
+        )
+        return paths
+
+    def export_deletion_pair(
+        self,
+        ori_slat,
+        mask: torch.Tensor,
+        output_dir: str | Path,
+    ) -> dict:
+        """Export SLAT+SS pair for a deletion edit.
+
+        ``before`` = original SLAT, ``after`` = SLAT with deleted-part
+        voxels removed.  SS latents are computed from the respective
+        occupancy grids.
+        """
+        from interweave_Trellis import get_coords_mask
+        from trellis.modules import sparse as sp
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        paths = {}
+
+        keep = get_coords_mask(ori_slat.coords, mask)
+        after_slat = sp.SparseTensor(
+            feats=ori_slat.feats[keep],
+            coords=ori_slat.coords[keep],
+        )
+
+        z_s_before = self.encode_ss(ori_slat.coords)
+        z_s_after = self.encode_ss(after_slat.coords)
+
+        before_npz = output_dir / "before.npz"
+        self._save_npz(before_npz, ori_slat, z_s_before)
+        paths['before_npz'] = str(before_npz)
+
+        after_npz = output_dir / "after.npz"
+        self._save_npz(after_npz, after_slat, z_s_after)
+        paths['after_npz'] = str(after_npz)
+
+        logger.info("Exported deletion pair: %s", output_dir)
         return paths
 
     # ---- Utility ----
+
+    @staticmethod
+    def load_pair_npz(pair_dir: str | Path, tag: str = "before",
+                      device: str = "cpu") -> dict:
+        """Load SLAT + SS from ``{tag}.npz`` or legacy ``{tag}_slat/`` dir.
+
+        Returns dict with keys ``slat_feats``, ``slat_coords``,
+        and optionally ``ss``.  All values are ``torch.Tensor``.
+        """
+        pair_dir = Path(pair_dir)
+        npz_path = pair_dir / f"{tag}.npz"
+        if npz_path.exists():
+            data = np.load(str(npz_path))
+            out = {
+                "slat_feats": torch.from_numpy(data["slat_feats"]).to(device),
+                "slat_coords": torch.from_numpy(data["slat_coords"]).to(device),
+            }
+            if "ss" in data:
+                out["ss"] = torch.from_numpy(data["ss"]).to(device)
+            return out
+        # Legacy: directory with feats.pt / coords.pt
+        legacy = pair_dir / f"{tag}_slat"
+        if legacy.exists():
+            resolved = legacy.resolve()
+            feats = torch.load(resolved / "feats.pt", weights_only=True)
+            coords = torch.load(resolved / "coords.pt", weights_only=True)
+            return {
+                "slat_feats": feats.to(device),
+                "slat_coords": coords.to(device),
+            }
+        raise FileNotFoundError(
+            f"No SLAT data for tag '{tag}' in {pair_dir}")
 
     @staticmethod
     def extract_glb(mesh_zip_path: str, obj_id: str, out_dir: str) -> str:

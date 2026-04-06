@@ -61,15 +61,22 @@ def main():
     cfg = load_config(args.config)
     logger = setup_logging(cfg, "encode_slat")
     p25_cfg = cfg.get("phase2_5", {})
+    project_root = Path(__file__).resolve().parents[2]
 
-    # Paths
+    # Paths (resolve early so mesh.zip / metadata exist regardless of cwd)
     data_dir = Path(cfg["data"].get("data_dir", "data/partobjaverse_tiny"))
+    if not data_dir.is_absolute():
+        data_dir = project_root / data_dir
+    data_dir = data_dir.resolve()
     mesh_zip = data_dir / "source" / "mesh.zip"
     if not mesh_zip.exists():
         logger.error(f"source/mesh.zip not found at {mesh_zip}")
         sys.exit(1)
 
     cache_dir = Path(p25_cfg.get("cache_dir", "cache/phase2_5"))
+    if not cache_dir.is_absolute():
+        cache_dir = project_root / cache_dir
+    cache_dir = cache_dir.resolve()
     slat_cache_dir = cache_dir / "slat_cache"
     slat_cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -98,13 +105,11 @@ def main():
 
     logger.info(f"Encoding {len(obj_ids)} objects into SLAT")
 
-    # encode_asset scripts use relative paths like outputs/img_Enc/, outputs/slat/
-    # These resolve via third_party/outputs/ symlinks
-    project_root = Path(__file__).resolve().parents[2]
+    os.environ["PARTCRAFT_DATASET_ROOT"] = str(data_dir)
     third_party = str(project_root / "third_party")
     if third_party not in sys.path:
         sys.path.insert(0, third_party)
-    os.chdir(third_party)
+    os.chdir(str(data_dir))
 
     from encode_asset.render_img_for_enc import renderImg_voxelize
     from encode_asset.encode_into_SLAT import encode_into_SLAT
@@ -129,8 +134,8 @@ def main():
 
                 # 4. Copy SLAT to our cache
                 import shutil
-                src_feats = Path(f"outputs/slat/{oid}_feats.pt")
-                src_coords = Path(f"outputs/slat/{oid}_coords.pt")
+                src_feats = data_dir / "slat" / f"{oid}_feats.pt"
+                src_coords = data_dir / "slat" / f"{oid}_coords.pt"
                 if src_feats.exists() and src_coords.exists():
                     shutil.copy2(str(src_feats), str(slat_cache_dir / f"{oid}_feats.pt"))
                     shutil.copy2(str(src_coords), str(slat_cache_dir / f"{oid}_coords.pt"))
