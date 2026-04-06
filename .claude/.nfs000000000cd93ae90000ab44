@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m json.tool)",
+      "Bash(grep -E \"voxels|mesh|transforms\" echo ---当前正在运行的进程--- pgrep -af \"prerender|blender\")"
+    ]
+  }
+}

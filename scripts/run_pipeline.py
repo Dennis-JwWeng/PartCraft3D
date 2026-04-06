@@ -936,29 +936,22 @@ def run_step_3d_edit_multi_gpu(
 # Step 5: Quality Scoring
 # =========================================================================
 
+_STEP56_DEPRECATED_MSG = (
+    "Step 5/6 of run_pipeline.py have been removed. "
+    "The post-Step4 flow now lives outside the main pipeline:\n"
+    "  1. scripts/tools/repack_to_object_dirs.py     (flat mesh_pairs/ → object-centric partverse_pairs/)\n"
+    "  2. scripts/tools/migrate_slat_to_npz.py --phase 1   (mod/scl/mat/glb *_slat/ → NPZ)\n"
+    "  3. scripts/tools/run_vlm_cleaning_multi_gpu.sh      (decoupled render + score, --render-only supported)\n"
+    "  4. scripts/tools/extract_passed_deletion_ids.py     (vlm_scores.jsonl → passed_deletion_ids.txt)\n"
+    "  5. scripts/tools/migrate_slat_to_npz.py --phase 5 --include-list ...   (deletion PLY → 40-view re-encode)\n"
+    "  6. scripts/tools/migrate_slat_to_npz.py --phase 3,4                    (addition/identity backfill)\n"
+    "See docs/ARCH.md §389-470 for the full flow."
+)
+
+
 def run_step_quality(cfg, results_path, logger, tag=None, limit=None):
-    """Step 5: VLM quality scoring + tier classification."""
-    logger.info("=" * 60)
-    logger.info("STEP 5: Quality Scoring (VLM)")
-    logger.info("=" * 60)
-
-    from partcraft.phase3_filter.vlm_filter import run_vlm_filter
-    p25_cfg = cfg.get("phase2_5", {})
-    cache_dir = Path(p25_cfg["cache_dir"])
-    output_dir = Path(cfg["data"]["output_dir"])
-    tag_suffix = f"_{tag}" if tag else ""
-    mesh_pairs_dir = output_dir / f"mesh_pairs{tag_suffix}"
-
-    phase3_dir = cache_dir / f"phase3{tag_suffix}"
-    run_vlm_filter(
-        cfg, str(results_path), str(mesh_pairs_dir),
-        str(phase3_dir),
-        limit=limit)
-
-    scores_file = phase3_dir / "vlm_scores.jsonl"
-    out = str(scores_file) if scores_file.is_file() else None
-    logger.info(f"Quality scores: {out}")
-    return out
+    """Removed. Use scripts/tools/run_vlm_cleaning.py — see deprecation message."""
+    raise RuntimeError(_STEP56_DEPRECATED_MSG)
 
 
 # =========================================================================
@@ -966,82 +959,8 @@ def run_step_quality(cfg, results_path, logger, tag=None, limit=None):
 # =========================================================================
 
 def run_step_export(cfg, specs_path, scores_path, logger, tag=None):
-    """Step 6: Instruction generation + final dataset export."""
-    logger.info("=" * 60)
-    logger.info("STEP 6: Export")
-    logger.info("=" * 60)
-
-    from partcraft.io.export import EditPairWriter, EditPairRecord
-    from partcraft.phase4_filter.instruction import generate_instructions
-
-    output_dir = Path(cfg["data"]["output_dir"])
-    tag_suffix = f"_{tag}" if tag else ""
-    n_variants = cfg.get("phase3", {}).get("instructions_per_edit", 3)
-
-    # Load passed entries from quality scoring
-    passed_entries = []
-    if scores_path and Path(scores_path).exists():
-        with open(scores_path, encoding="utf-8", errors="replace") as f:
-            for lineno, line in enumerate(f, 1):
-                line = line.strip().replace("\x00", "")
-                if not line or not line.startswith("{"):
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    logger.warning(
-                        "Skipping invalid JSON in scores file line %s", lineno
-                    )
-                    continue
-                if entry.get("quality_tier") in ("high", "medium"):
-                    passed_entries.append(entry)
-
-    if not passed_entries:
-        logger.warning("No passed entries for export")
-        return None
-
-    # Load edit specs
-    specs_map: dict[str, EditSpec] = {}
-    with open(specs_path) as f:
-        for line in f:
-            if line.strip():
-                d = json.loads(line)
-                specs_map[d["edit_id"]] = EditSpec(**d)
-
-    exported = 0
-    export_path = output_dir / f"edit_pairs{tag_suffix}.jsonl"
-    with EditPairWriter(output_dir,
-                        filename=f"edit_pairs{tag_suffix}.jsonl") as writer:
-        for entry in passed_entries:
-            eid = entry["edit_id"]
-            spec = specs_map.get(eid)
-            if spec is None:
-                continue
-
-            instructions = generate_instructions(spec, n_variants)
-            if not instructions:
-                continue
-
-            record = EditPairRecord(
-                edit_id=eid,
-                edit_type=entry.get("effective_edit_type", spec.edit_type),
-                instruction=instructions[0],
-                instruction_variants=instructions[1:],
-                source_obj_id=spec.obj_id,
-                source_shard=spec.shard,
-                object_desc=spec.object_desc,
-                edit_prompt=spec.edit_prompt,
-                after_desc=spec.after_desc,
-                quality_tier=entry.get("quality_tier", ""),
-                quality_score=float(
-                    entry.get("quality_score", entry.get("score", 0.0))
-                ),
-            )
-            writer.write_pair(record)
-            exported += 1
-
-    logger.info(f"Exported {exported} pairs → {export_path}")
-    return export_path
+    """Removed. Use repack_to_object_dirs.py + migrate_slat_to_npz.py — see deprecation message."""
+    raise RuntimeError(_STEP56_DEPRECATED_MSG)
 
 
 # =========================================================================

@@ -1,18 +1,19 @@
-"""Phase 3: VLM-based quality filter for Phase 2.5 SLAT edit pairs.
+"""VLM judge library for edit-pair quality scoring.
 
-Optional **mesh prefilter** (``phase3.vlm_mesh_prefilter``): cheap ``trimesh``
-checks on ``before.ply`` / ``after.ply`` *before* TRELLIS decode and VLM.
-Failsures are scored as ``negative`` and skip rendering + API calls.
+This module is a pure **library** (no main, no batch runner).  The previous
+``run_vlm_filter`` / ``evaluate_edit`` / mesh-prefilter / PLY-render entries
+have been removed; the active entry point for VLM cleaning is
+``scripts/tools/run_vlm_cleaning.py`` (object-centric ``partverse_pairs/``
+layout, decoupled render + score, multi-GPU launcher).
 
-The VLM evaluates:
-  1. edit_executed   — did the edit actually happen?
-  2. correct_region  — was the right part modified?
-  3. preserve_other  — are unedited parts preserved?
-  4. visual_quality  — overall visual quality (1-5)
-  5. artifact_free   — no broken geometry / floating blobs?
-
-Each edit pair gets a structured JSON score.  Pairs below threshold
-are marked as failed.
+Public API:
+  * ``VLMScore``                    — dataclass for one edit's score
+  * ``compute_composite_score``     — weighted scalar from VLMScore fields
+  * ``classify_tier``               — high / medium / low / negative / rejected
+  * ``compose_comparison``          — top=before / bottom=after PNG grid
+  * ``build_judge_prompt``          — VLM prompt (Part 1 edit + Part 2 prompt eval)
+  * ``call_vlm_judge``              — OpenAI-compatible chat call with JSON parse
+  * ``_VLM_YAWS`` / ``_VLM_PITCHES``— 3-view optimal-coverage angles (single source)
 """
 
 from __future__ import annotations
@@ -22,38 +23,23 @@ import io
 import json
 import logging
 import math
-import os
 import re
 from dataclasses import dataclass, asdict
-from pathlib import Path
 
 import numpy as np
-import torch
 
 logger = logging.getLogger(__name__)
 
-# Public API for reuse by partcraft.cleaning
 __all__ = [
     "VLMScore",
     "compute_composite_score",
     "classify_tier",
-    "call_vlm_judge",
-    "render_views",
-    "render_ply_views",
     "compose_comparison",
-    "load_slat",
     "build_judge_prompt",
-    "evaluate_edit_from_ply",
-    "evaluate_edit_from_slat_dir",
+    "call_vlm_judge",
     "_VLM_YAWS",
     "_VLM_PITCHES",
 ]
-
-# Mesh prefilter: full ``evaluate_pair`` (volume / edit ratio / …) only for types
-# where vertex motion is expected.  Light checks for del/add.  Skip for identity
-# and appearance-only edits (material/global) where metrics misfire.
-_MESH_PREFILTER_FULL = frozenset({"modification", "scale"})
-_MESH_PREFILTER_LIGHT = frozenset({"deletion", "addition"})
 
 
 # ---------------------------------------------------------------------------
@@ -71,11 +57,11 @@ class VLMScore:
     visual_quality: int = 0        # 1-5
     artifact_free: bool = False
     reason: str = ""
-    prompt_quality: int = 0        # 1-5: how well edit_prompt matches the visual change
-    improved_prompt: str = ""      # VLM-suggested edit_prompt (always filled)
-    improved_after_desc: str = ""  # VLM-suggested after_desc (always filled)
+    prompt_quality: int = 0        # 1-5
+    improved_prompt: str = ""
+    improved_after_desc: str = ""
     score: float = 0.0             # composite [0, 1]
-    quality_tier: str = "rejected" # "high" / "medium" / "low" / "negative" / "rejected"
+    quality_tier: str = "rejected" # high / medium / low / negative / rejected
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -84,15 +70,10 @@ class VLMScore:
 def compute_composite_score(s: VLMScore) -> float:
     """Weighted composite score from VLM judgments."""
     total = 0.0
-    # edit_executed: 30%
     total += 0.3 * (1.0 if s.edit_executed else 0.0)
-    # correct_region: 20%
     total += 0.2 * (1.0 if s.correct_region else 0.0)
-    # preserve_other: 20%
     total += 0.2 * (1.0 if s.preserve_other else 0.0)
-    # visual_quality: 20% (normalized 1-5 → 0-1)
     total += 0.2 * max(0, (s.visual_quality - 1)) / 4.0
-    # artifact_free: 10%
     total += 0.1 * (1.0 if s.artifact_free else 0.0)
     return round(total, 4)
 
@@ -100,11 +81,11 @@ def compute_composite_score(s: VLMScore) -> float:
 def classify_tier(s: VLMScore) -> str:
     """Classify edit quality into tiers.
 
-    - high:     All criteria met, visual_quality >= 4 — ideal training data
-    - medium:   All criteria met, visual_quality = 3 — usable training data
-    - low:      Minor issues (e.g. small artifacts) — use with caution
-    - negative: Edit failed or wrong region — negative sample for training
-    - rejected: Evaluation error / no VLM response — discard
+    - high:     all criteria met, visual_quality >= 4 — ideal training data
+    - medium:   all criteria met, visual_quality = 3 — usable training data
+    - low:      minor issues — use with caution
+    - negative: edit failed or wrong region — usable as negative sample
+    - rejected: evaluation error / no VLM response — discard
     """
     if s.score == 0.0 and not s.edit_executed:
         if s.reason.startswith("Evaluation error") or \
@@ -113,74 +94,28 @@ def classify_tier(s: VLMScore) -> str:
 
     if not s.edit_executed or not s.correct_region:
         return "negative"
-
     if s.preserve_other and s.artifact_free and s.visual_quality >= 4:
         return "high"
-
     if s.preserve_other and s.artifact_free and s.visual_quality >= 3:
         return "medium"
-
     if s.visual_quality >= 2:
         return "low"
-
     return "negative"
 
 
 # ---------------------------------------------------------------------------
-# Rendering helpers (reuse from vis module)
+# 3-view optimal coverage angles (single source of truth)
 # ---------------------------------------------------------------------------
 
-def load_slat(slat_dir: Path, device: str = "cuda"):
-    """Load SLAT from feats.pt + coords.pt.
-
-    Raises RuntimeError if files are corrupted or contain invalid data.
-    """
-    from trellis.modules import sparse as sp
-    feats_path = slat_dir / "feats.pt"
-    coords_path = slat_dir / "coords.pt"
-    try:
-        feats = torch.load(feats_path, weights_only=True)
-        coords = torch.load(coords_path, weights_only=True)
-    except Exception as e:
-        raise RuntimeError(
-            f"Corrupted SLAT in {slat_dir} — delete and re-encode"
-        ) from e
-    if feats.shape[0] != coords.shape[0]:
-        raise RuntimeError(
-            f"SLAT shape mismatch in {slat_dir}: "
-            f"feats {feats.shape} vs coords {coords.shape}")
-    if not torch.isfinite(feats).all():
-        raise RuntimeError(f"Non-finite SLAT feats in {slat_dir}")
-    return sp.SparseTensor(feats=feats.to(device), coords=coords.to(device))
-
-
-# 3-view optimal coverage angles (shared with run_vlm_cleaning).
 # View 1 (0°, 26°): front + sides;  View 2 (120°, 26°): right-back;
 # View 3 (240°, 63°): left-back + top surface.
-_VLM_YAWS   = [0.0, 2 * math.pi / 3, 4 * math.pi / 3]
+_VLM_YAWS    = [0.0, 2 * math.pi / 3, 4 * math.pi / 3]
 _VLM_PITCHES = [0.45, 0.45, 1.1]
 
 
-def render_views(pipeline, slat, num_views: int = 3,
-                 pitch: float = 0.45) -> list[np.ndarray]:
-    """Render multiview images from SLAT via pipeline.decode_slat → Gaussian.
-
-    Default 3 views use the optimal-coverage angles (_VLM_YAWS / _VLM_PITCHES).
-    If *num_views* differs from 3, falls back to uniform yaw with constant pitch.
-    """
-    from trellis.utils import render_utils
-    outputs = pipeline.decode_slat(slat, ['gaussian'])
-    gaussian = outputs['gaussian'][0]
-    if num_views == 3:
-        yaws = _VLM_YAWS
-        pitches = _VLM_PITCHES
-    else:
-        yaws = torch.linspace(0, 2 * math.pi, num_views + 1)[:-1].tolist()
-        pitches = [pitch] * num_views
-    imgs = render_utils.Trellis_render_multiview_images(
-        gaussian, yaws, pitches)['color']
-    return imgs
-
+# ---------------------------------------------------------------------------
+# Image composition
+# ---------------------------------------------------------------------------
 
 def compose_comparison(before_imgs: list[np.ndarray],
                        after_imgs: list[np.ndarray]) -> bytes:
@@ -201,16 +136,12 @@ def compose_comparison(before_imgs: list[np.ndarray],
     draw = ImageDraw.Draw(canvas)
 
     for i in range(n):
-        # Before row
-        img_b = Image.fromarray(before_imgs[i])
-        canvas.paste(img_b, (i * w, label_h))
-        # After row
-        img_a = Image.fromarray(after_imgs[i])
-        canvas.paste(img_a, (i * w, h + label_h * 2))
+        canvas.paste(Image.fromarray(before_imgs[i]), (i * w, label_h))
+        canvas.paste(Image.fromarray(after_imgs[i]), (i * w, h + label_h * 2))
 
-    # Labels
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
     except Exception:
         font = ImageFont.load_default()
     draw.text((canvas_w // 2 - 30, 4), "Before", fill=(0, 0, 0), font=font)
@@ -223,144 +154,16 @@ def compose_comparison(before_imgs: list[np.ndarray],
 
 
 # ---------------------------------------------------------------------------
-# PLY rendering (Blender-based, no TRELLIS needed)
-# ---------------------------------------------------------------------------
-
-def render_ply_views(
-    ply_path: str | Path,
-    num_views: int = 3,
-    blender_path: str = "blender",
-    resolution: int = 512,
-) -> list[np.ndarray]:
-    """Render multiview images from a PLY mesh via Blender.
-
-    Default 3 views use optimal-coverage angles.
-    Returns list of (H, W, 3) uint8 numpy arrays — same format as
-    ``render_views()`` for drop-in compatibility.
-    """
-    import sys
-    _project_root = Path(__file__).resolve().parents[2]
-    vis_dir = str(_project_root / "scripts" / "vis")
-    if vis_dir not in sys.path:
-        sys.path.insert(0, vis_dir)
-    from render_ply_pairs import render_3views, render_4views  # noqa: E402
-
-    if num_views == 3:
-        imgs = render_3views(str(ply_path), resolution=resolution,
-                             blender_path=blender_path)
-    else:
-        imgs = render_4views(str(ply_path), resolution=resolution,
-                             blender_path=blender_path)
-        if num_views < len(imgs):
-            imgs = imgs[:num_views]
-    return imgs
-
-
-# ---------------------------------------------------------------------------
-# Convenience evaluators for different data formats
-# ---------------------------------------------------------------------------
-
-def evaluate_edit_from_ply(
-    before_ply: str | Path,
-    after_ply: str | Path,
-    edit_id: str,
-    edit_type: str,
-    edit_prompt: str,
-    object_desc: str,
-    part_label: str,
-    vlm_client,
-    vlm_model: str,
-    *,
-    num_views: int = 3,
-    blender_path: str = "blender",
-    vlm_max_tokens: int = 4096,
-    vlm_json_object_mode: bool = False,
-) -> VLMScore:
-    """Evaluate an edit pair from PLY files: Blender render → VLM judge."""
-    score = VLMScore(edit_id=edit_id, edit_type=edit_type)
-    try:
-        before_imgs = render_ply_views(before_ply, num_views,
-                                       blender_path=blender_path)
-        after_imgs = render_ply_views(after_ply, num_views,
-                                      blender_path=blender_path)
-        comp_bytes = compose_comparison(before_imgs, after_imgs)
-        result = call_vlm_judge(
-            vlm_client, vlm_model, comp_bytes,
-            edit_prompt, edit_type, object_desc, part_label,
-            max_tokens=vlm_max_tokens,
-            json_object_mode=vlm_json_object_mode,
-        )
-        if result is None:
-            score.reason = "VLM returned no valid response"
-            return score
-        score.edit_executed = bool(result.get("edit_executed", False))
-        score.correct_region = bool(result.get("correct_region", False))
-        score.preserve_other = bool(result.get("preserve_other", False))
-        score.visual_quality = int(result.get("visual_quality", 0))
-        score.artifact_free = bool(result.get("artifact_free", False))
-        score.reason = result.get("reason", "")
-        score.score = compute_composite_score(score)
-        score.quality_tier = classify_tier(score)
-    except Exception as e:
-        score.reason = f"Evaluation error: {e}"
-        logger.error("  %s: %s", edit_id, e)
-    return score
-
-
-def evaluate_edit_from_slat_dir(
-    pipeline,
-    slat_dir_before: str | Path,
-    slat_dir_after: str | Path,
-    edit_id: str,
-    edit_type: str,
-    edit_prompt: str,
-    object_desc: str,
-    part_label: str,
-    vlm_client,
-    vlm_model: str,
-    *,
-    num_views: int = 3,
-    device: str = "cuda",
-    vlm_max_tokens: int = 4096,
-    vlm_json_object_mode: bool = False,
-) -> VLMScore:
-    """Evaluate an edit pair from ``*_slat/`` directories.
-
-    Loads feats.pt + coords.pt, decodes via TRELLIS Gaussian, renders,
-    and sends to VLM — same as ``evaluate_edit`` but takes directory paths
-    instead of pre-loaded SLATs.
-    """
-    return evaluate_edit(
-        pipeline=pipeline,
-        slat_dir_before=Path(slat_dir_before),
-        slat_dir_after=Path(slat_dir_after),
-        edit_id=edit_id,
-        edit_type=edit_type,
-        edit_prompt=edit_prompt,
-        object_desc=object_desc,
-        part_label=part_label,
-        vlm_client=vlm_client,
-        vlm_model=vlm_model,
-        num_views=num_views,
-        device=device,
-        vlm_max_tokens=vlm_max_tokens,
-        vlm_json_object_mode=vlm_json_object_mode,
-    )
-
-
-# ---------------------------------------------------------------------------
-# VLM judge
+# VLM judge prompt
 # ---------------------------------------------------------------------------
 
 def build_judge_prompt(edit_prompt: str, edit_type: str,
                        object_desc: str, part_label: str) -> str:
     """Build the VLM judge prompt.
 
-    Public API — reused by partcraft.cleaning for Layer 3 VLM evaluation.
-
-    The prompt asks the VLM to:
-    1. Evaluate edit quality (5 criteria)
-    2. Rate the edit_prompt quality and provide an improved version
+    Asks the VLM to:
+      1. Evaluate edit quality (5 criteria)
+      2. Rate the edit_prompt quality and provide an improved version
     """
     prompt_section = f'- Edit prompt: "{edit_prompt}"' if edit_prompt.strip() else \
         "- Edit prompt: (none provided — you MUST infer what happened from the images)"
@@ -396,6 +199,10 @@ Example shape:
 
 Be strict but fair. Minor imperfections are acceptable (quality=3-4). Only fail edit_executed if there is NO visible change."""
 
+
+# ---------------------------------------------------------------------------
+# JSON extraction helpers
+# ---------------------------------------------------------------------------
 
 def _balanced_brace_object(s: str, start: int) -> str | None:
     """If s[start] == '{', return the balanced JSON object substring, else None."""
@@ -462,7 +269,7 @@ def _extract_json_from_vlm(content: str) -> dict | None:
         r"`think`.*?`</think>`", "", content, flags=re.DOTALL | re.IGNORECASE
     ).strip()
 
-    # Strip markdown code fences: ```json ... ``` or ``` ... ```
+    # Strip markdown code fences
     fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", content, re.DOTALL)
     if fence_match:
         inner = fence_match.group(1).strip()
@@ -471,20 +278,22 @@ def _extract_json_from_vlm(content: str) -> dict | None:
             return got
         content = inner
 
-    # Whole buffer
     got = _parse_vlm_score_dict(content)
     if got is not None:
         return got
 
     # Prefer the last valid object with schema keys (final answer after CoT)
-    blocks = _iter_json_object_substrings(content)
-    for blob in reversed(blocks):
+    for blob in reversed(_iter_json_object_substrings(content)):
         got = _parse_vlm_score_dict(blob)
         if got is not None:
             return got
 
     return None
 
+
+# ---------------------------------------------------------------------------
+# VLM judge call
+# ---------------------------------------------------------------------------
 
 def call_vlm_judge(client, model: str, img_bytes: bytes,
                    edit_prompt: str, edit_type: str,
@@ -494,7 +303,7 @@ def call_vlm_judge(client, model: str, img_bytes: bytes,
                    json_object_mode: bool = False) -> dict | None:
     """Call VLM to judge edit quality. Returns parsed JSON or None."""
     import time
-    b64 = base64.b64encode(img_bytes).decode('utf-8')
+    b64 = base64.b64encode(img_bytes).decode("utf-8")
     base_text = build_judge_prompt(edit_prompt, edit_type, object_desc, part_label)
     strict_suffix = (
         "\n\nIf you already wrote analysis above, IGNORE it for the parser: "
@@ -509,9 +318,7 @@ def call_vlm_judge(client, model: str, img_bytes: bytes,
             "Never write explanations, headings, or markdown."
         )
         if attempt > 0:
-            sys_msg += (
-                " Your reply must be a single JSON object; no chain-of-thought."
-            )
+            sys_msg += " Your reply must be a single JSON object; no chain-of-thought."
         try:
             create_kw: dict = {
                 "model": model,
@@ -530,8 +337,8 @@ def call_vlm_judge(client, model: str, img_bytes: bytes,
                 "max_tokens": max_tokens,
                 "timeout": 120,
             }
-            # Disable thinking/CoT for models that support it (e.g. Qwen3.5
-            # via SGLang). Silently dropped if the backend doesn't recognise it.
+            # Disable thinking/CoT for Qwen3.5 via SGLang; silently dropped on
+            # backends that don't support extra_body.
             create_kw["extra_body"] = {
                 "chat_template_kwargs": {"enable_thinking": False},
             }
@@ -540,7 +347,6 @@ def call_vlm_judge(client, model: str, img_bytes: bytes,
             try:
                 resp = client.chat.completions.create(**create_kw)
             except TypeError:
-                # OpenAI SDK < 1.x or backends that reject extra_body
                 create_kw.pop("extra_body", None)
                 resp = client.chat.completions.create(**create_kw)
             except Exception as e0:
@@ -554,10 +360,12 @@ def call_vlm_judge(client, model: str, img_bytes: bytes,
                     resp = client.chat.completions.create(**create_kw)
                 else:
                     raise
+
             content = resp.choices[0].message.content
             if not content:
                 logger.warning(
-                    f"VLM returned empty content (attempt {attempt+1}/{max_retries+1})")
+                    "VLM returned empty content (attempt %d/%d)",
+                    attempt + 1, max_retries + 1)
                 if attempt < max_retries:
                     time.sleep(2 * (attempt + 1))
                 continue
@@ -567,457 +375,14 @@ def call_vlm_judge(client, model: str, img_bytes: bytes,
                 return result
 
             logger.warning(
-                f"VLM JSON extraction failed (attempt {attempt+1}/{max_retries+1}), "
-                f"raw response: {content[:300]}")
+                "VLM JSON extraction failed (attempt %d/%d), raw: %s",
+                attempt + 1, max_retries + 1, content[:300])
 
         except Exception as e:
-            logger.warning(f"VLM judge call failed (attempt {attempt+1}/{max_retries+1}): {e}")
+            logger.warning("VLM judge call failed (attempt %d/%d): %s",
+                           attempt + 1, max_retries + 1, e)
 
         if attempt < max_retries:
             time.sleep(2 * (attempt + 1))
 
     return None
-
-
-# ---------------------------------------------------------------------------
-# Mesh prefilter (before TRELLIS + VLM)
-# ---------------------------------------------------------------------------
-
-def mesh_prefilter_before_vlm(
-    pair_dir: Path,
-    entry: dict,
-    cfg: dict,
-) -> VLMScore | None:
-    """If enabled, run fast PLY checks. Returns a finished score to skip VLM, or None."""
-    p3 = cfg.get("phase3", {})
-    if not p3.get("vlm_mesh_prefilter", False):
-        return None
-
-    before_ply = pair_dir / "before.ply"
-    after_ply = pair_dir / "after.ply"
-    if not before_ply.is_file() or not after_ply.is_file():
-        return None
-
-    eid = entry["edit_id"]
-    et = (entry.get("edit_type") or "").lower()
-
-    try:
-        import trimesh
-        from partcraft.phase3_filter._mesh_metrics import (
-            MetricResult,
-            QualityReport,
-            evaluate_pair,
-            metric_connected_components,
-            metric_not_degenerate,
-        )
-
-        before = trimesh.load(str(before_ply), process=False)
-        after = trimesh.load(str(after_ply), process=False)
-    except Exception as e:
-        s = VLMScore(edit_id=eid, edit_type=et, reason=f"Mesh prefilter load: {e}")
-        s.quality_tier = "rejected"
-        return s
-
-    def _negative_from_failed(report, prefix: str) -> VLMScore:
-        failed = [m for m in report.metrics if not m.passed]
-        reasons = "; ".join(
-            f"{m.name}: {m.reason or 'fail'}" for m in failed[:4])
-        s = VLMScore(edit_id=eid, edit_type=et)
-        s.reason = f"{prefix}{reasons}"
-        s.score = round(report.score, 4)
-        s.quality_tier = "negative"
-        s.edit_executed = False
-        return s
-
-    if et in _MESH_PREFILTER_FULL:
-        report = evaluate_pair(eid, et, before, after, cfg)
-        if not report.passed:
-            return _negative_from_failed(report, "Mesh prefilter: ")
-        return None
-
-    if et in _MESH_PREFILTER_LIGHT:
-        results = []
-        for fn in (metric_not_degenerate, metric_connected_components):
-            try:
-                results.append(fn(before, after, cfg))
-            except Exception as e:
-                results.append(
-                    MetricResult(fn.__name__.replace("metric_", ""), 0.0, False,
-                                 reason=str(e)))
-
-        bv, av = len(before.vertices), len(after.vertices)
-        min_v = int(p3.get("vlm_mesh_prefilter_min_vertices", 8))
-        if bv < min_v or av < min_v:
-            results.append(
-                MetricResult(
-                    "min_vertices",
-                    float(min(bv, av)),
-                    False,
-                    weight=2.0,
-                    reason=f"before={bv}, after={av} (min={min_v})",
-                ))
-
-        total_weight = sum(r.weight for r in results)
-        score = (
-            sum(r.weight * (1.0 if r.passed else 0.0) for r in results)
-            / max(total_weight, 1e-8)
-        )
-        passed = all(r.passed for r in results)
-        if not passed:
-            qr = QualityReport(
-                edit_id=eid,
-                edit_type=et,
-                passed=False,
-                score=score,
-                metrics=results,
-            )
-            return _negative_from_failed(qr, "Mesh prefilter (light): ")
-        return None
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Core evaluation
-# ---------------------------------------------------------------------------
-
-def evaluate_edit(
-    pipeline,
-    slat_dir_before: Path,
-    slat_dir_after: Path,
-    edit_id: str,
-    edit_type: str,
-    edit_prompt: str,
-    object_desc: str,
-    part_label: str,
-    vlm_client,
-    vlm_model: str,
-    num_views: int = 3,
-    device: str = "cuda",
-    vlm_max_tokens: int = 4096,
-    vlm_json_object_mode: bool = False,
-) -> VLMScore:
-    """Evaluate a single edit pair: render → compose → VLM judge."""
-    score = VLMScore(edit_id=edit_id, edit_type=edit_type)
-
-    try:
-        # Load SLATs
-        slat_before = load_slat(slat_dir_before, device)
-        slat_after = load_slat(slat_dir_after, device)
-
-        # Render views
-        before_imgs = render_views(pipeline, slat_before, num_views)
-        after_imgs = render_views(pipeline, slat_after, num_views)
-
-        # Compose comparison image
-        comp_bytes = compose_comparison(before_imgs, after_imgs)
-
-        # Call VLM judge
-        result = call_vlm_judge(
-            vlm_client, vlm_model, comp_bytes,
-            edit_prompt, edit_type, object_desc, part_label,
-            max_tokens=vlm_max_tokens,
-            json_object_mode=vlm_json_object_mode,
-        )
-
-        if result is None:
-            score.reason = "VLM returned no valid response"
-            return score
-
-        score.edit_executed = bool(result.get("edit_executed", False))
-        score.correct_region = bool(result.get("correct_region", False))
-        score.preserve_other = bool(result.get("preserve_other", False))
-        score.visual_quality = int(result.get("visual_quality", 0))
-        score.artifact_free = bool(result.get("artifact_free", False))
-        score.reason = result.get("reason", "")
-        score.score = compute_composite_score(score)
-        score.quality_tier = classify_tier(score)
-
-    except Exception as e:
-        score.reason = f"Evaluation error: {e}"
-        logger.error(f"  {edit_id}: {e}")
-
-    return score
-
-
-# ---------------------------------------------------------------------------
-# Batch runner
-# ---------------------------------------------------------------------------
-
-def run_vlm_filter(
-    cfg: dict,
-    results_path: str | Path,
-    mesh_pairs_dir: str | Path,
-    output_dir: str | Path | None = None,
-    limit: int | None = None,
-    num_views: int = 3,
-    device: str = "cuda",
-) -> list[dict]:
-    """Run Phase 3 VLM filter on Phase 2.5 edit results.
-
-    All edits are kept and scored with quality tiers:
-      high/medium — positive training samples
-      low         — usable with caution
-      negative    — failed edits, usable as negative samples
-      rejected    — evaluation errors, discard
-
-    Args:
-        cfg: pipeline config
-        results_path: edit_results.jsonl from Phase 2.5
-        mesh_pairs_dir: directory with {edit_id}/before_slat, after_slat
-        output_dir: where to write filter results (default: cache/phase3)
-        limit: max edits to evaluate
-        num_views: number of views to render per model
-
-    Returns:
-        All scored entries (sorted by score descending)
-    """
-    from openai import OpenAI
-    from tqdm import tqdm
-
-    results_path = Path(results_path)
-    mesh_pairs_dir = Path(mesh_pairs_dir)
-
-    p3_cfg = cfg.get("phase3", {})
-    num_views = int(p3_cfg.get("num_views", num_views))
-    vlm_max_tokens = int(p3_cfg.get("vlm_max_tokens", 4096))
-    vlm_json_object_mode = bool(p3_cfg.get("vlm_json_response_format", False))
-    if output_dir is None:
-        output_dir = Path(p3_cfg.get("cache_dir", "cache/phase3"))
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Load edit results
-    entries = []
-    with open(results_path) as f:
-        for line in f:
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            if rec.get("status") == "success":
-                entries.append(rec)
-
-    if limit:
-        entries = entries[:limit]
-
-    if not entries:
-        logger.info("No successful edits to filter")
-        return []
-
-    # VLM client
-    p0 = cfg.get("phase0", {})
-    api_key = p0.get("vlm_api_key", "")
-    if not api_key:
-        import yaml
-        default_cfg = Path(__file__).parents[2] / "configs" / "default.yaml"
-        if default_cfg.exists():
-            with open(default_cfg) as f:
-                dcfg = yaml.safe_load(f)
-            api_key = dcfg.get("phase0", {}).get("vlm_api_key", "")
-
-    if not api_key:
-        raise ValueError("No API key for VLM judge")
-
-    client = OpenAI(
-        base_url=p0.get("vlm_base_url", ""),
-        api_key=api_key,
-    )
-    vlm_model = p0.get("vlm_model", "gemini-3.1-flash-lite-preview")
-
-    # Load TRELLIS decoder
-    logger.info("Loading TRELLIS decoder for rendering...")
-    p25 = cfg.get("phase2_5", {})
-
-    import sys
-    project_root = Path(__file__).parents[2]
-    third_party = str(project_root / "third_party")
-    if third_party not in sys.path:
-        sys.path.insert(0, third_party)
-    from trellis.pipelines import TrellisImageTo3DPipeline
-
-    # Resolve checkpoint path (load_config makes this absolute when using ckpt_root)
-    ckpt_spec = p25.get("trellis_image_ckpt", "checkpoints/TRELLIS-image-large")
-    ckpt_path = Path(ckpt_spec)
-    if not ckpt_path.is_absolute():
-        ckpt_path = project_root / ckpt_spec
-    if not (ckpt_path / "pipeline.json").exists():
-        raise FileNotFoundError(
-            f"TRELLIS checkpoint not found at {ckpt_path}")
-    ckpt = str(ckpt_path)
-
-    logger.info(f"TRELLIS checkpoint: {ckpt}")
-    pipeline = TrellisImageTo3DPipeline.from_pretrained(ckpt)
-    pipeline.to(device)
-
-    pre_on = bool(p3_cfg.get("vlm_mesh_prefilter", False))
-    if pre_on:
-        logger.info(
-            "Mesh prefilter enabled: full=%s light=%s (skips TRELLIS+VLM on fail)",
-            sorted(_MESH_PREFILTER_FULL),
-            sorted(_MESH_PREFILTER_LIGHT),
-        )
-
-    logger.info(
-        f"Phase 3 VLM filter: {len(entries)} edits, {num_views} views each, "
-        f"model={vlm_model}, max_tokens={vlm_max_tokens}, "
-        f"json_object_mode={vlm_json_object_mode}"
-    )
-
-    # Evaluate — all results kept, classified by quality tier
-    all_scored: list[dict] = []
-    scores_path = output_dir / "vlm_scores.jsonl"
-    mesh_prefilter_skipped_vlm = 0
-
-    with open(scores_path, "w") as fp:
-        for i, entry in enumerate(tqdm(entries, desc="Phase 3: VLM Filter")):
-            eid = entry["edit_id"]
-            pair_dir = mesh_pairs_dir / eid
-
-            has_before = (pair_dir / "before.npz").exists() or (pair_dir / "before_slat").exists()
-            has_after = (pair_dir / "after.npz").exists() or (pair_dir / "after_slat").exists()
-
-            if not has_before or not has_after:
-                score = VLMScore(edit_id=eid, edit_type=entry.get("edit_type", ""),
-                                 reason="SLAT files missing")
-                score_dict = score.to_dict()
-                fp.write(json.dumps(score_dict, ensure_ascii=False) + "\n")
-                fp.flush()
-                all_scored.append({**entry, **score_dict})
-                continue
-
-            pre_score = mesh_prefilter_before_vlm(pair_dir, entry, cfg)
-            if pre_score is not None:
-                mesh_prefilter_skipped_vlm += 1
-                score_dict = pre_score.to_dict()
-                fp.write(json.dumps(score_dict, ensure_ascii=False) + "\n")
-                fp.flush()
-                all_scored.append({**entry, **score_dict})
-                logger.info(
-                    f"  [{i+1}/{len(entries)}] {eid}: "
-                    f"{pre_score.quality_tier.upper()} (mesh prefilter, skip VLM) "
-                    f"{pre_score.reason[:80]}")
-                continue
-
-            # Extract part label from edit_prompt or entry
-            part_label = entry.get("old_label", "")
-            if not part_label:
-                # Try to extract from remove_labels or add_labels
-                labels = entry.get("remove_labels", entry.get("add_labels", []))
-                part_label = labels[0] if labels else "unknown"
-
-            score = evaluate_edit(
-                pipeline=pipeline,
-                slat_dir_before=slat_before,
-                slat_dir_after=slat_after,
-                edit_id=eid,
-                edit_type=entry.get("edit_type", ""),
-                edit_prompt=entry.get("edit_prompt", ""),
-                object_desc=entry.get("object_desc", ""),
-                part_label=part_label,
-                vlm_client=client,
-                vlm_model=vlm_model,
-                num_views=num_views,
-                device=device,
-                vlm_max_tokens=vlm_max_tokens,
-                vlm_json_object_mode=vlm_json_object_mode,
-            )
-
-            score_dict = score.to_dict()
-            fp.write(json.dumps(score_dict, ensure_ascii=False) + "\n")
-            fp.flush()
-            all_scored.append({**entry, **score_dict})
-
-            tier = score.quality_tier
-            logger.info(f"  [{i+1}/{len(entries)}] {eid}: "
-                        f"{tier.upper()} (score={score.score:.2f}) "
-                        f"{score.reason}")
-
-    if pre_on and mesh_prefilter_skipped_vlm:
-        logger.info(
-            "Mesh prefilter dropped %d edits before TRELLIS+VLM "
-            "(see reasons in vlm_scores.jsonl)",
-            mesh_prefilter_skipped_vlm,
-        )
-
-    # Write tiered output
-    _write_tiered_output(all_scored, output_dir)
-
-    return all_scored
-
-
-def _write_tiered_output(all_scored: list[dict], output_dir: Path):
-    """Write tiered output: all edits kept, grouped by quality."""
-    from collections import defaultdict
-
-    summary_path = output_dir / "summary.json"
-
-    # Group by tier
-    by_tier: dict[str, list[dict]] = defaultdict(list)
-    for e in all_scored:
-        tier = e.get("quality_tier", "rejected")
-        by_tier[tier].append(e)
-
-    # Write per-tier JSONL files
-    for tier, items in by_tier.items():
-        tier_path = output_dir / f"tier_{tier}.jsonl"
-        with open(tier_path, "w") as f:
-            for e in items:
-                f.write(json.dumps(e, ensure_ascii=False) + "\n")
-
-    # Write combined scored output (all tiers, sorted by score desc)
-    all_path = output_dir / "all_scored.jsonl"
-    all_sorted = sorted(all_scored, key=lambda x: x.get("score", 0), reverse=True)
-    with open(all_path, "w") as f:
-        for e in all_sorted:
-            f.write(json.dumps(e, ensure_ascii=False) + "\n")
-
-    # Stats
-    tier_counts = {t: len(items) for t, items in by_tier.items()}
-    scores = [e["score"] for e in all_scored if "score" in e]
-
-    by_type = defaultdict(lambda: defaultdict(int))
-    for e in all_scored:
-        et = e.get("edit_type", "unknown")
-        tier = e.get("quality_tier", "rejected")
-        by_type[et][tier] += 1
-        by_type[et]["total"] += 1
-
-    summary = {
-        "total": len(all_scored),
-        "avg_score": float(np.mean(scores)) if scores else 0.0,
-        "tier_counts": tier_counts,
-        "by_edit_type": {k: dict(v) for k, v in by_type.items()},
-    }
-
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-
-    # Print summary
-    print(f"\n{'='*60}")
-    print(f"Phase 3 VLM Quality Assessment")
-    print(f"{'='*60}")
-    print(f"  Total: {summary['total']}, Avg score: {summary['avg_score']:.3f}")
-    print(f"\n  Quality tiers:")
-    tier_order = ["high", "medium", "low", "negative", "rejected"]
-    tier_desc = {
-        "high": "ideal training data",
-        "medium": "usable training data",
-        "low": "use with caution",
-        "negative": "negative samples",
-        "rejected": "evaluation failed",
-    }
-    for tier in tier_order:
-        n = tier_counts.get(tier, 0)
-        pct = n / max(len(all_scored), 1)
-        desc = tier_desc.get(tier, "")
-        print(f"    {tier:10s}: {n:4d} ({pct:5.1%})  — {desc}")
-
-    print(f"\n  By edit type:")
-    for et, counts in sorted(by_type.items()):
-        total = counts["total"]
-        parts = ", ".join(f"{t}={counts.get(t, 0)}"
-                          for t in tier_order if counts.get(t, 0) > 0)
-        print(f"    {et:15s}: {total:4d} [{parts}]")
-
-    print(f"\n  Output: {all_path}")
-    print(f"{'='*60}")
