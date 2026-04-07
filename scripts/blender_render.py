@@ -108,17 +108,19 @@ def scene_bbox():
     return Vector(bbox_min), Vector(bbox_max)
 
 
-def normalize_scene():
+def _scene_root():
     roots = [obj for obj in bpy.context.scene.objects.values() if not obj.parent]
     if len(roots) > 1:
         parent = bpy.data.objects.new("ParentEmpty", None)
         bpy.context.scene.collection.objects.link(parent)
         for obj in roots:
             obj.parent = parent
-        scene = parent
-    else:
-        scene = roots[0]
+        return parent
+    return roots[0]
 
+
+def normalize_scene():
+    scene = _scene_root()
     bbox_min, bbox_max = scene_bbox()
     scale = 2 / max(bbox_max - bbox_min)  # match pyrender: fit in [-1,1]^3
     scene.scale = scene.scale * scale
@@ -127,7 +129,16 @@ def normalize_scene():
     offset = -(bbox_min + bbox_max) / 2
     scene.matrix_world.translation += offset
     bpy.ops.object.select_all(action="DESELECT")
-    return scale, offset
+    return float(scale), tuple(offset)
+
+
+def apply_scale_offset(scale, offset):
+    """Apply a precomputed (scale, offset) — same convention as normalize_scene."""
+    scene = _scene_root()
+    scene.scale = scene.scale * scale
+    bpy.context.view_layer.update()
+    scene.matrix_world.translation += Vector(offset)
+    bpy.ops.object.select_all(action="DESELECT")
 
 
 def get_transform_matrix(obj):
@@ -200,11 +211,22 @@ def main(args):
 
     init_render(resolution=args.resolution)
     init_scene()
-    import_mesh(args.object)
-    print('[INFO] Object loaded.')
 
-    normalize_scene()
-    print('[INFO] Scene normalized.')
+    if args.ref_object:
+        # Compute scale/offset from reference mesh, then re-import the real
+        # object and apply the same transform so before/after share a frame.
+        import_mesh(args.ref_object)
+        ref_scale, ref_offset = normalize_scene()
+        init_scene()
+        import_mesh(args.object)
+        apply_scale_offset(ref_scale, ref_offset)
+        print(f'[INFO] Object loaded; using ref normalization '
+              f'scale={ref_scale:.6f} offset={tuple(round(x,4) for x in ref_offset)}')
+    else:
+        import_mesh(args.object)
+        print('[INFO] Object loaded.')
+        normalize_scene()
+        print('[INFO] Scene normalized.')
 
     cam = init_camera()
     init_lighting()
@@ -246,6 +268,11 @@ if __name__ == '__main__':
     argv = sys.argv[sys.argv.index("--") + 1:]
     parser = argparse.ArgumentParser()
     parser.add_argument('--object', required=True)
+    parser.add_argument('--ref_object', default=None,
+                        help='Optional reference mesh — its bbox is used to '
+                             'compute the scale/offset, which is then applied '
+                             'to --object. Use to keep before/after at the '
+                             'same scale.')
     parser.add_argument('--output_folder', required=True)
     parser.add_argument('--views', required=True)
     parser.add_argument('--resolution', type=int, default=518)

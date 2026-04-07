@@ -62,8 +62,13 @@ _THREE_VIEWS = [
 
 def _render_views(mesh_path: str, views: list[dict], resolution: int = 512,
                   blender_path: str = "blender",
-                  bg_color: tuple = (1.0, 1.0, 1.0)) -> list[np.ndarray]:
+                  bg_color: tuple = (1.0, 1.0, 1.0),
+                  ref_mesh_path: str | None = None) -> list[np.ndarray]:
     """Render arbitrary views of a mesh via Blender Cycles.
+
+    If ``ref_mesh_path`` is given, normalization (scale + offset) is computed
+    from that reference mesh and applied to ``mesh_path``, so a sequence of
+    renders sharing the same reference end up at a consistent scale.
 
     Returns list of (H, W, 3) uint8 numpy arrays (RGB).
     """
@@ -75,6 +80,8 @@ def _render_views(mesh_path: str, views: list[dict], resolution: int = 512,
             "--views", json.dumps(views),
             "--resolution", str(resolution),
         ]
+        if ref_mesh_path is not None:
+            cmd += ["--ref_object", str(ref_mesh_path)]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
             print(f"  Blender stdout:\n{result.stdout[-2000:]}")
@@ -107,22 +114,20 @@ def _render_views(mesh_path: str, views: list[dict], resolution: int = 512,
 
 def render_3views(mesh_path: str, resolution: int = 512,
                   blender_path: str = "blender",
-                  bg_color: tuple = (1.0, 1.0, 1.0)) -> list[np.ndarray]:
-    """Render 3 optimal-coverage views of a mesh via Blender Cycles.
-
-    Returns list of 3 (H, W, 3) uint8 numpy arrays (RGB).
-    """
-    return _render_views(mesh_path, _THREE_VIEWS, resolution, blender_path, bg_color)
+                  bg_color: tuple = (1.0, 1.0, 1.0),
+                  ref_mesh_path: str | None = None) -> list[np.ndarray]:
+    """Render 3 optimal-coverage views of a mesh via Blender Cycles."""
+    return _render_views(mesh_path, _THREE_VIEWS, resolution, blender_path,
+                         bg_color, ref_mesh_path=ref_mesh_path)
 
 
 def render_4views(mesh_path: str, resolution: int = 512,
                   blender_path: str = "blender",
-                  bg_color: tuple = (1.0, 1.0, 1.0)) -> list[np.ndarray]:
-    """Render 4 orthogonal views of a mesh via Blender Cycles.
-
-    Returns list of 4 (H, W, 3) uint8 numpy arrays (RGB).
-    """
-    return _render_views(mesh_path, _FOUR_VIEWS, resolution, blender_path, bg_color)
+                  bg_color: tuple = (1.0, 1.0, 1.0),
+                  ref_mesh_path: str | None = None) -> list[np.ndarray]:
+    """Render 4 orthogonal views of a mesh via Blender Cycles."""
+    return _render_views(mesh_path, _FOUR_VIEWS, resolution, blender_path,
+                         bg_color, ref_mesh_path=ref_mesh_path)
 
 
 # ---------------------------------------------------------------------------

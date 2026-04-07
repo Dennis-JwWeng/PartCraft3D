@@ -120,8 +120,13 @@ def _render_ply_pair(
         sys.path.insert(0, vis_dir)
     from render_ply_pairs import render_3views  # noqa: E402
 
+    # Normalize before with its own bbox, then reuse the SAME scale/offset for
+    # after — otherwise Blender refits each mesh into [-1,1]^3 independently
+    # and a deletion's after-mesh gets scaled up to look identical to before.
     before_imgs = render_3views(str(before_ply), blender_path=blender_path)
-    after_imgs = render_3views(str(after_ply), blender_path=blender_path)
+    after_imgs = render_3views(
+        str(after_ply), blender_path=blender_path, ref_mesh_path=str(before_ply)
+    )
     return before_imgs[:num_views], after_imgs[:num_views]
 
 
