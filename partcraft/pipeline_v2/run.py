@@ -41,6 +41,7 @@ import yaml
 
 from .paths import PipelineRoot, ObjectContext, normalize_shard
 from .status import rebuild_manifest, manifest_summary, step_done
+from .validators import apply_check
 
 LOG = logging.getLogger("pipeline_v2")
 
@@ -299,11 +300,21 @@ def main():
     for step in steps:
         if step in GPU_STEPS and args.gpus and not args.single_gpu:
             dispatch_gpus(step, args.config, args)
-            # children already wrote status; rebuild manifest in parent
-            rebuild_manifest(root)
         else:
             run_step(step, ctxs, cfg, args)
-            rebuild_manifest(root)
+        # post-step validation: rewrite status to reflect product reality
+        n_pass = n_fail = 0
+        for c in ctxs:
+            rep = apply_check(c, step)
+            if rep.ok:
+                n_pass += 1
+            else:
+                n_fail += 1
+                LOG.warning("[%s] %s incomplete: %d/%d (missing: %s)",
+                            step, c.obj_id, rep.found, rep.expected,
+                            rep.missing[:3])
+        LOG.info("[%s] validate: pass=%d fail=%d", step, n_pass, n_fail)
+        rebuild_manifest(root)
 
     LOG.info("\n%s", json.dumps(manifest_summary(root),
                                  indent=2, ensure_ascii=False))
