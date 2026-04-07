@@ -4,6 +4,67 @@
 
 ---
 
+## 2026-04-07 — Phase 1 v2：prompt-driven part selection（重构）
+
+**问题**：旧 phase 1 是 group-driven —— phase0 LLM 先给每个 part 出语义描述、再 group、再为每个 group 生成 prompt。链路长、prompt 风格塌缩、对 cluster_size 小的 part 过滤不一致；多次清洗发现 deletion 13% 空 prompt 主要源于这条管线的中间环节。
+
+**决策**：参照 Vinedresser，**一次 VLM 调用同时输出 object 元信息 + N 条编辑指令**，跳过 phase0 group。喂给 VLM 的是一张 5×2 拼图（top 5 张原始照片 + bottom 5 张同视角 part-colored Workbench 渲染），加一份 part menu（id / 颜色名 / cluster_size）。VLM 直接根据图选 part，不依赖任何上游 caption。
+
+**5 视角集**（来自 dataset 已存的 16 视角）：
+- `89/90/91/100`：4 个 cam 在 +z 上方、~30° 俯视，覆盖 4 个 yaw 象限
+- `8`：cam 在 -z 下方、~52° 仰视，前方，看物体底面
+- 颜色用 16 名色调色板（red/orange/.../gray），part_id `% 16` 取色
+
+**输出 schema**：
+```json
+{ "object": { "full_desc", "full_desc_stage1", "full_desc_stage2", "parts":[{part_id,color,name}] },
+  "edits":  [{ edit_type, prompt, view_index, selected_part_ids,
+               target_part_desc, after_desc_full, after_desc_stage{1,2},
+               new_parts_desc{,_stage1,_stage2}, edit_params,
+               rationale, confidence }, ...] }
+```
+- 双轨 stage1/stage2 描述供 TRELLIS 两阶段条件
+- `view_index` 0..4 由 VLM 自选（哪张视角最能看清 target），下游可视化直接还原 frame
+- deletion 的 `after_desc_*` 设为 null（object.full_desc 减去删除 part 已自洽）
+
+**Per-N 配额**（N = part 数，N>16 跳过；3 shard 共保留 3431/3609 = 95.1%）：
+
+| N | del | mod | sc | mat | glob | 总 |
+|---|---|---|---|---|---|---|
+| 2 | 1 | 1 | 1 | 1 | 1 | 5 |
+| 3 | 3 | 3 | 1 | 1 | 1 | 9 |
+| 4 | 4 | 4 | 2 | 2 | 1 | 13 |
+| 5 | 5 | 5 | 2 | 2 | 1 | 15 |
+| 6 | 6 | 6 | 2 | 2 | 1 | 17 |
+| 7-8 | 8 | 8 | 3 | 3 | 1 | 23 |
+| 9-10 | 10 | 10 | 3 | 4 | 1 | 28 |
+| 11-12 | 12 | 12 | 4 | 4 | 2 | 34 |
+| 13-14 | 14 | 14 | 4 | 5 | 2 | 39 |
+| 15-16 | 16 | 16 | 5 | 5 | 2 | 44 |
+
+del 与 mod 同步增长（mod 不破坏拓扑、del 是最便宜的有效编辑）。
+
+**硬规则 R1-R9**（违规丢弃单条；非 deletion 缺 after_desc 算违规；view_index 必须 ∈ [0,4]）。代码侧实际校验 R1/R3 prompt 部分的 R5/R7/R8/R9，R2/R4 是纯语义提示。
+
+**多 GPU 部署**：`--vlm-url` 接受逗号分隔多 server，runner 用 round-robin 把 jobs 分到每个 server，**每 server 单 semaphore 串行**避免 SGLang KV cache thrashing（之前 concurrency=8 实测比 sequential 慢 3×）。每 server 一张 GPU + 独立 27B 权重。
+
+**实测**（shard01 头 20 obj，N≤16 保留 18 个，6 GPU）：
+- Phase A 渲染 ~1.5s/obj（Workbench flat，无光照）
+- Phase B VLM ~36s/obj wall（≈ 215s/obj sequential ÷ 6）
+- 编辑通过率 196/197（99.5%）
+- 单 GPU 全 shard01 估算 ~68h，6 GPU ~11.5h
+
+**新增/修改文件**：
+- `scripts/standalone/run_phase1_v2.py`：runner，含 `quota_for(N)`、`extract_json_object`、`validate`、`run_async` 多 server 调度
+- `scripts/blender_render_parts.py`：Workbench flat 渲染器，按 `transform_matrix` 摆相机
+- `scripts/tools/render_part_overview.py`：5×2 grid 拼图（`VIEW_INDICES = [89,90,91,100,8]`）
+- `scripts/blender_render.py` / `scripts/vis/render_ply_pairs.py`：`--ref_object` 让 before/after 共用归一化
+- `scripts/tools/run_vlm_cleaning.py`：渲染 deletion after 时传 before 作 ref
+
+提交：`b07fa8c` on `feature/prompt-driven-part-selection`。
+
+---
+
 ## 2026-04-05 — 统一 VLM 评分 prompt + 3-view 渲染方案
 
 **问题**：

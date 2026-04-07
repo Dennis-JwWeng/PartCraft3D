@@ -210,6 +210,17 @@ flowchart TD
 
 ## 已清理的冗余入口/模块
 
+### Phase 1 v2（prompt-driven，当前重构分支）
+
+`scripts/standalone/run_phase1_v2.py` 是新的 phase 1 入口（branch `feature/prompt-driven-part-selection`），跳过 phase0 group，一次 VLM 调用直接产出 object 元信息 + 动态配额的 N 条编辑（deletion ≈ modification ≈ N）。
+
+- 视觉输入：`scripts/tools/render_part_overview.py` 渲染 5×2 grid，4 张俯视 + 1 张仰视（dataset idx `[89,90,91,100,8]`），底排是 `scripts/blender_render_parts.py` 用 16 名色调色板染色后的 part-only Workbench 渲染。
+- 输出包含 `view_index ∈ [0,4]`（VLM 自选最能看清 target 的视角）和双轨 stage1/stage2 描述（供 TRELLIS 两阶段条件）。
+- N>16 的对象自动跳过（3 shard 共 178/3609，4.9%）。
+- 多 GPU：`--vlm-url url1,url2,...`，每 server 一个 semaphore 串行，避免 SGLang KV thrashing。
+
+详细配额表、规则 R1-R9 与 schema 见 `docs/AI_LOG.md` 2026-04-07 条目。
+
 ### 已删除 standalone 入口
 
 - `scripts/standalone/run_all.py`
