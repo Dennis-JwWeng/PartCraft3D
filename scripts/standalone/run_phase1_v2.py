@@ -38,132 +38,172 @@ from render_part_overview import (  # noqa: E402
 
 # ─────────────────────────── prompt construction ───────────────────────────
 
-SYSTEM_PROMPT = """You are a structured-data generator for a 3D part-editing dataset. \
-You look at multi-view renders of one 3D object plus a part menu, and produce \
-a single JSON object describing the object and a diverse set of editing \
-instructions.
+SYSTEM_PROMPT = """You are a 3D Spatial Reasoning Engine generating a JSON dataset for 3D part editing. \
+You are given a 5x2 grid: TOP row = 5 RGB photos of one 3D object from 5 cameras; \
+BOTTOM row = the same 5 cameras re-rendered with each editable part in a fixed \
+palette color.
 
-The output is consumed directly by an automated pipeline. Output ONE valid \
-JSON object — no prose, no markdown, no extra text. Begin with '{' and end \
-with '}'."""
+CRITICAL: maintain 3D OBJECT-SPACE consistency. An object's anatomical "left" is \
+a fixed physical part — it does NOT change just because the camera moved it to \
+the image-right. Whenever you write a directional word, you MUST first reason \
+about which camera you are looking through and apply the mirror rule explicitly.
+
+Output ONE valid JSON object — no prose, no markdown. Begin with '{' and end with '}'."""
 
 
-USER_PROMPT_TEMPLATE = """[The image shows a 5×2 grid. Top row = 5 photos of the same 3D object. \
-The 5 columns are indexed 0..4 (left to right):
-  views 0, 1, 2, 3 — 4 overhead viewpoints (camera above the object,
-                    tilted ~30° downward), each from a different yaw
-                    direction so together they cover all sides.
-  view 4 — a steep upward viewpoint (camera below, looking up ~50°)
-           that exposes the underside of the object.
-Look at the images yourself to figure out which view shows which side. \
-Bottom row = the same 5 viewpoints re-rendered with each editable part \
-painted in a fixed color. Same column = same camera pose.]
+USER_PROMPT_TEMPLATE = """[Image: 5×2 grid. TOP row = 5 RGB photos. BOTTOM row =
+same 5 cameras re-rendered with each editable part in a fixed palette color
+(same column = same camera). The palette colors are INTERNAL labels for you
+only — they are NOT properties of the real object.]
 
-Available parts (each line: id, color in the bottom-row image, cluster size):
+# CAMERA GEOMETRY (fixed for every object — memorize this)
+
+Views 0,1,2,3 form a horizontal ring around the object at 90° yaw increments,
+all looking slightly downward (elev ≈ +30°):
+  • view (k+2) mod 4  is the 180° OPPOSITE of view k  (back-to-back cameras)
+  • view (k+1) mod 4  is the 90° rotation of view k   (perpendicular / profile)
+View 4 is a low camera looking UP from below the object.
+
+This geometry is intrinsic to the cameras, NOT to the object. The object itself
+has an arbitrary world orientation — you must decide which camera happens to
+face the object's front by LOOKING at the photos.
+
+Parts (id, palette color in bottom row, cluster_size):
 {part_menu}
 
-Notes:
-- Use the IMAGE as the source of truth for what each part is. You will name
-  each part yourself in the "object.parts" output below.
-- Very small clusters (cluster_size < 30) are likely segmentation artifacts
-  with no real geometry. Do not target them.
-- A part may be invisible in the bottom row (occluded or degenerate). Do not
-  target invisible parts.
+# CORE LOGIC: THE 3D SPATIAL RULEBOOK
 
-## YOUR JOB
+P1. ID-FIRST TRUTH. selected_part_ids are the absolute ground truth on which
+    part is being edited. Your text MUST visually match the highlighted parts.
+    If unsure what a part is, describe its shape/structure, do not guess a name.
 
-Produce a single JSON object with two top-level keys: "object" and "edits".
+P2. ANTI-VIEWPORT RULE. Bare directional words ("left", "right", "front",
+    "back", "leftmost", "rightmost") are FORBIDDEN as standalone descriptors.
+    Use either:
+      (a) view-invariant cues — shape, size, function, or structural relation
+          to another part ("the ear above the raised paw", "the wheel under
+          the driver seat"), OR
+      (b) the object-anatomical form defined in P3+P4 below.
 
-### object block
+P3. CANONICAL FRONT (mandatory field).
+    object.canonical_front: ONE structural sentence describing what visually
+        marks the object's intrinsic forward direction (e.g. "the side with
+        the snout and eyes", "the side with the headlights and windshield",
+        "the side where you sit on the chair"), OR null if the object has no
+        unambiguous orientation (sphere, vase, symmetric drum, etc.).
+    object.frontal_view_index: int in [0..4], the view_index whose camera
+        most directly faces canonical_front (the camera you would describe
+        as "looking the object in the face"). Set to null iff
+        canonical_front is null.
 
-  full_desc        Natural English description of the whole object. Mention
-                   all visible parts with shape, color, material, and spatial
-                   relationships.
+    When canonical_front is null, NO directional words at all (P4 disabled).
 
-  full_desc_stage1 Geometry-only version of full_desc. Keep all shape, count,
-                   layout and structural relationships. REMOVE all colors,
-                   materials, textures, and finish words.
+P4. MIRROR RULE (only valid when canonical_front and frontal_view_index are set).
+    Let F = frontal_view_index. Then because the camera and the object are
+    facing each other:
+      • In view F   : image-LEFT half = object's anatomical RIGHT side,
+                       image-RIGHT half = object's anatomical LEFT side. (MIRROR)
+      • In view (F+2) mod 4 (back view): image-side = object-side. (NO MIRROR)
+      • In view (F±1) mod 4 (profile views): the object is sideways — you
+        CANNOT read anatomical left/right from these views. Do NOT pick a
+        profile view as view_index for any edit that uses left/right.
+      • View 4 (bottom-up): also unreliable for left/right; use other cues.
 
-  full_desc_stage2 Texture-only version of full_desc. Keep all colors,
-                   materials, finishes and textures. REMOVE shape modifiers,
-                   counts, and layout words.
+    So any anatomical-left/right edit MUST have view_index ∈ {{F, (F+2) mod 4}}.
 
-  parts            List of {{part_id, color, name}} for every part in the
-                   menu. "name" is YOUR clean short semantic label based on
-                   what you see. Use "(invisible)" or "(artifact)" for parts
-                   you cannot see or that are noise.
+    EVERY use of an anatomical "left" / "right" in prompt or target_part_desc
+    MUST be tagged with "(object's anatomical left/right)". The rationale
+    field MUST cite the mirror reasoning explicitly, e.g.:
+       "frontal_view_index=1; target visible in view 1 on the image-RIGHT
+        half → mirror → object's anatomical LEFT ear."
 
-### edits block
+P5. SYMMETRY → GROUP EDITS. For every pair/group of symmetric parts (both
+    eyes, both ears, all four wheels, the pair of arms), prefer a SINGLE
+    group edit whose selected_part_ids contains every member of the group
+    ("Remove BOTH ears", "Make ALL FOUR wheels larger"). Group edits avoid
+    the left/right problem entirely. Mix group and single-part edits.
 
-A list of EXACTLY {n_total} editing instructions with the following per-type
-quotas (the total {n_total} is fixed for this object, scaled to its part count):
-  - {n_deletion} deletion       (mix of single-part, multi-part bundles, and "remove all of a kind"; each must target a DIFFERENT part)
-  - {n_modification} modification   (swap a part for a different object of similar role; vary the verb — Change/Replace/Make)
-  - {n_scale} scale          (resize a part by a factor in [0.3, 2.5])
-  - {n_material} material       (change the material/finish of one or more parts)
-  - {n_global} global         (change the entire object's style; selected_part_ids = [])
+P6. NO PALETTE COLORS. The palette names (red, orange, yellow, lime, green,
+    teal, cyan, blue, navy, purple, magenta, pink, brown, tan, black, gray)
+    are INTERNAL labels and MUST NOT appear in any output text field. To
+    describe real color, use the appearance from the TOP row photos
+    ("the dark wooden seat", "the chrome pipe").
 
-Each edit:
+# OUTPUT — one JSON object
 
-  edit_type           One of: deletion, modification, scale, material, global
-  prompt              Natural English imperative starting with one of:
-                      Remove, Delete, Add, Change, Replace, Make, Scale, Resize.
-                      Use the semantic part name you assigned in object.parts.
-                      Do NOT mention part_id numbers.
-  view_index          Integer 0..4. The single view that BEST shows the target
-                      of this edit (clearest, least occluded angle on the
-                      affected parts). For global edits, pick the view that
-                      best shows the overall object.
-  selected_part_ids   List of int part_ids targeted. Empty [] ONLY for global.
-  target_part_desc    Short natural-language description of the target.
-  after_desc_full     Complete description of the object AFTER this edit.
-                      OMIT for deletion edits (set to null) — the object is
-                      fully described by object.full_desc minus the removed
-                      parts, no separate after description is needed.
-  after_desc_stage1   Geometry-only version of after_desc_full. OMIT (null)
-                      for deletion edits.
-  after_desc_stage2   Texture-only version of after_desc_full. OMIT (null)
-                      for deletion edits.
-  new_parts_desc      For modification edits: rich description of the NEW parts
-                      that replaced the old ones, with all visible detail.
-                      Null for other edit types.
-  new_parts_desc_stage1   Geometry-only version of new_parts_desc, or null.
-  new_parts_desc_stage2   Texture-only version of new_parts_desc, or null.
-  edit_params         Type-specific parameters (see below).
-  rationale           One short sentence explaining why this edit makes sense.
+object:
+  full_desc            full English description of the object
+  full_desc_stage1     geometry-only version (no colors/materials/finish words)
+  full_desc_stage2     texture-only version (no shape/count/layout words)
+  canonical_front      ONE structural sentence OR null  (see P3)
+  frontal_view_index   int in [0..4] OR null            (see P3)
+  parts                [{{part_id, color, name}}, ...] for every menu entry;
+                       name = your short semantic label, "(artifact)" or
+                       "(invisible)" for noise / unseen parts.
+
+edits: EXACTLY {n_total} entries with these per-type counts
+  - {n_deletion} deletion
+  - {n_modification} modification
+  - {n_scale} scale
+  - {n_material} material
+  - {n_global} global       (selected_part_ids = [])
+
+Each edit MUST list these fields IN THIS ORDER (the rationale comes FIRST so
+you reason before you write the prompt):
+  rationale           ONE sentence. If the edit uses anatomical left/right,
+                      this sentence MUST cite the mirror rule and reference
+                      frontal_view_index. Example:
+                      "frontal_view_index=1; in view 1 the target ear is on
+                       the image-RIGHT half → mirror → object's anatomical
+                       LEFT ear (part_id 5)."
+                      For edits without left/right, a single short reason.
+  edit_type           one of: deletion, modification, scale, material, global
+  selected_part_ids   list of int part_ids; empty ONLY for global
+  prompt              imperative starting with Remove/Delete/Add/Change/
+                      Replace/Make/Scale/Resize. NO part_id numbers,
+                      NO palette color names. Obeys P2/P4/P6. Any anatomical
+                      left/right MUST be tagged "(object's anatomical L/R)".
+  target_part_desc    short visual description of the target part(s) — same
+                      forbidden-word rules as prompt.
+  view_index          int in [0..4]: the view where the target is most
+                      visible. If the edit uses anatomical left/right this
+                      MUST equal frontal_view_index OR (frontal_view_index+2)
+                      mod 4. (For global, pick the best overall view.)
+  edit_params         deletion: {{}}
+                      modification: {{"new_part_desc": "..."}}
+                      scale:        {{"factor": float in [0.3, 2.5]}}
+                      material:     {{"target_material": "..."}}
+                      global:       {{"target_style": "..."}}
+  after_desc_full / after_desc_stage1 / after_desc_stage2
+                      object after the edit. For deletion: ALL three null.
+                      For others: all three filled, stage1 has no
+                      colors/materials, stage2 has no shape changes.
+  new_parts_desc / new_parts_desc_stage1 / new_parts_desc_stage2
+                      modification only: describe the new replacement parts.
+                      null for non-modification edits.
   confidence          "high" | "medium" | "low"
 
-edit_params per type:
-  deletion:     {{}}
-  modification: {{"new_part_desc": "<short label, e.g. 'a tall wooden stool'>"}}
-  scale:        {{"factor": <float in [0.3, 2.5]>}}
-  material:     {{"target_material": "<e.g. 'polished brass', 'frosted glass'>"}}
-  global:       {{"target_style": "<e.g. 'wooden carved', 'industrial metal'>"}}
+# HARD RULES (violations drop that edit)
 
-## HARD RULES (violations cause that edit to be discarded)
+R1. selected_part_ids ⊆ part menu ids; never target cluster_size<30 (noise);
+    never target parts you cannot see in the bottom row.
+R2. Each edit is distinct: no two with same edit_type AND same
+    selected_part_ids.
+R3. Never delete or extreme-scale a part that forms the structural body —
+    the object should remain recognizable.
+R4. prompt and target_part_desc must obey P2, P4, P5, P6.
+R5. Non-deletion edits fill all three after_desc_*. Deletion edits set
+    all three to null.
+R6. view_index ∈ [0,4] and the target must be clearly visible in that view.
+R7. If canonical_front is null, NO directional words anywhere; use group
+    edits or structural anchors only.
+R8. If an edit uses anatomical left/right, view_index ∈ {{F, (F+2) mod 4}}
+    where F = frontal_view_index, and the rationale must cite the mirror
+    reasoning explicitly.
 
-R1. selected_part_ids may only contain ids that appear in the part menu.
-R2. Never target a part you cannot see in the bottom row of the image.
-R3. Never target parts with cluster_size < 30 (they are noise).
-R4. Never delete or extreme-scale the part forming the structural body of the
-    object (the object should remain recognizable).
-R5. prompt MUST start with an imperative verb: Remove, Delete, Add, Change,
-    Replace, Make, Scale, or Resize. prompt MUST NOT mention part_id numbers.
-    Color names, materials, and other natural descriptive language are allowed.
-R6. Each edit must be DISTINCT — no two edits with the same edit_type AND
-    same selected_part_ids.
-R7. selected_part_ids must be empty for global edits and non-empty otherwise.
-R8. For non-deletion edits, all three after_desc_* fields must be filled.
-    Stage1 must omit colors/materials. Stage2 must omit shape changes.
-    For deletion edits, set all three after_desc_* fields to null (the
-    object minus the removed parts is self-explanatory from object.full_desc).
-R9. view_index must be an integer in [0, 4] and must point to a view where
-    the target parts are clearly visible (not occluded). For global edits,
-    pick the view that gives the best overall look at the object.
+# OUTPUT FORMAT
 
-## OUTPUT
-
-ONE JSON object. Begin with '{{' and end with '}}'. No prose, no markdown."""
+ONE JSON object. Begin with '{{', end with '}}'. No prose, no markdown."""
 
 
 def build_part_menu(mesh_npz: Path, img_npz: Path) -> tuple[list[int], str]:

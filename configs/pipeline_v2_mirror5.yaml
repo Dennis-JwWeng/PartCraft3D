@@ -1,0 +1,33 @@
+# Pipeline v2 — mirror5 reorganized run.
+# Object-centric layout under data.output_dir.
+
+ckpt_root: /Node11_nvme/wjw/3D_Editing/PartCraft3D/checkpoints
+
+blender: /Node11_nvme/artgen/lac/.tools/blender-4.2.0-linux-x64/blender
+
+data:
+  output_dir: /Node11_nvme/wjw/3D_Editing/PartCraft3D/outputs/partverse/pipeline_v2_mirror5
+  mesh_root:  /Node11_nvme/wjw/3D_Editing/PartCraft3D/data/partverse/mesh
+  images_root: /Node11_nvme/wjw/3D_Editing/PartCraft3D/data/partverse/images
+
+phase0:
+  vlm_model: Qwen3.5-27B
+  vlm_base_urls:
+    - http://localhost:8002/v1
+
+phase2_5:
+  enabled: true
+  trellis_text_ckpt: checkpoints/TRELLIS-text-xlarge
+  image_edit_backend: local_diffusers
+  image_edit_base_urls:
+    - http://localhost:8004
+    - http://localhost:8005
+    - http://localhost:8006
+    - http://localhost:8007
+  workers_per_server: 2
+  export_ply: false
+  export_ply_for_deletion: true
+  large_part_threshold: 0.35
+
+phase5:
+  num_views: 40
