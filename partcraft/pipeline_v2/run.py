@@ -82,8 +82,16 @@ def resolve_ctxs(
     if obj_ids:
         ids = obj_ids
     elif all_objs:
-        ids = [d.name for d in sorted(root.shard_dir(shard).iterdir())
-               if d.is_dir()] if root.shard_dir(shard).is_dir() else []
+        # First try existing object dirs (resume mode); if empty, fall
+        # back to discovering from input npz under mesh_root/<shard>/.
+        ids = []
+        if root.shard_dir(shard).is_dir():
+            ids = [d.name for d in sorted(root.shard_dir(shard).iterdir())
+                   if d.is_dir()]
+        if not ids:
+            mesh_shard = mesh_root / shard
+            if mesh_shard.is_dir():
+                ids = sorted(p.stem for p in mesh_shard.glob("*.npz"))
     else:
         raise SystemExit("[CLI] one of --obj-ids or --all is required")
 
