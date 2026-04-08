@@ -47,7 +47,7 @@ from run_phase1_v2 import (  # noqa: E402
 )
 
 from .paths import ObjectContext
-from .status import update_step, STATUS_OK, STATUS_FAIL, STATUS_SKIP
+from .status import update_step, step_done, STATUS_OK, STATUS_FAIL, STATUS_SKIP
 
 
 @dataclass
