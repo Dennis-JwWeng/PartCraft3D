@@ -67,13 +67,27 @@ def flux_port(cfg: dict, idx: int) -> int:
     return base + idx * stride
 
 
-def vlm_urls_for(cfg: dict) -> list[str]:
+def n_vlm_servers(cfg: dict) -> int:
+    """Number of VLM server instances to start.
+
+    Defaults to n_gpus(cfg) but can be capped via
+    ``pipeline.n_vlm_servers`` when thread/memory limits prevent
+    running one VLM per GPU.
+    """
+    p = _pipeline(cfg)
+    explicit = p.get("n_vlm_servers")
+    if explicit is not None:
+        return int(explicit)
+    return n_gpus(cfg)
+
+
+
     """Override via ``phase0.vlm_base_urls`` if you want remote servers."""
     override = (cfg.get("phase0") or {}).get("vlm_base_urls")
     if override:
         return list(override)
     return [f"http://localhost:{vlm_port(cfg, i)}/v1"
-            for i in range(n_gpus(cfg))]
+            for i in range(n_vlm_servers(cfg))]
 
 
 def flux_urls_for(cfg: dict) -> list[str]:
@@ -154,7 +168,8 @@ def dump_shell_env(cfg: dict, phase_name: str | None = None) -> str:
     gpus = gpus_for(cfg)
     lines = [
         f"GPUS=({' '.join(str(g) for g in gpus)})",
-        f"VLM_PORTS=({' '.join(str(vlm_port(cfg, i)) for i in range(len(gpus)))})",
+        f"N_VLM_SERVERS={n_vlm_servers(cfg)}",
+        f"VLM_PORTS=({' '.join(str(vlm_port(cfg, i)) for i in range(n_vlm_servers(cfg)))})",
         f"FLUX_PORTS=({' '.join(str(flux_port(cfg, i)) for i in range(len(gpus)))})",
         f"DEFAULT_PHASES=({' '.join(p.name for p in select_phases(cfg))})",
         f"ALL_PHASES=({' '.join(p.name for p in phases_for(cfg))})",

@@ -30,19 +30,27 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 [ -f "$CFG" ] || { echo "missing $CFG"; exit 1; }
 
-# ─── env from node39.env ─────────────────────────────────────────────
-ENV_FILE="configs/machine/node39.env"
-[ -f "$ENV_FILE" ] || { echo "missing $ENV_FILE"; exit 1; }
+# ─── env from machine/<hostname>.env ─────────────────────────────────
+ENV_FILE="${MACHINE_ENV:-configs/machine/$(hostname).env}"
+[ -f "$ENV_FILE" ] || { echo "[ERROR] Machine config not found: ${ENV_FILE}"; echo "  Create it from: configs/machine/node39.env"; exit 1; }
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
-CONDA_ENV_SERVER="${CONDA_ENV_SERVER:-qwen_test}"
-CONDA_ENV_PIPELINE="${CONDA_ENV_PIPELINE:-vinedresser3d}"
-VLM_CKPT="${VLM_CKPT:-/Node11_nvme/zsn/checkpoints/Qwen3.5-27B}"
-EDIT_CKPT="${EDIT_CKPT:-/Node11_nvme/wjw/checkpoints/FLUX.2-klein-9B}"
+CONDA_INIT="${CONDA_INIT:?CONDA_INIT not set in ${ENV_FILE}}"
+CONDA_ENV_SERVER="${CONDA_ENV_SERVER:?CONDA_ENV_SERVER not set in ${ENV_FILE}}"
+CONDA_ENV_PIPELINE="${CONDA_ENV_PIPELINE:?CONDA_ENV_PIPELINE not set in ${ENV_FILE}}"
+VLM_CKPT="${VLM_CKPT:?VLM_CKPT not set in ${ENV_FILE}}"
+EDIT_CKPT="${EDIT_CKPT:?EDIT_CKPT not set in ${ENV_FILE}}"
 
-PY_PIPE="/Node11_nvme/artgen/.miniconda3/envs/${CONDA_ENV_PIPELINE}/bin/python"
-PY_SRV="/Node11_nvme/artgen/.miniconda3/envs/${CONDA_ENV_SERVER}/bin/python"
+# Resolve Python binaries via conda environments
+# shellcheck disable=SC1090
+set +u; source "${CONDA_INIT}"; set -u
+PY_PIPE="$(conda run -n "${CONDA_ENV_PIPELINE}" which python 2>/dev/null)" \
+    || PY_PIPE="${CONDA_PREFIX:-/root/miniconda3}/envs/${CONDA_ENV_PIPELINE}/bin/python"
+PY_SRV="$(conda run -n "${CONDA_ENV_SERVER}" which python 2>/dev/null)" \
+    || PY_SRV="${CONDA_PREFIX:-/root/miniconda3}/envs/${CONDA_ENV_SERVER}/bin/python"
+[ -x "$PY_PIPE" ] || { echo "[ERROR] Pipeline python not found: $PY_PIPE"; exit 1; }
+[ -x "$PY_SRV"  ] || { echo "[ERROR] Server python not found: $PY_SRV";   exit 1; }
 
 LOG_DIR="logs/v2_${TAG}"
 mkdir -p "$LOG_DIR"
@@ -59,6 +67,7 @@ print(dump_shell_env(cfg))
 )
 eval "$plan"
 N_GPUS=${#GPUS[@]}
+N_VLM_SERVERS="${N_VLM_SERVERS:-$N_GPUS}"
 
 # Phase selection: env PHASES override > default selection
 if [ -n "${PHASES:-}" ]; then
@@ -84,20 +93,19 @@ echo "============================================================"
 # ─── server lifecycle ────────────────────────────────────────────────
 
 start_vlm() {
-    echo "[VLM] starting ${N_GPUS} servers"
+    echo "[VLM] starting ${N_VLM_SERVERS} servers (of ${N_GPUS} total GPUs)"
     : > "$LOG_DIR/vlm.pids"
-    for i in $(seq 0 $((N_GPUS-1))); do
+    for i in $(seq 0 $((N_VLM_SERVERS-1))); do
         local gpu="${GPUS[i]}" port="${VLM_PORTS[i]}"
         local log="$LOG_DIR/vlm_${port}.log"
         echo "  GPU $gpu -> port $port"
+        set +u; source "${CONDA_INIT}" && conda activate "${CONDA_ENV_SERVER}"; set -u
         CUDA_VISIBLE_DEVICES="$gpu" \
+        VLM_MODEL="$VLM_CKPT" \
+        VLM_PORT="$port" \
+        VLM_TP=1 \
         SGLANG_DISABLE_CUDNN_CHECK=1 \
-            "$PY_SRV" -m sglang.launch_server \
-                --model-path "$VLM_CKPT" \
-                --host 0.0.0.0 --port "$port" \
-                --tp-size 1 --mem-fraction-static 0.85 \
-                --context-length 32768 \
-                --skip-server-warmup \
+            bash scripts/tools/launch_local_vlm.sh \
                 > "$log" 2>&1 &
         echo $! >> "$LOG_DIR/vlm.pids"
     done
@@ -137,6 +145,7 @@ start_flux() {
         local gpu="${GPUS[i]}" port="${FLUX_PORTS[i]}"
         local log="$LOG_DIR/flux_${port}.log"
         echo "  GPU $gpu -> port $port"
+        set +u; source "${CONDA_INIT}" && conda activate "${CONDA_ENV_SERVER}"; set -u
         CUDA_VISIBLE_DEVICES="$gpu" \
             "$PY_SRV" scripts/tools/image_edit_server.py \
                 --model "$EDIT_CKPT" --port "$port" \
@@ -202,7 +211,7 @@ print(dump_shell_env(cfg, phase_name='$phase'))
         *) echo "[scheduler] unknown servers=$PHASE_SERVERS"; return 1 ;;
     esac
 
-    ATTN_BACKEND=xformers \
+    ATTN_BACKEND=flash_attn \
     "$PY_PIPE" -m partcraft.pipeline_v2.run \
         --config "$CFG" \
         --shard "${TAG#shard}" \

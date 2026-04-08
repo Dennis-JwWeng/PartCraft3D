@@ -214,7 +214,7 @@ def dispatch_gpus(
     for i, gpu in enumerate(gpus):
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = gpu
-        env.setdefault("ATTN_BACKEND", "xformers")
+        env.setdefault("ATTN_BACKEND", "flash_attn")
         # Children always receive --steps (single step) regardless of
         # whether the parent was launched with --phase, so no special-case.
         cmd = [
