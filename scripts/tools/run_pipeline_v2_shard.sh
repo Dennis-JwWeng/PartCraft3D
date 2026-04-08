@@ -1,47 +1,41 @@
 #!/usr/bin/env bash
-# pipeline_v2 phased scheduler.
+# pipeline_v2 phased scheduler — config-driven, GPU-count-agnostic.
 #
-# Drives a full shard through the new object-centric pipeline_v2 by
-# starting/stopping the right servers around each phase. Each phase
-# logs to logs/v2_<shard>/<phase>.log and the script aborts on the
-# first non-zero exit.
+# All scheduling decisions (which GPUs, which ports, which phases,
+# which step needs which servers) come from the YAML config's
+# `pipeline:` section. The shell only knows how to:
+#   1. ask python "what does this config look like?"
+#   2. start/stop server pools
+#   3. invoke `python -m partcraft.pipeline_v2.run --phase <name>`
 #
 # Usage:
 #   bash scripts/tools/run_pipeline_v2_shard.sh shard01 \
-#        configs/pipeline_v2_shard01.yaml \
-#        4,5,6,7
+#        configs/pipeline_v2_shard01.yaml
 #
-# Phases (only the requested ones run; default = all):
-#   PHASES="A,B,C,D,E,F,G" bash scripts/tools/run_pipeline_v2_shard.sh ...
+#   PHASES="A,C,D,D2,E,F"  bash ... shard01 cfg     # custom subset
+#   PHASES=A               bash ... shard01 cfg     # single phase
+#   WITH_OPTIONAL=1        bash ... shard01 cfg     # include optional phases
 #
-#   A : VLM up on GPU0 of pool → s1 → VLM down
-#   B : s2 (CPU only)
-#   C : FLUX up on all 4 GPUs (one per GPU) → s4 → FLUX down
-#   D : s5 + s5b on GPU pool (multi-GPU dispatch)
-#   E : s6 + s6b on GPU pool
-#   F : s7 (CPU only)
-#
-# Resume: each pipeline_v2 step is idempotent + has product validators,
-# so re-running this script picks up where it left off.
+# Each phase logs to logs/v2_<tag>/<phase>.log; the script aborts on
+# the first non-zero exit and tears down any running server.
 
 set -euo pipefail
 
 # ─── args ─────────────────────────────────────────────────────────────
-TAG="${1:-shard01}"
-CFG="${2:-configs/pipeline_v2_shard01.yaml}"
-GPUS="${3:-4,5,6,7}"
-PHASES="${PHASES:-A,B,C,D,E,F}"
+TAG="${1:?usage: $0 <tag> <config> }"
+CFG="${2:?usage: $0 <tag> <config> }"
+WITH_OPTIONAL="${WITH_OPTIONAL:-0}"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
+[ -f "$CFG" ] || { echo "missing $CFG"; exit 1; }
 
-# ─── env paths from node39.env ───────────────────────────────────────
+# ─── env from node39.env ─────────────────────────────────────────────
 ENV_FILE="configs/machine/node39.env"
 [ -f "$ENV_FILE" ] || { echo "missing $ENV_FILE"; exit 1; }
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
-CONDA_INIT="${CONDA_INIT:-/home/artgen/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV_SERVER="${CONDA_ENV_SERVER:-qwen_test}"
 CONDA_ENV_PIPELINE="${CONDA_ENV_PIPELINE:-vinedresser3d}"
 VLM_CKPT="${VLM_CKPT:-/Node11_nvme/zsn/checkpoints/Qwen3.5-27B}"
@@ -53,82 +47,94 @@ PY_SRV="/Node11_nvme/artgen/.miniconda3/envs/${CONDA_ENV_SERVER}/bin/python"
 LOG_DIR="logs/v2_${TAG}"
 mkdir -p "$LOG_DIR"
 
-# ─── derived ─────────────────────────────────────────────────────────
-IFS=',' read -r -a GPU_ARR <<< "$GPUS"
-N_GPUS=${#GPU_ARR[@]}
-VLM_GPU="${GPU_ARR[0]}"
-VLM_PORT=8002
-VLM_URL="http://localhost:${VLM_PORT}/v1"
-FLUX_BASE_PORT=8004
-FLUX_PORTS=()
-for i in $(seq 0 $((N_GPUS-1))); do
-    FLUX_PORTS+=( $((FLUX_BASE_PORT+i)) )
-done
+# ─── ask python for the run plan ─────────────────────────────────────
+# Sets: GPUS=(...) VLM_PORTS=(...) FLUX_PORTS=(...) DEFAULT_PHASES=(...)
+plan=$(
+    "$PY_PIPE" -c "
+import sys, yaml
+from partcraft.pipeline_v2.scheduler import dump_shell_env
+cfg = yaml.safe_load(open('$CFG'))
+print(dump_shell_env(cfg))
+"
+)
+eval "$plan"
+N_GPUS=${#GPUS[@]}
+
+# Phase selection: env PHASES override > default selection
+if [ -n "${PHASES:-}" ]; then
+    IFS=',' read -r -a SELECTED_PHASES <<< "$PHASES"
+elif [ "$WITH_OPTIONAL" = "1" ]; then
+    SELECTED_PHASES=("${ALL_PHASES[@]}")
+else
+    SELECTED_PHASES=("${DEFAULT_PHASES[@]}")
+fi
 
 echo "============================================================"
 echo "  pipeline_v2 phased run"
 echo "============================================================"
 echo "  tag         : $TAG"
 echo "  config      : $CFG"
-echo "  gpus        : $GPUS  (N=$N_GPUS)"
-echo "  phases      : $PHASES"
+echo "  gpus        : ${GPUS[*]}  (N=$N_GPUS)"
+echo "  vlm_ports   : ${VLM_PORTS[*]}"
+echo "  flux_ports  : ${FLUX_PORTS[*]}"
+echo "  phases      : ${SELECTED_PHASES[*]}"
 echo "  log dir     : $LOG_DIR"
-echo "  python(pipe): $PY_PIPE"
-echo "  python(srv) : $PY_SRV"
 echo "============================================================"
 
-run_phase() { [[ ",${PHASES}," == *",${1},"* ]]; }
-
-# ─── server lifecycle ─────────────────────────────────────────────────
+# ─── server lifecycle ────────────────────────────────────────────────
 
 start_vlm() {
-    echo "[VLM] starting on GPU $VLM_GPU port $VLM_PORT"
-    local log="$LOG_DIR/vlm_server.log"
-    CUDA_VISIBLE_DEVICES="$VLM_GPU" \
-    SGLANG_DISABLE_CUDNN_CHECK=1 \
-        "$PY_SRV" -m sglang.launch_server \
-            --model-path "$VLM_CKPT" \
-            --host 0.0.0.0 --port "$VLM_PORT" \
-            --tp-size 1 --mem-fraction-static 0.85 \
-            --context-length 32768 \
-            --skip-server-warmup \
-            > "$log" 2>&1 &
-    VLM_PID=$!
-    echo "[VLM] pid=$VLM_PID  log=$log"
-    echo $VLM_PID > "$LOG_DIR/vlm.pid"
-    # wait until /v1/models responds (timeout 600s)
-    local deadline=$(( $(date +%s) + 600 ))
-    while :; do
-        if curl -s -m 2 "${VLM_URL}/models" >/dev/null 2>&1; then
-            echo "[VLM] ready"; return 0
-        fi
-        if ! kill -0 "$VLM_PID" 2>/dev/null; then
-            echo "[VLM] DIED — see $log"; tail -30 "$log"; return 1
-        fi
-        if [ "$(date +%s)" -gt "$deadline" ]; then
-            echo "[VLM] TIMEOUT"; kill "$VLM_PID" 2>/dev/null || true; return 1
-        fi
-        sleep 5
+    echo "[VLM] starting ${N_GPUS} servers"
+    : > "$LOG_DIR/vlm.pids"
+    for i in $(seq 0 $((N_GPUS-1))); do
+        local gpu="${GPUS[i]}" port="${VLM_PORTS[i]}"
+        local log="$LOG_DIR/vlm_${port}.log"
+        echo "  GPU $gpu -> port $port"
+        CUDA_VISIBLE_DEVICES="$gpu" \
+        SGLANG_DISABLE_CUDNN_CHECK=1 \
+            "$PY_SRV" -m sglang.launch_server \
+                --model-path "$VLM_CKPT" \
+                --host 0.0.0.0 --port "$port" \
+                --tp-size 1 --mem-fraction-static 0.85 \
+                --context-length 32768 \
+                --skip-server-warmup \
+                > "$log" 2>&1 &
+        echo $! >> "$LOG_DIR/vlm.pids"
     done
+    local deadline=$(( $(date +%s) + 900 ))
+    for port in "${VLM_PORTS[@]}"; do
+        while :; do
+            if curl -s -m 2 "http://localhost:${port}/v1/models" \
+                    >/dev/null 2>&1; then
+                echo "[VLM] :${port} ready"; break
+            fi
+            if [ "$(date +%s)" -gt "$deadline" ]; then
+                echo "[VLM] :${port} TIMEOUT"
+                tail -30 "$LOG_DIR/vlm_${port}.log" || true
+                stop_vlm; return 1
+            fi
+            sleep 5
+        done
+    done
+    echo "[VLM] all ${N_GPUS} servers ready"
 }
 
 stop_vlm() {
-    if [ -f "$LOG_DIR/vlm.pid" ]; then
-        local pid; pid=$(cat "$LOG_DIR/vlm.pid")
-        echo "[VLM] killing pid=$pid"
-        kill -9 "$pid" 2>/dev/null || true
+    if [ -f "$LOG_DIR/vlm.pids" ]; then
+        echo "[VLM] killing all servers"
+        while read -r pid; do kill -9 "$pid" 2>/dev/null || true; done \
+            < "$LOG_DIR/vlm.pids"
         pkill -9 -f "sglang.launch_server.*${VLM_CKPT}" 2>/dev/null || true
-        rm -f "$LOG_DIR/vlm.pid"
+        rm -f "$LOG_DIR/vlm.pids"
         sleep 2
     fi
 }
 
 start_flux() {
-    echo "[FLUX] starting ${N_GPUS} servers on GPUs $GPUS"
+    echo "[FLUX] starting ${N_GPUS} servers"
     : > "$LOG_DIR/flux.pids"
     for i in $(seq 0 $((N_GPUS-1))); do
-        local gpu="${GPU_ARR[i]}"
-        local port="${FLUX_PORTS[i]}"
+        local gpu="${GPUS[i]}" port="${FLUX_PORTS[i]}"
         local log="$LOG_DIR/flux_${port}.log"
         echo "  GPU $gpu -> port $port"
         CUDA_VISIBLE_DEVICES="$gpu" \
@@ -137,17 +143,16 @@ start_flux() {
                 > "$log" 2>&1 &
         echo $! >> "$LOG_DIR/flux.pids"
     done
-    # wait for all
-    local deadline=$(( $(date +%s) + 600 ))
+    local deadline=$(( $(date +%s) + 900 ))
     for port in "${FLUX_PORTS[@]}"; do
         while :; do
             if curl -s -m 2 -o /dev/null -w "%{http_code}" \
                     "http://localhost:${port}/health" 2>/dev/null \
                     | grep -q "200"; then
-                echo "[FLUX] :$port ready"; break
+                echo "[FLUX] :${port} ready"; break
             fi
             if [ "$(date +%s)" -gt "$deadline" ]; then
-                echo "[FLUX] :$port TIMEOUT"
+                echo "[FLUX] :${port} TIMEOUT"
                 tail -20 "$LOG_DIR/flux_${port}.log" || true
                 stop_flux; return 1
             fi
@@ -160,69 +165,67 @@ start_flux() {
 stop_flux() {
     if [ -f "$LOG_DIR/flux.pids" ]; then
         echo "[FLUX] killing all servers"
-        while read -r pid; do
-            kill -9 "$pid" 2>/dev/null || true
-        done < "$LOG_DIR/flux.pids"
+        while read -r pid; do kill -9 "$pid" 2>/dev/null || true; done \
+            < "$LOG_DIR/flux.pids"
         pkill -9 -f "image_edit_server.py" 2>/dev/null || true
         rm -f "$LOG_DIR/flux.pids"
         sleep 2
     fi
 }
 
-# global trap so any abort tears down servers
 cleanup_all() { stop_vlm; stop_flux; }
 trap cleanup_all EXIT
 
-# ─── pipeline_v2 invocations ──────────────────────────────────────────
+# ─── per-phase invocation ────────────────────────────────────────────
 
-pv2() {
-    local steps="$1"; shift
-    local log="$LOG_DIR/$1.log"; shift
-    echo "  -> $steps  (log: $log)"
+run_pipeline_phase() {
+    local phase="$1"
+    local log="$LOG_DIR/phase${phase}.log"
+
+    # Ask python what this phase needs
+    eval "$(
+        "$PY_PIPE" -c "
+import yaml
+from partcraft.pipeline_v2.scheduler import dump_shell_env
+cfg = yaml.safe_load(open('$CFG'))
+print(dump_shell_env(cfg, phase_name='$phase'))
+"
+    )"
+
+    echo
+    echo "▶ Phase ${PHASE_NAME} — ${PHASE_DESC}  (steps=${PHASE_STEPS[*]} servers=${PHASE_SERVERS} use_gpus=${PHASE_USE_GPUS})"
+
+    case "$PHASE_SERVERS" in
+        vlm)  start_vlm ;;
+        flux) start_flux ;;
+        none) ;;
+        *) echo "[scheduler] unknown servers=$PHASE_SERVERS"; return 1 ;;
+    esac
+
     ATTN_BACKEND=xformers \
     "$PY_PIPE" -m partcraft.pipeline_v2.run \
         --config "$CFG" \
         --shard "${TAG#shard}" \
         --all \
-        --steps "$steps" \
-        "$@" \
+        --phase "$phase" \
         2>&1 | tee "$log"
+    local rc=${PIPESTATUS[0]}
+
+    case "$PHASE_SERVERS" in
+        vlm)  stop_vlm ;;
+        flux) stop_flux ;;
+    esac
+
+    if [ "$rc" != 0 ]; then
+        echo "[scheduler] phase $phase exit=$rc — aborting"
+        exit "$rc"
+    fi
 }
 
-# ═══ PHASES ═══════════════════════════════════════════════════════════
+# ═══ MAIN LOOP ═══════════════════════════════════════════════════════
+for phase in "${SELECTED_PHASES[@]}"; do
+    run_pipeline_phase "$phase"
+done
 
-if run_phase A; then
-    echo; echo "▶ Phase A — s1 (VLM)"
-    start_vlm
-    pv2 s1 phaseA
-    stop_vlm
-fi
-
-if run_phase B; then
-    echo; echo "▶ Phase B — s2 (highlights, CPU)"
-    pv2 s2 phaseB
-fi
-
-if run_phase C; then
-    echo; echo "▶ Phase C — s4 (FLUX 2D)"
-    start_flux
-    pv2 s4 phaseC
-    stop_flux
-fi
-
-if run_phase D; then
-    echo; echo "▶ Phase D — s5 + s5b (TRELLIS 3D + deletion mesh)"
-    pv2 s5,s5b phaseD --gpus "$GPUS"
-fi
-
-if run_phase E; then
-    echo; echo "▶ Phase E — s6 + s6b (3D rerender + deletion reencode)"
-    pv2 s6,s6b phaseE --gpus "$GPUS"
-fi
-
-if run_phase F; then
-    echo; echo "▶ Phase F — s7 (addition backfill, CPU)"
-    pv2 s7 phaseF
-fi
-
-echo; echo "=== ALL PHASES DONE ==="
+echo
+echo "=== ALL PHASES DONE ==="

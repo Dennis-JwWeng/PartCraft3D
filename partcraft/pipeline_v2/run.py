@@ -42,6 +42,7 @@ import yaml
 from .paths import PipelineRoot, ObjectContext, normalize_shard
 from .status import rebuild_manifest, manifest_summary, step_done
 from .validators import apply_check
+from . import scheduler as sched
 
 LOG = logging.getLogger("pipeline_v2")
 
@@ -129,18 +130,17 @@ def run_step(
     shard = ctxs[0].shard
 
     if step == "s1":
-        from .s1_phase1_vlm import run_many_async
+        from .s1_phase1_vlm import run_many_streaming
         import asyncio
-        urls = (cfg.get("phase0") or {}).get("vlm_base_urls") or [
-            (cfg.get("phase0") or {}).get("vlm_base_url",
-                                          "http://localhost:8002/v1")
-        ]
+        urls = sched.vlm_urls_for(cfg)
         model = (cfg.get("phase0") or {}).get("vlm_model", "Qwen3.5-27B")
         blender = cfg.get("blender",
                           "/Node11_nvme/artgen/lac/.tools/blender-4.2.0-linux-x64/blender")
-        asyncio.run(run_many_async(
+        n_pre = int((cfg.get("pipeline") or {}).get("prerender_workers", 8))
+        asyncio.run(run_many_streaming(
             ctxs, blender=blender, vlm_urls=urls,
-            vlm_model=model, force=args.force,
+            vlm_model=model, n_prerender_workers=n_pre,
+            force=args.force,
         ))
 
     elif step == "s2":
@@ -151,13 +151,9 @@ def run_step(
 
     elif step == "s4":
         from .s4_flux_2d import run as s4_run
-        urls = (cfg.get("phase2_5") or {}).get("image_edit_base_urls") or []
+        urls = sched.flux_urls_for(cfg)
         if not urls:
-            single = (cfg.get("phase2_5") or {}).get("image_edit_base_url")
-            if single:
-                urls = [single]
-        if not urls:
-            raise SystemExit("[CONFIG] phase2_5.image_edit_base_urls required for s4")
+            raise SystemExit("[CONFIG] no FLUX urls (set pipeline.gpus or phase2_5.image_edit_base_urls)")
         s4_run(ctxs, edit_urls=urls,
                workers_per_server=cfg.get("phase2_5", {}).get("workers_per_server", 2),
                images_root=images_root, mesh_root=mesh_root, shard=shard,
@@ -170,9 +166,12 @@ def run_step(
 
     elif step == "s5b":
         from .s5b_deletion import run_mesh_delete
+        # use_refiner=False keeps s5b CPU-only: just trimesh-direct
+        # delete to before/after.ply. The proper after.npz is produced
+        # by s6b later (Blender 40 views → DINOv2 → SLAT enc → SS enc).
         run_mesh_delete(ctxs, cfg=cfg, images_root=images_root,
                         mesh_root=mesh_root, shard=shard,
-                        force=args.force, logger=log)
+                        force=args.force, use_refiner=False, logger=log)
 
     elif step == "s6":
         from .s6_render_3d import run as s6_run
@@ -216,6 +215,8 @@ def dispatch_gpus(
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = gpu
         env.setdefault("ATTN_BACKEND", "xformers")
+        # Children always receive --steps (single step) regardless of
+        # whether the parent was launched with --phase, so no special-case.
         cmd = [
             sys.executable, "-m", "partcraft.pipeline_v2.run",
             "--config", str(cfg_path),
@@ -269,11 +270,15 @@ def main():
     grp = ap.add_mutually_exclusive_group()
     grp.add_argument("--obj-ids", nargs="+")
     grp.add_argument("--all", action="store_true")
-    ap.add_argument("--steps", default=",".join(ALL_STEPS),
-                    help=f"comma list, any of: {','.join(ALL_STEPS)}")
+    ap.add_argument("--steps", default=None,
+                    help=f"comma list, any of: {','.join(ALL_STEPS)} "
+                         "(mutually exclusive with --phase)")
+    ap.add_argument("--phase", default=None,
+                    help="run a single phase by name (uses pipeline.phases "
+                         "from the config to derive steps + gpus + use_gpus)")
     ap.add_argument("--gpus", default=None,
-                    help="comma list, e.g. 4,5,6,7 (only used for "
-                         "GPU steps; ignored otherwise)")
+                    help="comma list e.g. 4,5,6,7. If omitted, falls back "
+                         "to pipeline.gpus from the config when needed.")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
 
@@ -300,13 +305,38 @@ def main():
         print(json.dumps(manifest_summary(root), indent=2))
         return
 
-    steps = [s.strip() for s in args.steps.split(",") if s.strip()]
+    # Resolve steps + use_gpus from --phase or --steps
+    phase_use_gpus = False
+    if args.phase:
+        ph = sched.get_phase(cfg, args.phase)
+        steps = list(ph.steps)
+        phase_use_gpus = ph.use_gpus
+        LOG.info("phase %s (%s): steps=%s use_gpus=%s",
+                 ph.name, ph.desc, steps, phase_use_gpus)
+    elif args.steps:
+        steps = [s.strip() for s in args.steps.split(",") if s.strip()]
+    else:
+        steps = list(ALL_STEPS)
     bad = [s for s in steps if s not in ALL_STEPS]
     if bad:
         raise SystemExit(f"unknown steps: {bad}")
 
+    # Resolve gpu list: explicit --gpus first, then pipeline.gpus
+    if args.gpus is None and (phase_use_gpus or args.phase):
+        try:
+            gpus_list = sched.gpus_for(cfg)
+            args.gpus = ",".join(str(g) for g in gpus_list)
+        except Exception:
+            pass
+
     for step in steps:
-        if step in GPU_STEPS and args.gpus and not args.single_gpu:
+        # GPU dispatch only when this step is GPU-bound AND the phase
+        # asked for it (or the user passed --gpus explicitly).
+        wants_dispatch = (step in GPU_STEPS
+                          and args.gpus
+                          and (phase_use_gpus or not args.phase)
+                          and not args.single_gpu)
+        if wants_dispatch:
             dispatch_gpus(step, args.config, args)
         else:
             run_step(step, ctxs, cfg, args)

@@ -10,6 +10,22 @@ data:
   mesh_root:  /Node11_nvme/wjw/3D_Editing/PartCraft3D/data/partverse/mesh
   images_root: /Node11_nvme/wjw/3D_Editing/PartCraft3D/data/partverse/images
 
+pipeline:
+  gpus: [4, 5, 6, 7]
+  prerender_workers: 8
+  vlm_port_base:    8002
+  vlm_port_stride:  10
+  flux_port_base:   8004
+  flux_port_stride: 1
+  phases:
+    - { name: A,  desc: "phase1 VLM",        servers: vlm,  steps: [s1] }
+    - { name: B,  desc: "highlights",        servers: none, steps: [s2], optional: true }
+    - { name: C,  desc: "FLUX 2D",           servers: flux, steps: [s4] }
+    - { name: D,  desc: "TRELLIS 3D edit",   servers: none, steps: [s5],  use_gpus: true }
+    - { name: D2, desc: "deletion mesh",     servers: none, steps: [s5b] }
+    - { name: E,  desc: "3D rerender",       servers: none, steps: [s6, s6b], use_gpus: true }
+    - { name: F,  desc: "addition backfill", servers: none, steps: [s7] }
+
 phase0:
   vlm_model: Qwen3.5-27B
   vlm_base_urls:

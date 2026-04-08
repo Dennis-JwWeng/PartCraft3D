@@ -9,11 +9,16 @@ exclusively into ``ObjectContext.phase1_dir``:
         parsed.json    ← {obj_id, validation, parsed:{object,edits}}
         raw.txt        ← raw VLM completion text
 
-Two entrypoints:
+Three entrypoints:
 
 * :func:`run_one` — synchronous, single object (best for debug / tests).
-* :func:`run_many_async` — async multi-server fan-out, one object per
-  request, semaphore = 1 per server (matches legacy KV-friendly mode).
+* :func:`run_many_async` — async multi-server fan-out, prerender first
+  then dispatch (kept for compatibility / single-server runs).
+* :func:`run_many_streaming` — producer-consumer pipeline: a process
+  pool runs blender prerenders in parallel and feeds an asyncio queue
+  consumed by N VLM clients (one per server, semaphore=1 each). The
+  first VLM call fires as soon as the first prerender completes, so a
+  4-server config keeps all GPUs working from second 1.
 
 Both write the per-object ``status.json`` step entry ``s1_phase1`` on
 success and rebuild nothing globally — the orchestrator calls
@@ -23,8 +28,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -176,6 +183,25 @@ async def run_many_async(
 
     # Phase A: prerender (sequential, cheap)
     for ctx in ctxs:
+        # Resume short-circuit: if parsed.json exists on disk and parses,
+        # skip this obj entirely (no prerender, no VLM call). This is the
+        # only way to make a crashed run cheap to resume — status.json
+        # alone is not enough because it isn't written until after the
+        # VLM reply lands.
+        if not force and ctx.parsed_path.is_file():
+            try:
+                _j = json.loads(ctx.parsed_path.read_text())
+                if (_j.get("parsed") or {}).get("edits") is not None:
+                    # backfill status if it's missing
+                    if not step_done(ctx, "s1_phase1"):
+                        from .status import update_step, STATUS_OK
+                        update_step(ctx, "s1_phase1", status=STATUS_OK,
+                                    n_edits=len(_j["parsed"].get("edits") or []),
+                                    resumed=True)
+                    results.append(Phase1Result(ctx.obj_id, ok=True))
+                    continue
+            except Exception:
+                pass
         if not force and step_done(ctx, "s1_phase1"):
             results.append(Phase1Result(ctx.obj_id, ok=True))
             continue
@@ -210,4 +236,171 @@ async def run_many_async(
     return results
 
 
-__all__ = ["Phase1Result", "prerender", "run_one", "run_many_async"]
+# ─────────────────── streaming pipeline (mp pool + N VLM consumers) ──
+
+def _prerender_worker(args: tuple) -> tuple | None:
+    """Top-level pickleable worker for ProcessPoolExecutor.
+
+    Returns ``(png_bytes, user_msg, pids, quota)`` or ``None`` if the
+    object exceeds ``MAX_PARTS``. Side effect: writes
+    ``overview_path`` if it doesn't already exist.
+    """
+    mesh_npz, image_npz, blender, overview_path = args
+    from pathlib import Path as _P
+    import sys as _sys
+    _here = _P(__file__).resolve().parents[2] / "scripts" / "standalone"
+    if str(_here) not in _sys.path:
+        _sys.path.insert(0, str(_here))
+    from run_phase1_v2 import (  # type: ignore
+        build_part_menu as _bpm,
+        render_overview_png as _rov,
+        USER_PROMPT_TEMPLATE as _U,
+        quota_for as _qf,
+        MAX_PARTS as _MAX,
+    )
+    mesh_p = _P(mesh_npz); img_p = _P(image_npz); ov_p = _P(overview_path)
+    pids, menu = _bpm(mesh_p, img_p)
+    if len(pids) > _MAX:
+        return None
+    quota = _qf(len(pids))
+    if ov_p.is_file() and ov_p.stat().st_size > 1000:
+        png = ov_p.read_bytes()
+    else:
+        png = _rov(mesh_p, img_p, blender)
+        ov_p.parent.mkdir(parents=True, exist_ok=True)
+        ov_p.write_bytes(png)
+    user_msg = _U.format(
+        part_menu=menu, n_total=sum(quota.values()),
+        n_deletion=quota["deletion"], n_modification=quota["modification"],
+        n_scale=quota["scale"], n_material=quota["material"],
+        n_global=quota["global"],
+    )
+    return png, user_msg, pids, quota
+
+
+async def run_many_streaming(
+    ctxs: Iterable[ObjectContext],
+    *,
+    blender: str,
+    vlm_urls: list[str],
+    vlm_model: str,
+    n_prerender_workers: int = 8,
+    force: bool = False,
+    log_every: int = 20,
+) -> list[Phase1Result]:
+    """Producer-consumer streaming s1: ``n_prerender_workers`` blender
+    processes feed an asyncio queue consumed by ``len(vlm_urls)`` VLM
+    clients in parallel. The first VLM call fires within ~1s of start.
+
+    Resume rule: any obj that already has ``parsed.json`` on disk is
+    skipped (no prerender, no VLM). The orchestrator just calls this
+    after a crash and we pick up exactly where we left off.
+    """
+    from openai import AsyncOpenAI
+    import logging
+    log = logging.getLogger("pipeline_v2.s1.stream")
+
+    ctxs = list(ctxs)
+    todo: list[ObjectContext] = []
+    results: list[Phase1Result] = []
+
+    # Filter resume cases up-front so the queue only carries fresh work.
+    for ctx in ctxs:
+        if not force and ctx.parsed_path.is_file():
+            try:
+                _j = json.loads(ctx.parsed_path.read_text())
+                if (_j.get("parsed") or {}).get("edits") is not None:
+                    if not step_done(ctx, "s1_phase1"):
+                        update_step(
+                            ctx, "s1_phase1", status=STATUS_OK,
+                            n_edits=len(_j["parsed"].get("edits") or []),
+                            resumed=True,
+                        )
+                    results.append(Phase1Result(ctx.obj_id, ok=True))
+                    continue
+            except Exception:
+                pass
+        if not force and step_done(ctx, "s1_phase1"):
+            results.append(Phase1Result(ctx.obj_id, ok=True))
+            continue
+        if ctx.mesh_npz is None or ctx.image_npz is None:
+            results.append(Phase1Result(ctx.obj_id, ok=False, error="no_input"))
+            continue
+        todo.append(ctx)
+
+    log.info("s1 streaming: todo=%d resume=%d  vlm_servers=%d  prerender_workers=%d",
+             len(todo), len(results), len(vlm_urls), n_prerender_workers)
+
+    if not todo:
+        return results
+
+    loop = asyncio.get_running_loop()
+    pool = ProcessPoolExecutor(max_workers=n_prerender_workers)
+    queue: asyncio.Queue = asyncio.Queue(maxsize=2 * len(vlm_urls))
+
+    clients = [AsyncOpenAI(base_url=u, api_key="EMPTY") for u in vlm_urls]
+    sems = [asyncio.Semaphore(1) for _ in clients]
+
+    n_done = 0
+    n_total = len(todo)
+
+    async def render_one(ctx: ObjectContext):
+        try:
+            pre = await loop.run_in_executor(
+                pool, _prerender_worker,
+                (str(ctx.mesh_npz), str(ctx.image_npz),
+                 blender, str(ctx.overview_path)),
+            )
+        except Exception as e:
+            log.warning("prerender %s: %s", ctx.obj_id[:12], e)
+            update_step(ctx, "s1_phase1", status=STATUS_FAIL, error=str(e))
+            return
+        if pre is None:
+            update_step(ctx, "s1_phase1", status=STATUS_SKIP,
+                        reason="too_many_parts")
+            return
+        await queue.put((ctx, pre))
+
+    async def producer():
+        # Cap concurrent prerender submissions to keep memory bounded.
+        sem = asyncio.Semaphore(n_prerender_workers * 2)
+
+        async def _wrap(c):
+            async with sem:
+                await render_one(c)
+
+        await asyncio.gather(*[_wrap(c) for c in todo])
+        for _ in range(len(clients)):
+            await queue.put(None)
+
+    async def consumer(idx: int):
+        nonlocal n_done
+        client = clients[idx]
+        sem = sems[idx]
+        while True:
+            item = await queue.get()
+            if item is None:
+                return
+            ctx, pre = item
+            png, user_msg, pids, quota = pre
+            res = await _call_one(client, ctx, png, user_msg, pids, quota,
+                                  vlm_model, sem)
+            results.append(res)
+            n_done += 1
+            if n_done % log_every == 0 or n_done == n_total:
+                log.info("s1 stream: %d/%d  ok_so_far=%d",
+                         n_done, n_total,
+                         sum(1 for r in results if r.ok))
+
+    try:
+        await asyncio.gather(producer(), *[consumer(i) for i in range(len(clients))])
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    return results
+
+
+__all__ = [
+    "Phase1Result", "prerender", "run_one",
+    "run_many_async", "run_many_streaming",
+]

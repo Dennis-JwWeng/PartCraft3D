@@ -23,10 +23,38 @@ data:
   mesh_root:   /Node11_nvme/wjw/3D_Editing/PartCraft3D/data/partverse/mesh
   images_root: /Node11_nvme/wjw/3D_Editing/PartCraft3D/data/partverse/images
 
+pipeline:
+  # The single source of truth for which GPUs participate in this run.
+  # Any number works (1, 2, 4, 8, ...). VLM and FLUX server ports are
+  # derived from base+stride so we can spawn N servers without listing
+  # them anywhere else.
+  gpus: [4, 5, 6, 7]
+  prerender_workers: 8
+
+  vlm_port_base:    8002
+  vlm_port_stride:  10
+  flux_port_base:   8004
+  flux_port_stride: 1
+
+  # Phase ordering. Each phase optionally needs a server pool, runs a
+  # set of pipeline_v2 steps, and may dispatch the GPU steps across
+  # the gpus list (use_gpus: true) instead of single-process.
+  # `optional: true` phases are skipped unless --with-optional is set
+  # or PHASES env explicitly names them.
+  phases:
+    - { name: A,  desc: "phase1 VLM",        servers: vlm,  steps: [s1] }
+    - { name: B,  desc: "highlights",        servers: none, steps: [s2], optional: true }
+    - { name: C,  desc: "FLUX 2D",           servers: flux, steps: [s4] }
+    - { name: D,  desc: "TRELLIS 3D edit",   servers: none, steps: [s5],  use_gpus: true }
+    - { name: D2, desc: "deletion mesh",     servers: none, steps: [s5b] }
+    - { name: E,  desc: "3D rerender",       servers: none, steps: [s6, s6b], use_gpus: true }
+    - { name: F,  desc: "addition backfill", servers: none, steps: [s7] }
+
 phase0:
   vlm_model: Qwen3.5-27B
-  vlm_base_urls:
-    - http://localhost:8002/v1
+  # vlm_base_urls is auto-derived from pipeline.gpus + vlm_port_base
+  # at runtime; you can override it here if you want to point at
+  # remote servers instead.
 
 phase2_5:
   enabled: true
