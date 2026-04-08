@@ -67,9 +67,14 @@ def prerender(ctx: ObjectContext, blender: str) -> tuple[bytes, str, list[int], 
     if len(pids) > MAX_PARTS:
         return None
     quota = quota_for(len(pids))
-    png = render_overview_png(ctx.mesh_npz, ctx.image_npz, blender)
     ctx.phase1_dir.mkdir(parents=True, exist_ok=True)
-    ctx.overview_path.write_bytes(png)
+    # Reuse a cached overview.png if it already exists (parsed.json may
+    # be missing because the previous run died at the VLM phase).
+    if ctx.overview_path.is_file() and ctx.overview_path.stat().st_size > 1000:
+        png = ctx.overview_path.read_bytes()
+    else:
+        png = render_overview_png(ctx.mesh_npz, ctx.image_npz, blender)
+        ctx.overview_path.write_bytes(png)
     user_msg = USER_PROMPT_TEMPLATE.format(
         part_menu=menu, n_total=sum(quota.values()),
         n_deletion=quota["deletion"], n_modification=quota["modification"],

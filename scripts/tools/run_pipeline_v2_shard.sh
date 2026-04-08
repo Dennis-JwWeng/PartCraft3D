@@ -91,6 +91,7 @@ start_vlm() {
             --host 0.0.0.0 --port "$VLM_PORT" \
             --tp-size 1 --mem-fraction-static 0.85 \
             --context-length 32768 \
+            --skip-server-warmup \
             > "$log" 2>&1 &
     VLM_PID=$!
     echo "[VLM] pid=$VLM_PID  log=$log"
