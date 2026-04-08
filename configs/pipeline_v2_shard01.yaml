@@ -22,13 +22,14 @@ data:
   output_dir:  /Node11_nvme/wjw/3D_Editing/PartCraft3D/outputs/partverse/pipeline_v2_shard01
   mesh_root:   /Node11_nvme/wjw/3D_Editing/PartCraft3D/data/partverse/mesh
   images_root: /Node11_nvme/wjw/3D_Editing/PartCraft3D/data/partverse/images
+  slat_dir:    /Node11_nvme/wjw/3D_Editing/PartCraft3D/data/partverse/slat
 
 pipeline:
   # The single source of truth for which GPUs participate in this run.
   # Any number works (1, 2, 4, 8, ...). VLM and FLUX server ports are
   # derived from base+stride so we can spawn N servers without listing
   # them anywhere else.
-  gpus: [4, 5, 6, 7]
+  gpus: [0, 4, 5, 6, 7]
   prerender_workers: 8
 
   vlm_port_base:    8002

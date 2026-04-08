@@ -21,8 +21,30 @@ from typing import Callable
 from .paths import ObjectContext
 from .specs import iter_all_specs, iter_deletion_specs, iter_flux_specs
 from .status import (
-    STATUS_OK, STATUS_FAIL, load_status, save_status,
+    STATUS_OK, STATUS_FAIL, STATUS_SKIP, load_status, save_status,
 )
+
+
+def _phase1_skipped(ctx: ObjectContext) -> bool:
+    """True if s1 was explicitly marked skip (e.g. too_many_parts)."""
+    s = load_status(ctx)
+    entry = (s.get("steps") or {}).get("s1_phase1") or {}
+    return entry.get("status") == STATUS_SKIP
+
+
+def _require_phase1(step: str, ctx: ObjectContext) -> StepCheck | None:
+    """Gate downstream validators on parsed.json.
+
+    Returns a short-circuit StepCheck, or ``None`` to continue:
+      * SKIP at s1 (too_many_parts) → ok=True, expected=0 (nothing to do).
+      * parsed.json missing → ok=False, missing=['parsed.json'].
+      * otherwise → None (caller runs its own product check).
+    """
+    if _phase1_skipped(ctx):
+        return StepCheck(step=step, ok=True, expected=0, found=0, skip=True)
+    if not ctx.parsed_path.is_file():
+        return StepCheck(step=step, ok=False, missing=["parsed.json"])
+    return None
 
 
 @dataclass
@@ -32,6 +54,7 @@ class StepCheck:
     expected: int = 0
     found: int = 0
     missing: list[str] = field(default_factory=list)
+    skip: bool = False   # True when phase1 was skip → step is n/a
 
     def to_dict(self) -> dict:
         return {
@@ -60,6 +83,10 @@ def _check_files(step: str, paths: list[tuple[str, Path]]) -> StepCheck:
 # ─────────────────── per-step validators ─────────────────────────────
 
 def check_s1(ctx: ObjectContext) -> StepCheck:
+    # Preserve explicit SKIP (e.g. too_many_parts) — absence of parsed.json
+    # is expected in that case and should not be flipped to FAIL.
+    if _phase1_skipped(ctx):
+        return StepCheck(step="s1_phase1", ok=True, expected=0, found=0, skip=True)
     return _check_files("s1_phase1", [
         ("parsed.json", ctx.parsed_path),
         ("overview.png", ctx.overview_path),
@@ -67,8 +94,9 @@ def check_s1(ctx: ObjectContext) -> StepCheck:
 
 
 def check_s2(ctx: ObjectContext) -> StepCheck:
-    if not ctx.parsed_path.is_file():
-        return StepCheck("s2_highlights", ok=False, missing=["parsed.json"])
+    gate = _require_phase1("s2_highlights", ctx)
+    if gate is not None:
+        return gate
     edits = (json.loads(ctx.parsed_path.read_text())
              .get("parsed") or {}).get("edits") or []
     return _check_files("s2_highlights", [
@@ -77,6 +105,9 @@ def check_s2(ctx: ObjectContext) -> StepCheck:
 
 
 def check_s4(ctx: ObjectContext) -> StepCheck:
+    gate = _require_phase1("s4_flux_2d", ctx)
+    if gate is not None:
+        return gate
     return _check_files("s4_flux_2d", [
         (f"{s.edit_id}_edited.png", ctx.edit_2d_output(s.edit_id))
         for s in iter_flux_specs(ctx)
@@ -84,6 +115,9 @@ def check_s4(ctx: ObjectContext) -> StepCheck:
 
 
 def check_s5(ctx: ObjectContext) -> StepCheck:
+    gate = _require_phase1("s5_trellis", ctx)
+    if gate is not None:
+        return gate
     paths = []
     for s in iter_flux_specs(ctx):
         paths.append((f"{s.edit_id}/before.npz", ctx.edit_3d_npz(s.edit_id, "before")))
@@ -92,6 +126,9 @@ def check_s5(ctx: ObjectContext) -> StepCheck:
 
 
 def check_s5b(ctx: ObjectContext) -> StepCheck:
+    gate = _require_phase1("s5b_del_mesh", ctx)
+    if gate is not None:
+        return gate
     paths = []
     for s in iter_deletion_specs(ctx):
         d = ctx.edit_3d_dir(s.edit_id)
@@ -101,6 +138,9 @@ def check_s5b(ctx: ObjectContext) -> StepCheck:
 
 
 def check_s6(ctx: ObjectContext) -> StepCheck:
+    gate = _require_phase1("s6_render_3d", ctx)
+    if gate is not None:
+        return gate
     paths = []
     for s in iter_flux_specs(ctx):
         paths.append((f"{s.edit_id}/before.png", ctx.edit_3d_png(s.edit_id, "before")))
@@ -109,6 +149,9 @@ def check_s6(ctx: ObjectContext) -> StepCheck:
 
 
 def check_s6b(ctx: ObjectContext) -> StepCheck:
+    gate = _require_phase1("s6b_del_reencode", ctx)
+    if gate is not None:
+        return gate
     return _check_files("s6b_del_reencode", [
         (f"{s.edit_id}/after.npz", ctx.edit_3d_npz(s.edit_id, "after"))
         for s in iter_deletion_specs(ctx)
@@ -116,6 +159,9 @@ def check_s6b(ctx: ObjectContext) -> StepCheck:
 
 
 def check_s7(ctx: ObjectContext) -> StepCheck:
+    gate = _require_phase1("s7_add_backfill", ctx)
+    if gate is not None:
+        return gate
     paths = []
     add_seq = 0
     for s in iter_deletion_specs(ctx):
@@ -158,7 +204,9 @@ def apply_check(ctx: ObjectContext, step_short: str) -> StepCheck:
     steps = s.setdefault("steps", {})
     entry = steps.get(rep.step) or {"status": "?"}
     entry["validation"] = rep.to_dict()
-    if not rep.ok:
+    if rep.skip:
+        entry["status"] = STATUS_SKIP
+    elif not rep.ok:
         entry["status"] = STATUS_FAIL
     elif entry.get("status") not in (STATUS_OK, STATUS_FAIL):
         entry["status"] = STATUS_OK

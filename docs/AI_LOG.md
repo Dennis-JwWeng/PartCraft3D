@@ -4,6 +4,79 @@
 
 ---
 
+## 2026-04-08 — pipeline_v2：object-centric 全管线入口 + validator 修复
+
+**问题**：phase1 v2 之后,后续 step（FLUX 2D / TRELLIS 3D / rerender / addition backfill）原本仍走旧 batch 入口（`scripts/run_pipeline.py`），与 object-centric 输出布局（`outputs/<root>/objects/<shard>/<obj_id>/{phase1,edits_2d,edits_3d,...}`）不对齐；并且没有按 phase 自动起停 VLM/FLUX 服务的统一调度。
+
+**决策**：把 phase1 v2 的全部下游搬进新模块 `partcraft/pipeline_v2/`,以 object 为单位串起 s1→s2→s4→s5→s5b→s6→s6b→s7,并新增 shell 调度器 `scripts/tools/run_pipeline_v2_shard.sh` 按 config 的 `pipeline.phases` 拉起/拆卸服务。
+
+**新入口**：
+
+- Python：`python -m partcraft.pipeline_v2.run --config <yaml> --shard <NN> --all --phase <A|C|D|D2|E|F>`
+- Shell：`PHASES="A,C,D,D2,E,F" bash scripts/tools/run_pipeline_v2_shard.sh shard01 configs/pipeline_v2_shard01.yaml`
+  - 由 `partcraft/pipeline_v2/scheduler.py:dump_shell_env()` 给 bash 吐 `GPUS / VLM_PORTS / FLUX_PORTS / DEFAULT_PHASES`,bash 只负责 `start_vlm`/`start_flux`/`stop_*` 和 phase 循环
+  - 任意 N-GPU 自动派生端口(VLM `base+i*stride`,FLUX `base+i*stride`)
+  - 单 phase 失败立刻清理服务并退出
+
+**模块布局**(`partcraft/pipeline_v2/`):
+
+| 文件 | 作用 |
+|---|---|
+| `run.py` | CLI；按 `--phase` 或 `--steps` 调度多卡;每个 step 跑完调用 validators 翻 status |
+| `scheduler.py` | 纯控制面: `gpus_for / vlm_urls_for / flux_urls_for / phases_for / dump_shell_env` |
+| `specs.py` | `iter_all_specs / iter_flux_specs / iter_deletion_specs`,从 parsed.json 派生 edit 任务 |
+| `paths.py` | `ObjectContext`,统一所有产物路径(parsed/overview/highlights/edits_2d/edits_3d) |
+| `status.py` | `status.json` 读写 + 状态常量(OK/FAIL/SKIP/PENDING) + `step_done` |
+| `validators.py` | 每 step 的纯文件检查,翻 status 用 |
+| `s1_phase1_vlm.py` | 异步 producer-consumer:1 producer + N consumer,每 VLM server `Semaphore(1)`;`ProcessPoolExecutor` 跑 blender prerender;parsed.json 存在即跳过 |
+| `s2_highlights.py` | 渲染 highlights/e{idx:02d}.png |
+| `s4_flux_2d.py` | 调 FLUX 服务做 2D 编辑,per-edit 看 `_edited.png` resume |
+| `s5_trellis_3d.py` | TRELLIS 编辑产 before/after.npz |
+| `s5b_deletion.py` | deletion 专用 mesh 路径 |
+| `s6_render_3d.py` | 3D rerender(`s6` Gaussian 渲染 + `s6b` deletion 重编码) |
+| `s7_addition_backfill.py` | addition 互换硬链接 |
+
+**Resume 协议(per-edit 粒度)**:
+
+1. 每 step 跑完 → validators 扫磁盘 → status flip(OK/FAIL/SKIP)
+2. 下次启动 → s5/s6 等先看 `step_done(ctx, step)` 跳过物体级 OK
+3. 物体级 FAIL/PENDING → 进入 step,内部 per-edit 检查 `before.npz/after.npz/_edited.png` 等,只补缺失文件
+4. s1 SKIP(`too_many_parts`) 不会被 validator 翻成 FAIL
+
+**Validator bug 修复**(本次配套):
+
+| 问题 | 修复 |
+|---|---|
+| `_check_files` 在 expected=0 时返回 ok=True,导致没 parsed.json 的物体被 s4/s5/s5b/s6/s6b/s7 标成"通过" | 新增 `_require_phase1(step, ctx)` 网关:s1 SKIP → ok=True expected=0;parsed.json 缺失 → ok=False missing=['parsed.json'];否则继续 |
+| `check_s1` 把 too_many_parts 的 SKIP 物体翻成 FAIL(parsed.json 不存在) | 先看 `_phase1_skipped`,SKIP 短路返回 ok=True |
+| `dispatch_gpus` 子进程 exit=1 时 orchestrator 不抛错,直接报"ALL PHASES DONE" + 旧 status 数字 | (待修)`run.py` 的 `dispatch_gpus` 返回 rc 应让 phase 失败传播 |
+
+**配置示例**:`configs/pipeline_v2_shard01.yaml`
+
+```yaml
+pipeline:
+  gpus: [0, 4, 5, 6, 7]              # N-GPU agnostic, 单一事实源
+  prerender_workers: 8
+  vlm_port_base:    8002
+  vlm_port_stride:  10               # → 8002,8012,8022,8032,8042
+  flux_port_base:   8004
+  flux_port_stride: 1                # → 8004..8008
+  phases:
+    - { name: A,  desc: "phase1 VLM",        servers: vlm,  steps: [s1],       use_gpus: false }
+    - { name: C,  desc: "FLUX 2D",           servers: flux, steps: [s4],       use_gpus: false }
+    - { name: D,  desc: "TRELLIS 3D edit",   servers: none, steps: [s5],       use_gpus: true  }
+    - { name: D2, desc: "deletion mesh",     servers: none, steps: [s5b],      use_gpus: false }
+    - { name: E,  desc: "3D rerender",       servers: none, steps: [s6, s6b],  use_gpus: true  }
+    - { name: F,  desc: "addition backfill", servers: none, steps: [s7],       use_gpus: false }
+```
+
+**实测**(shard01,5 GPU):
+- Phase A:5 sglang 并行 → ~40s/obj wall,982 个剩余 obj 约 2.5h
+- Phase D:TRELLIS 单 GPU ~4 min/edit,5 GPU 并行 ≈ 1.25 edit/min 整体吞吐
+- 与其他用户共享卡时会被显著拖慢(GPU 4-7 上每张卡有 13-23 GB 别人的 python 进程,实测 D 约 1 edit/min)
+
+---
+
 ## 2026-04-07 — Phase 1 v2：prompt-driven part selection（重构）
 
 **问题**：旧 phase 1 是 group-driven —— phase0 LLM 先给每个 part 出语义描述、再 group、再为每个 group 生成 prompt。链路长、prompt 风格塌缩、对 cluster_size 小的 part 过滤不一致；多次清洗发现 deletion 13% 空 prompt 主要源于这条管线的中间环节。

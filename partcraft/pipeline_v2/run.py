@@ -329,6 +329,7 @@ def main():
         except Exception:
             pass
 
+    exit_rc = 0
     for step in steps:
         # GPU dispatch only when this step is GPU-bound AND the phase
         # asked for it (or the user passed --gpus explicitly).
@@ -337,7 +338,10 @@ def main():
                           and (phase_use_gpus or not args.phase)
                           and not args.single_gpu)
         if wants_dispatch:
-            dispatch_gpus(step, args.config, args)
+            rc = dispatch_gpus(step, args.config, args)
+            if rc != 0:
+                LOG.error("[%s] dispatch_gpus returned rc=%d — aborting", step, rc)
+                exit_rc = rc
         else:
             run_step(step, ctxs, cfg, args)
         # post-step validation: rewrite status to reflect product reality
@@ -353,9 +357,13 @@ def main():
                             rep.missing[:3])
         LOG.info("[%s] validate: pass=%d fail=%d", step, n_pass, n_fail)
         rebuild_manifest(root)
+        if exit_rc != 0:
+            break
 
     LOG.info("\n%s", json.dumps(manifest_summary(root),
                                  indent=2, ensure_ascii=False))
+    if exit_rc != 0:
+        raise SystemExit(exit_rc)
 
 
 _STATUS_KEYS = {
