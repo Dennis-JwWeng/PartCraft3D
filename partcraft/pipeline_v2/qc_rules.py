@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Any
 
 _PART_REQUIRED = frozenset({"deletion", "modification", "scale", "material"})
-_ADD_VERBS = ("add ", "insert", "attach", "place", "put ")
+_ADD_VERBS = ("add ", "insert ", "attach ", "put ")
 _REMOVE_ONLY = ("remove", "delete", "erase", "strip", "eliminate")
 _REPLACE_IND = ("replace", "swap", "change", "modify", "convert")
 
@@ -16,7 +16,7 @@ def check_rules(edit: dict[str, Any], parts_by_id: dict[int, Any]) -> dict[str, 
     fails: dict[str, bool] = {}
 
     if len(prompt) < 8:
-        fails["prompt_empty"] = True
+        fails["prompt_too_short"] = True
     if et in _PART_REQUIRED:
         if not pids:
             fails["parts_missing"] = True

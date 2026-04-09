@@ -12,9 +12,9 @@ class TestQcRules(unittest.TestCase):
                 "selected_part_ids": [0], "target_part_desc": "chair leg"}
         self.assertEqual(self.check(edit, self.parts), {})
 
-    def test_prompt_empty(self):
+    def test_prompt_too_short(self):
         edit = {"edit_type": "deletion", "prompt": "hi", "selected_part_ids": [0]}
-        self.assertIn("prompt_empty", self.check(edit, self.parts))
+        self.assertIn("prompt_too_short", self.check(edit, self.parts))
 
     def test_parts_missing(self):
         edit = {"edit_type": "deletion",
@@ -43,6 +43,14 @@ class TestQcRules(unittest.TestCase):
     def test_verb_conflict_deletion(self):
         edit = {"edit_type": "deletion",
                 "prompt": "Add a new leg to the chair", "selected_part_ids": [0]}
+        self.assertIn("verb_conflict", self.check(edit, self.parts))
+
+    def test_verb_conflict_modification(self):
+        edit = {"edit_type": "modification",
+                "prompt": "Remove the wooden leg completely",
+                "selected_part_ids": [0], "target_part_desc": "wooden leg",
+                "new_parts_desc": "nothing", "new_parts_desc_stage1": "none",
+                "new_parts_desc_stage2": ""}
         self.assertIn("verb_conflict", self.check(edit, self.parts))
 
     def test_global_no_parts(self):
