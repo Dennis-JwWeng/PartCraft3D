@@ -208,11 +208,19 @@ print(dump_shell_env(cfg, stage_name='$stage'))
         *) echo "[scheduler] unknown servers=$STAGE_SERVERS"; return 1 ;;
     esac
 
+    # OBJ_IDS env var: space-separated object IDs to process instead of --all
+    if [ -n "${OBJ_IDS:-}" ]; then
+        read -ra _OBJ_FLAG <<< "$OBJ_IDS"
+        _OBJ_FLAG=(--obj-ids "${_OBJ_FLAG[@]}")
+    else
+        _OBJ_FLAG=(--all)
+    fi
+
     ATTN_BACKEND=flash_attn \
     "$PY_PIPE" -m partcraft.pipeline_v2.run \
         --config "$CFG" \
         --shard "${TAG#shard}" \
-        --all \
+        "${_OBJ_FLAG[@]}" \
         --stage "$stage" \
         2>&1 | tee "$log"
     local rc=${PIPESTATUS[0]}
