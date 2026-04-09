@@ -91,9 +91,9 @@ class TestQcRules(unittest.TestCase):
                 "selected_part_ids": [0], "target_part_desc": "chair leg"}
         self.assertEqual(self.check(edit, self.parts), {})
 
-    def test_prompt_empty(self):
+    def test_prompt_too_short(self):
         edit = {"edit_type": "deletion", "prompt": "hi", "selected_part_ids": [0]}
-        self.assertIn("prompt_empty", self.check(edit, self.parts))
+        self.assertIn("prompt_too_short", self.check(edit, self.parts))
 
     def test_parts_missing(self):
         edit = {"edit_type": "deletion",
@@ -169,7 +169,7 @@ def check_rules(edit: dict[str, Any], parts_by_id: dict[int, Any]) -> dict[str, 
     fails: dict[str, bool] = {}
 
     if len(prompt) < 8:
-        fails["prompt_empty"] = True
+        fails["prompt_too_short"] = True
     if et in _PART_REQUIRED:
         if not pids:
             fails["parts_missing"] = True
@@ -248,10 +248,10 @@ class TestQcIo(unittest.TestCase):
         from partcraft.pipeline_v2.qc_io import update_edit_gate, load_qc
         ctx = _ctx(self.p)
         update_edit_gate(ctx, "del_000", "deletion", "A",
-                         rule_result={"pass": False, "checks": {"prompt_empty": True}})
+                         rule_result={"pass": False, "checks": {"prompt_too_short": True}})
         e = load_qc(ctx)["edits"]["del_000"]
         self.assertFalse(e["final_pass"])
-        self.assertEqual(e["fail_gate"], "A"); self.assertEqual(e["fail_reason"], "prompt_empty")
+        self.assertEqual(e["fail_gate"], "A"); self.assertEqual(e["fail_reason"], "prompt_too_short")
 
     def test_all_pass(self):
         from partcraft.pipeline_v2.qc_io import update_edit_gate, load_qc

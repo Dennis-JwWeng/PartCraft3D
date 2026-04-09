@@ -134,7 +134,7 @@ Location: `objects/<shard>/<obj_id>/qc.json` (alongside `status.json`).
 
 | Rule code | Check | Types |
 |-----------|-------|-------|
-| `prompt_empty` | `prompt` empty or < 8 chars | all |
+| `prompt_too_short` | `prompt` empty or < 8 chars | all |
 | `parts_missing` | `selected_part_ids` empty | deletion / modification / scale / material |
 | `parts_invalid` | Any ID not in `object.parts` table | same |
 | `new_desc_missing` | `new_parts_desc` empty | modification |
