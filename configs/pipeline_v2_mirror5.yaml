@@ -6,9 +6,9 @@ ckpt_root: /Node11_nvme/wjw/3D_Editing/PartCraft3D/checkpoints
 blender: /Node11_nvme/artgen/lac/.tools/blender-4.2.0-linux-x64/blender
 
 data:
-  output_dir: /Node11_nvme/wjw/3D_Editing/PartCraft3D/outputs/partverse/pipeline_v2_mirror5
-  mesh_root:  /Node11_nvme/wjw/3D_Editing/PartCraft3D/data/partverse/mesh
-  images_root: /Node11_nvme/wjw/3D_Editing/PartCraft3D/data/partverse/images
+  output_dir: /Node11_nvme/wjw/3D_Editing/data/outputs/pipeline_v2_mirror5
+  mesh_root:  /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/mesh
+  images_root: /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/images
 
 pipeline:
   gpus: [4, 5, 6, 7]

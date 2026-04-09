@@ -18,22 +18,22 @@
 # 仅打包 NPZ：
 #   python scripts/datasets/partverse/pack_npz.py \
 #       --shard 01 --num-shards 10 \
-#       --data-root /Node11_nvme/wjw/3D_Editing/PartCraft3D/data/partverse
+#       --data-root /Node11_nvme/wjw/3D_Editing/data/inputs/partverse
 
 # ── Checkpoints ─────────────────────────────────────────────────────
 ckpt_root: "/Node11_nvme/wjw/3D_Editing/PartCraft3D/checkpoints"
 
 # ── Data ────────────────────────────────────────────────────────────
 data:
-  data_dir:               "/Node11_nvme/wjw/3D_Editing/PartCraft3D/data/partverse"
+  data_dir:               "/Node11_nvme/wjw/3D_Editing/data/inputs/partverse"
   derive_dataset_subpaths: true
-  output_dir:             "/Node11_nvme/wjw/3D_Editing/PartCraft3D/outputs/partverse"
+  output_dir:             "/Node11_nvme/wjw/3D_Editing/data/outputs"
   shards:                 ["01"]
   output_by_shard:        false
 
 # ── Paths: 预渲染产物 ──────────────────────────────────────────────
 paths:
-  dataset_root:           "/Node11_nvme/wjw/3D_Editing/PartCraft3D/data/partverse"
+  dataset_root:           "/Node11_nvme/wjw/3D_Editing/data/inputs/partverse"
   source_glb_dir:         "source/normalized_glbs"
   captions_json:          "source/text_captions.json"
   img_enc_dir:            "img_Enc"

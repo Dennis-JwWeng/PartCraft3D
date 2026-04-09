@@ -30,11 +30,11 @@ ckpt_root: "/Node11_nvme/wjw/3D_Editing/PartCraft3D/checkpoints"
 
 # ── Data & Output ───────────────────────────────────────────────────
 data:
-  data_dir:               "/Node11_nvme/wjw/3D_Editing/PartCraft3D/data/partverse"
+  data_dir:               "/Node11_nvme/wjw/3D_Editing/data/inputs/partverse"
   derive_dataset_subpaths: true
   shards:                 ["01"]
   output_by_shard:        true
-  output_dir:             "/Node11_nvme/wjw/3D_Editing/PartCraft3D/outputs/partverse"
+  output_dir:             "/Node11_nvme/wjw/3D_Editing/data/outputs"
 
 # ── Phase 0: VLM 语义标注 ──────────────────────────────────────────
 phase0:

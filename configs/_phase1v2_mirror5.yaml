@@ -1,11 +1,11 @@
 ckpt_root: /Node11_nvme/wjw/3D_Editing/PartCraft3D/checkpoints
 data:
-  data_dir: /Node11_nvme/wjw/3D_Editing/PartCraft3D/data/partverse
+  data_dir: /Node11_nvme/wjw/3D_Editing/data/inputs/partverse
   derive_dataset_subpaths: true
   shards:
   - '01'
   output_by_shard: false
-  output_dir: /Node11_nvme/wjw/3D_Editing/PartCraft3D/outputs/_debug/phase1_v2_mirror5
+  output_dir: /Node11_nvme/wjw/3D_Editing/data/outputs/_debug/phase1_v2_mirror5
 phase0:
   vlm_backend: local
   vlm_model: Qwen3.5-27B
