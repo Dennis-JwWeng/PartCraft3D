@@ -10,7 +10,7 @@
 #       0008dc75fb3648f2af4ca8c4d711e53e 000ec112ae7f4a8a93f847ccfd4031be
 #
 # Env overrides (same as the main shard script):
-#   PHASES=A,C,D     override phase list
+#   STAGES=A,C,D     override phase list
 #   MACHINE_ENV=...  point to a specific machine env file
 
 set -euo pipefail
@@ -63,10 +63,10 @@ eval "$plan"
 N_GPUS=${#GPUS[@]}
 N_VLM_SERVERS="${N_VLM_SERVERS:-$N_GPUS}"
 
-if [ -n "${PHASES:-}" ]; then
-    IFS=',' read -r -a SELECTED_PHASES <<< "$PHASES"
+if [ -n "${STAGES:-}" ]; then
+    IFS=',' read -r -a SELECTED_STAGES <<< "$STAGES"
 else
-    SELECTED_PHASES=("${DEFAULT_PHASES[@]}")
+    SELECTED_STAGES=("${DEFAULT_STAGES[@]}")
 fi
 
 OBJ_IDS_STR="${OBJ_IDS[*]}"
@@ -81,7 +81,7 @@ echo "  obj_ids     : ${OBJ_IDS[*]}"
 echo "  gpus        : ${GPUS[*]}  (N=$N_GPUS)"
 echo "  vlm_ports   : ${VLM_PORTS[*]}"
 echo "  flux_ports  : ${FLUX_PORTS[*]}"
-echo "  phases      : ${SELECTED_PHASES[*]}"
+echo "  stages      : ${SELECTED_STAGES[*]}"
 echo "  log dir     : $LOG_DIR"
 echo "============================================================"
 
@@ -147,39 +147,39 @@ cleanup_all() { stop_vlm; stop_flux; }
 trap cleanup_all EXIT
 
 # ── per-phase runner ─────────────────────────────────────────────────
-run_phase() {
-    local phase="$1"
-    local log="$LOG_DIR/phase${phase}.log"
+run_stage() {
+    local stage="$1"
+    local log="$LOG_DIR/stage_${stage}.log"
     eval "$("$PY_PIPE" -c "
 import yaml
 from partcraft.pipeline_v2.scheduler import dump_shell_env
 cfg = yaml.safe_load(open('$CFG'))
-print(dump_shell_env(cfg, phase_name='$phase'))
+print(dump_shell_env(cfg, stage_name='$stage'))
 ")"
     echo
-    echo "▶ Phase ${PHASE_NAME} — ${PHASE_DESC}  (steps=${PHASE_STEPS[*]} servers=${PHASE_SERVERS} gpus=${PHASE_USE_GPUS})"
-    case "$PHASE_SERVERS" in vlm) start_vlm ;; flux) start_flux ;; esac
+    echo "▶ Stage ${STAGE_NAME} — ${STAGE_DESC}  (steps=${STAGE_STEPS[*]} servers=${STAGE_SERVERS} gpus=${STAGE_USE_GPUS})"
+    case "$STAGE_SERVERS" in vlm) start_vlm ;; flux) start_flux ;; esac
 
     local gpus_flag=""
-    [ "${PHASE_USE_GPUS}" = "1" ] && gpus_flag="--gpus $(IFS=,; echo "${GPUS[*]}")"
+    [ "${STAGE_USE_GPUS}" = "1" ] && gpus_flag="--gpus $(IFS=,; echo "${GPUS[*]}")"
 
     ATTN_BACKEND=flash_attn \
     "$PY_PIPE" -m partcraft.pipeline_v2.run \
         --config "$CFG" \
         --shard "$SHARD" \
         --obj-ids ${OBJ_IDS_STR} \
-        --phase "$phase" \
+        --stage "$stage" \
         $gpus_flag \
         2>&1 | tee "$log"
     local rc=${PIPESTATUS[0]}
 
-    case "$PHASE_SERVERS" in vlm) stop_vlm ;; flux) stop_flux ;; esac
-    [ "$rc" = "0" ] || { echo "[smoke] phase $phase exit=$rc — abort"; exit "$rc"; }
+    case "$STAGE_SERVERS" in vlm) stop_vlm ;; flux) stop_flux ;; esac
+    [ "$rc" = "0" ] || { echo "[smoke] stage $stage exit=$rc — abort"; exit "$rc"; }
 }
 
 # ── MAIN ─────────────────────────────────────────────────────────────
-for phase in "${SELECTED_PHASES[@]}"; do
-    run_phase "$phase"
+for stage in "${SELECTED_STAGES[@]}"; do
+    run_stage "$stage"
 done
 echo
-echo "=== SMOKE TEST DONE (${#OBJ_IDS[@]} objects, phases: ${SELECTED_PHASES[*]}) ==="
+echo "=== SMOKE TEST DONE (${#OBJ_IDS[@]} objects, stages: ${SELECTED_STAGES[*]}) ==="

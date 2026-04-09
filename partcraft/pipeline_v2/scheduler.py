@@ -1,38 +1,32 @@
 """Pipeline v2 scheduling helpers (control plane).
 
-Pure functions that read the ``pipeline:`` block of a config and
-expose:
+Pure functions that read the ``pipeline:`` block and ``services`` of a config.
 
-* :func:`gpus_for(cfg)`         — list[int]    GPU ids in the run pool
-* :func:`vlm_urls_for(cfg)`     — list[str]    one /v1 url per GPU
-* :func:`flux_urls_for(cfg)`    — list[str]    one /<host:port> per GPU
-* :func:`phases_for(cfg)`       — list[Phase]  ordered phase definitions
-* :func:`select_phases(cfg, names, with_optional)` — phase subset
+* :func:`stages_for(cfg)` — list[Phase] ordered stage definitions (``pipeline.stages``)
+* :func:`select_stages(cfg, names, with_optional)` — stage subset
+* :func:`gpus_for` / :func:`vlm_urls_for` / :func:`flux_urls_for` — hardware + URL lists
 
-These are imported by both the orchestrator (`run.py --phase`) and the
-shell scheduler (which calls a tiny `python -c` to dump server
-specs in shell-eval format).
-
-The functional layer (`s1_phase1_vlm`, `s4_flux_2d`, …) never imports
-this module — they only see ``ObjectContext`` and explicit url lists.
+Imported by :mod:`run` and ``run_pipeline_v2_shard.sh`` (``dump_shell_env``).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import services_cfg as sc
+
 
 @dataclass
 class Phase:
+    """One pipeline stage row from ``pipeline.stages`` (historical class name)."""
+
     name: str
     desc: str = ""
     servers: str = "none"          # "vlm" | "flux" | "none"
     steps: list[str] = field(default_factory=list)
-    use_gpus: bool = False         # multi-GPU dispatch via subprocess
+    use_gpus: bool = False
     optional: bool = False
 
-
-# ─────────────────── readers ──────────────────────────────────────────
 
 def _pipeline(cfg: dict) -> dict:
     p = cfg.get("pipeline") or {}
@@ -68,12 +62,6 @@ def flux_port(cfg: dict, idx: int) -> int:
 
 
 def n_vlm_servers(cfg: dict) -> int:
-    """Number of VLM server instances to start.
-
-    Defaults to n_gpus(cfg) but can be capped via
-    ``pipeline.n_vlm_servers`` when thread/memory limits prevent
-    running one VLM per GPU.
-    """
     p = _pipeline(cfg)
     explicit = p.get("n_vlm_servers")
     if explicit is not None:
@@ -82,38 +70,40 @@ def n_vlm_servers(cfg: dict) -> int:
 
 
 def vlm_urls_for(cfg: dict) -> list[str]:
-    """One VLM /v1 URL per server instance.
+    """One VLM ``/v1`` URL per server instance.
 
-    Override via ``phase0.vlm_base_urls`` for remote or pre-started servers.
+    Override via ``services.vlm.base_urls`` (or legacy ``vlm_base_urls`` inside that block).
     """
-    override = (cfg.get("phase0") or {}).get("vlm_base_urls")
-    if override:
-        return list(override)
+    s = cfg.get("services")
+    if isinstance(s, dict):
+        v = s.get("vlm")
+        if isinstance(v, dict):
+            override = v.get("base_urls") or v.get("vlm_base_urls")
+            if override:
+                return list(override)
     return [f"http://localhost:{vlm_port(cfg, i)}/v1"
             for i in range(n_vlm_servers(cfg))]
 
 
 def flux_urls_for(cfg: dict) -> list[str]:
-    override = (cfg.get("phase2_5") or {}).get("image_edit_base_urls")
-    if override:
-        return list(override)
+    """Override via ``services.image_edit.base_urls``."""
+    s = cfg.get("services")
+    if isinstance(s, dict):
+        ie = s.get("image_edit")
+        if isinstance(ie, dict):
+            override = ie.get("base_urls") or ie.get("image_edit_base_urls")
+            if override:
+                return list(override)
     return [f"http://localhost:{flux_port(cfg, i)}"
             for i in range(n_gpus(cfg))]
 
 
-# ─────────────────── phase plan ───────────────────────────────────────
-
-def phases_for(cfg: dict) -> list[Phase]:
-    from partcraft.utils.pipeline_yaml_aliases import apply_yaml_aliases
-    apply_yaml_aliases(cfg)
-    p = _pipeline(cfg)
-    raw_list = p.get("stages") or p.get("phases") or []
-    if not raw_list:
-        raise ValueError("[CONFIG] pipeline.stages (or legacy pipeline.phases) is empty")
+def stages_for(cfg: dict) -> list[Phase]:
+    raw_list = sc.pipeline_stages_raw(cfg)
     out: list[Phase] = []
     for entry in raw_list:
         if not isinstance(entry, dict):
-            raise ValueError(f"[CONFIG] phase entry not a dict: {entry}")
+            raise ValueError(f"[CONFIG] pipeline.stages entry not a dict: {entry}")
         out.append(Phase(
             name=str(entry["name"]),
             desc=str(entry.get("desc", "")),
@@ -125,61 +115,38 @@ def phases_for(cfg: dict) -> list[Phase]:
     return out
 
 
-def select_phases(
+def select_stages(
     cfg: dict,
     *,
     names: list[str] | None = None,
     with_optional: bool = False,
 ) -> list[Phase]:
-    """Pick which phases to run.
-
-    * If ``names`` is given, return exactly those phases in the order
-      they appear in the config (optional flag is ignored — explicit
-      selection always wins).
-    * Otherwise return every non-optional phase, plus optional ones if
-      ``with_optional=True``.
-    """
-    phases = phases_for(cfg)
+    stages = stages_for(cfg)
     if names:
         wanted = set(names)
-        return [p for p in phases if p.name in wanted]
-    return [p for p in phases if with_optional or not p.optional]
+        return [p for p in stages if p.name in wanted]
+    return [p for p in stages if with_optional or not p.optional]
 
 
 def get_stage(cfg: dict, name: str) -> Phase:
-    for st in phases_for(cfg):
+    for st in stages_for(cfg):
         if st.name == name:
             return st
     raise KeyError(f"stage {name!r} not in config")
 
 
-def get_phase(cfg: dict, name: str) -> Phase:
-    """Backward-compatible alias for :func:`get_stage`."""
-    return get_stage(cfg, name)
+def dump_shell_env(
+    cfg: dict,
+    stage_name: str | None = None,
+    *,
+    phase_name: str | None = None,
+) -> str:
+    """Emit shell variables that bash can ``eval``.
 
+    ``phase_name`` is accepted as a deprecated alias for ``stage_name``.
 
-def stages_for(cfg: dict) -> list[Phase]:
-    """Alias for :func:`phases_for` (reads ``pipeline.stages`` or ``pipeline.phases``)."""
-    return phases_for(cfg)
-
-
-# ─────────────────── shell-eval dump ──────────────────────────────────
-
-def dump_shell_env(cfg: dict, phase_name: str | None = None) -> str:
-    """Emit shell variables that the bash scheduler can ``eval``.
-
-    Always exposes:
-        GPUS=4 5 6 7
-        VLM_PORTS=8002 8012 8022 8032
-        FLUX_PORTS=8004 8005 8006 8007
-        PHASES=A B C D D2 E F                      (default selection)
-
-    If ``phase_name`` is set, also dumps:
-        PHASE_NAME=...
-        PHASE_SERVERS=vlm|flux|none
-        PHASE_STEPS=s1 s2 ...
-        PHASE_USE_GPUS=0|1
-        PHASE_OPTIONAL=0|1
+    Exposes ``DEFAULT_STAGES`` / ``ALL_STAGES``. When ``stage_name`` is set, also
+    ``STAGE_NAME``, ``STAGE_DESC``, ``STAGE_STEPS``, ``STAGE_SERVERS``.
     """
     gpus = gpus_for(cfg)
     lines = [
@@ -187,22 +154,39 @@ def dump_shell_env(cfg: dict, phase_name: str | None = None) -> str:
         f"N_VLM_SERVERS={n_vlm_servers(cfg)}",
         f"VLM_PORTS=({' '.join(str(vlm_port(cfg, i)) for i in range(n_vlm_servers(cfg)))})",
         f"FLUX_PORTS=({' '.join(str(flux_port(cfg, i)) for i in range(len(gpus)))})",
-        f"DEFAULT_PHASES=({' '.join(p.name for p in select_phases(cfg))})",
-        f"ALL_PHASES=({' '.join(p.name for p in phases_for(cfg))})",
-        f"DEFAULT_STAGES=({' '.join(p.name for p in select_phases(cfg))})",
-        f"ALL_STAGES=({' '.join(p.name for p in phases_for(cfg))})",
+        f"DEFAULT_STAGES=({' '.join(p.name for p in select_stages(cfg))})",
+        f"ALL_STAGES=({' '.join(p.name for p in stages_for(cfg))})",
     ]
-    if phase_name:
-        ph = get_phase(cfg, phase_name)
+    name = stage_name or phase_name
+    if name:
+        ph = get_stage(cfg, name)
         lines += [
-            f"PHASE_NAME={ph.name}",
-            f"PHASE_DESC={ph.desc!r}",
-            f"PHASE_SERVERS={ph.servers}",
-            f"PHASE_STEPS=({' '.join(ph.steps)})",
-            f"PHASE_USE_GPUS={1 if ph.use_gpus else 0}",
-            f"PHASE_OPTIONAL={1 if ph.optional else 0}",
+            f"STAGE_NAME={ph.name}",
+            f"STAGE_DESC={ph.desc!r}",
+            f"STAGE_SERVERS={ph.servers}",
+            f"STAGE_STEPS=({' '.join(ph.steps)})",
+            f"STAGE_USE_GPUS={1 if ph.use_gpus else 0}",
+            f"STAGE_OPTIONAL={1 if ph.optional else 0}",
         ]
     return "\n".join(lines)
+
+
+# Back-compat aliases (older imports; prefer stages_for / select_stages / get_stage).
+def phases_for(cfg: dict) -> list[Phase]:
+    return stages_for(cfg)
+
+
+def select_phases(
+    cfg: dict,
+    *,
+    names: list[str] | None = None,
+    with_optional: bool = False,
+) -> list[Phase]:
+    return select_stages(cfg, names=names, with_optional=with_optional)
+
+
+def get_phase(cfg: dict, name: str) -> Phase:
+    return get_stage(cfg, name)
 
 
 __all__ = [
@@ -210,6 +194,7 @@ __all__ = [
     "gpus_for", "n_gpus",
     "vlm_port", "flux_port",
     "vlm_urls_for", "flux_urls_for",
-    "phases_for", "stages_for", "select_phases", "get_phase", "get_stage",
+    "stages_for", "select_stages", "get_stage",
+    "phases_for", "select_phases", "get_phase",
     "dump_shell_env",
 ]

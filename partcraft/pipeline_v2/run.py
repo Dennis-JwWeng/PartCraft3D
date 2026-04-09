@@ -8,7 +8,7 @@ Single entrypoint that selects which steps to run on which objects::
         --steps s1,s2,s4,s5,s6,s5b,s6b,s7 \\
         --obj-ids ABCDE...                # or --all (use existing object dirs)
 
-Stages (``pipeline.stages`` / legacy ``phases``) map to steps via ``--stage``.
+Stages (``pipeline.stages``) map to steps via ``--stage``.
 
 Per-step shape::
 
@@ -46,6 +46,7 @@ from .paths import (DatasetRoots, PipelineRoot, ObjectContext, normalize_shard,
 from .status import rebuild_manifest, manifest_summary, step_done
 from .validators import apply_check
 from . import scheduler as sched
+from . import services_cfg as psvc
 
 LOG = logging.getLogger("pipeline_v2")
 
@@ -58,9 +59,6 @@ GPU_STEPS = frozenset({"s5", "s6", "s6b"})
 def load_config(path: Path) -> dict:
     cfg = yaml.safe_load(path.read_text())
     cfg.setdefault("data", {})
-    from partcraft.utils.pipeline_yaml_aliases import apply_yaml_aliases
-    apply_yaml_aliases(cfg)
-    cfg.setdefault("phase2_5", {})
     return cfg
 
 
@@ -162,7 +160,7 @@ def run_step(
         urls = ([u.strip() for u in args.vlm_url.split(",") if u.strip()]
                 if getattr(args, "vlm_url", None)
                 else sched.vlm_urls_for(cfg))
-        model = (cfg.get("phase0") or {}).get("vlm_model", "Qwen3.5-27B")
+        model = psvc.vlm_model_name(cfg)
         blender = resolve_blender_executable(cfg)
         n_pre = int((cfg.get("pipeline") or {}).get("prerender_workers", 8))
         asyncio.run(run_many_streaming(
@@ -182,9 +180,9 @@ def run_step(
                 if getattr(args, "flux_url", None)
                 else sched.flux_urls_for(cfg))
         if not urls:
-            raise SystemExit("[CONFIG] no FLUX urls (set pipeline.gpus or phase2_5.image_edit_base_urls / services.image_edit.base_urls)")
+            raise SystemExit("[CONFIG] no FLUX urls (set pipeline.gpus or services.image_edit.base_urls)")
         s4_run(ctxs, edit_urls=urls,
-               workers_per_server=cfg.get("phase2_5", {}).get("workers_per_server", 2),
+               workers_per_server=psvc.image_edit_service(cfg).get("workers_per_server", 2),
                images_root=images_root, mesh_root=mesh_root, shard=shard,
                force=args.force, logger=log)
 
@@ -204,7 +202,7 @@ def run_step(
 
     elif step == "s6":
         from .s6_render_3d import run as s6_run
-        ckpt = (cfg.get("phase2_5") or {}).get(
+        ckpt = psvc.image_edit_service(cfg).get(
             "trellis_text_ckpt", "checkpoints/TRELLIS-text-xlarge")
         s6_run(ctxs, ckpt=ckpt, force=args.force, logger=log)
 
@@ -212,7 +210,7 @@ def run_step(
         from .s5b_deletion import run_reencode
         blender = resolve_blender_executable(cfg)
         run_reencode(ctxs, cfg=cfg, blender_path=blender,
-                     num_views=cfg.get("phase5", {}).get("num_views", 40),
+                     num_views=psvc.step_params_for(cfg, "s5").get("num_views", 40),
                      force=args.force, logger=log)
 
     elif step == "s7":
@@ -244,7 +242,7 @@ def dispatch_gpus(
         env["CUDA_VISIBLE_DEVICES"] = gpu
         env.setdefault("ATTN_BACKEND", "flash_attn")
         # Children always receive --steps (single step) regardless of
-        # whether the parent was launched with --phase, so no special-case.
+        # whether the parent was launched with --stage, so no special-case.
         cmd = [
             sys.executable, "-m", "partcraft.pipeline_v2.run",
             "--config", str(cfg_path),
@@ -301,12 +299,10 @@ def main():
     grp.add_argument("--all", action="store_true")
     ap.add_argument("--steps", default=None,
                     help=f"comma list, any of: {','.join(ALL_STEPS)} "
-                         "(mutually exclusive with --stage/--phase)")
+                         "(mutually exclusive with --stage)")
     ap.add_argument("--stage", default=None,
                     help="run a single pipeline stage by name (e.g. A,C,D) "
                          "using pipeline.stages from the config")
-    ap.add_argument("--phase", default=None,
-                    help="deprecated: use --stage (same behavior)")
     ap.add_argument("--gpus", default=None,
                     help="comma list e.g. 4,5,6,7. If omitted, falls back "
                          "to pipeline.gpus from the config when needed.")
@@ -347,12 +343,8 @@ def main():
         print(json.dumps(manifest_summary(root), indent=2))
         return
 
-    # Resolve steps + use_gpus from --stage/--phase or --steps
-    if args.stage is not None and args.phase is not None:
-        raise SystemExit("[CLI] use only one of --stage or --phase")
-    run_stage = args.stage if args.stage is not None else args.phase
-    if args.phase is not None and args.stage is None:
-        LOG.warning("--phase is deprecated; use --stage")
+    # Resolve steps + use_gpus from --stage or --steps
+    run_stage = args.stage
 
     phase_use_gpus = False
     if run_stage:
@@ -379,7 +371,7 @@ def main():
 
     exit_rc = 0
     for step in steps:
-        # GPU dispatch only when this step is GPU-bound AND the phase
+        # GPU dispatch only when this step is GPU-bound AND the stage
         # asked for it (or the user passed --gpus explicitly).
         wants_dispatch = (step in GPU_STEPS
                           and args.gpus

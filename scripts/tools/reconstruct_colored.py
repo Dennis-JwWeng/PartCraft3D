@@ -50,7 +50,7 @@ def main():
     if cfg.get("ckpt_root"):
         os.environ.setdefault("PARTCRAFT_CKPT_ROOT", cfg["ckpt_root"])
     logger = setup_logging(cfg, "reconstruct")
-    p25_cfg = cfg.get("phase2_5", {})
+    p25_cfg = (cfg.get("services") or {}).get("image_edit") or {}
 
     from partcraft.trellis.refiner import TrellisRefiner
 

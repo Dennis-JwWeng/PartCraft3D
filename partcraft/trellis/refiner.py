@@ -1033,7 +1033,7 @@ class TrellisRefiner:
         """Return the base URL of the image edit HTTP server."""
         if not self.image_edit_base_url:
             raise ValueError(
-                "[CONFIG_ERROR] phase2_5.image_edit_base_url / services.image_edit.base_urls <missing> config "
+                "[CONFIG_ERROR] services.image_edit.base_urls (or base_urls) <missing> config "
                 "local_diffusers backend requires explicit URL"
             )
         return self.image_edit_base_url

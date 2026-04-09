@@ -191,7 +191,7 @@ def main():
         p2 = Path(cfg["phase2"]["cache_dir"]) / "assembled_pairs.jsonl"
         if p2.exists():
             manifest_paths.append(str(p2))
-        p25 = Path(cfg["data"]["output_dir"]) / cfg.get("phase2_5", {}).get("cache_dir", "cache/phase2_5") / "modification_pairs.jsonl"
+        p25 = Path(cfg["data"]["output_dir"]) / (cfg.get("services") or {}).get("image_edit", {}).get("cache_dir", "cache/phase2_5") / "modification_pairs.jsonl"
         if p25.exists():
             manifest_paths.append(str(p25))
         if not manifest_paths:

@@ -3,14 +3,14 @@
 ## 主入口约定
 
 - **Pipeline v2 主入口（推荐，object-centric）**：
-  - Python 编排：`python -m partcraft.pipeline_v2.run --config <yaml> --shard <NN> --all --stage <A|C|D|D2|E|F>`（`--phase` 仍为兼容别名）
-  - Shell 调度（自动起停 VLM/FLUX 服务、按 phase 顺序执行）：`bash scripts/tools/run_pipeline_v2_shard.sh <tag> <config_yaml>`
-    - `STAGES=A,C,D,D2,E,F` 可定制子集（`PHASES` 仍兼容但已弃用）；省略则跑 config 的 `pipeline.stages`（或 legacy `pipeline.phases`）默认列表
+  - Python 编排：`python -m partcraft.pipeline_v2.run --config <yaml> --shard <NN> --all --stage <A|C|D|D2|E|F>`
+  - Shell 调度（自动起停 VLM/FLUX 服务、按 stage 顺序执行）：`bash scripts/tools/run_pipeline_v2_shard.sh <tag> <config_yaml>`
+    - `STAGES=A,C,D,D2,E,F` 可定制子集；省略则跑 config 的 `pipeline.stages` 默认列表
     - 服务/GPU/端口完全由 config 的 `pipeline:` 段（`gpus`、`vlm_port_base/stride`、`flux_port_base/stride`）派生，N-GPU agnostic
   - 模块布局：`partcraft/pipeline_v2/{run,scheduler,specs,paths,status,validators,s1_phase1_vlm,s2_highlights,s4_flux_2d,s5_trellis_3d,s5b_deletion,s6_render_3d,s7_addition_backfill}.py`
   - Resume：每 step 跑完调用 `validators.apply_check`,根据磁盘产物把 `status.json` 翻成 OK/FAIL/SKIP；下一轮 step 在 per-edit 粒度上只补缺失文件
 - 约束：所有编排能力只能进入 pipeline_v2 入口及其模块，不再新增任何并行编排入口。
-- **配置命名**：`configs/pipeline_v2_*.yaml` 已采用 `services.*`、`pipeline.stages`、`step_params`；加载时仍由 `apply_yaml_aliases` 合并到 `phase0` / `phase2_5` / `phase5` / `pipeline.phases` 供尚未改动的代码路径读取。
+- **配置命名**：`configs/pipeline_v2_*.yaml` 与流式/PartVerse 模板使用顶层 `services.vlm` / `services.image_edit`、`pipeline.stages`、`step_params`；代码只从上述键读取（不再写入 legacy `phase0` / `phase2_5`）。
 
 
 
@@ -142,7 +142,7 @@ flowchart TD
 ### tmux 会话（长期跑 / 多面板）
 
 - **适用**：SSH 易断线、phase 耗时长、需要同时看日志与交互式 tail；**在仓库根**执行（`run_pipeline_v2_shard.sh` 会 `cd` 到项目根）。
-- **单会话跑完整 shard**：`tmux new -s pc3d` → 在会话内 `export` 需要的 `STAGES`（或 legacy `PHASES`）/ `MACHINE_ENV`（可选）→ 执行 `bash scripts/tools/run_pipeline_v2_shard.sh <tag> <config_yaml>`；断线后 `tmux attach -t pc3d` 回到同一进程。
+- **单会话跑完整 shard**：`tmux new -s pc3d` → 在会话内 `export` 需要的 `STAGES`/ `MACHINE_ENV`（可选）→ 执行 `bash scripts/tools/run_pipeline_v2_shard.sh <tag> <config_yaml>`；断线后 `tmux attach -t pc3d` 回到同一进程。
 - **常用快捷键**：`Ctrl-b d` detach；`Ctrl-b c` 新窗口；`Ctrl-b "` / `%` 分屏；`Ctrl-b [` 进入滚动/复制模式。
 - **多面板拆分（示例）**：窗口 0 跑管线编排；若需**手动**起 VLM / FLUX（与脚本自动起停并存时以脚本为准），另开窗口按机器上的 `scripts/tools/launch_local_vlm.sh`、`scripts/tools/image_edit_server.py` 等启动，端口须与 config 中 `pipeline.vlm_port_base` / `flux_port_base` 及 `pipeline.gpus` 派生结果一致。
 - **环境变量**：tmux 面板继承启动该面板的 shell 环境；跨机器请优先把路径写进 `configs/machine/$(hostname).env`，或用 `MACHINE_ENV=configs/machine/xxx.env` 单次注入，避免只在某一面板 `export` 导致另一面板缺变量。
@@ -193,7 +193,7 @@ bash scripts/tools/setup_pipeline_env.sh --check
 
 | 变量 | 说明 | 示例 |
 |------|------|------|
-| `STAGES`（`PHASES` 弃用） | 执行阶段（对应 config `pipeline.stages[].name` 或 legacy `phases`） | `A,C,D,D2,E,F` 或省略（跑全部） |
+| `STAGES` | 执行阶段（对应 config `pipeline.stages[].name`） | `A,C,D,D2,E,F` 或省略（跑全部） |
 | `LIMIT` | 限制对象数（调试用）；`pipeline_v2.run` 在解析对象列表并经过 `--gpu-shard` 后取前 N 个 | `3` |
 
 ### GPU 资源生命周期
@@ -439,7 +439,7 @@ GPUS=0,3,4,5,6,7 SHARD=01 ONLY_TYPES=deletion \
 ### 其他入口（仍可用）
 
 - **计算型清洗**：`scripts/tools/run_cleaning.py --input-dir partverse_pairs [--shards ...] [--workers N]`
-- **管线集成**：`python -m partcraft.pipeline_v2.run --config <yaml> --shard <NN> --stage F`（`--phase` 兼容；旧 run_pipeline.py 已删除）
+- **管线集成**：`python -m partcraft.pipeline_v2.run --config <yaml> --shard <NN> --stage F`（旧 run_pipeline.py 已删除）
 
 ### 输出
 

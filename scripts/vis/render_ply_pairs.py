@@ -338,7 +338,7 @@ def main():
     if args.config:
         from partcraft.utils.config import load_config
         cfg = load_config(args.config)
-        raw_cache = cfg.get("phase2_5", {}).get("cache_dir", "cache/phase2_5")
+        raw_cache = (cfg.get("services") or {}).get("image_edit", {}).get("cache_dir", "cache/phase2_5")
         cache_dir = Path(raw_cache) if Path(raw_cache).is_absolute() else Path(cfg["data"]["output_dir"]) / raw_cache
         edit_prompts = load_edit_prompts_from_results(cache_dir, args.tag or "")
 

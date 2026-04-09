@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
-# pipeline_v2 phased scheduler — config-driven, GPU-count-agnostic.
+# pipeline_v2 stage scheduler — config-driven, GPU-count-agnostic.
 #
-# All scheduling decisions (which GPUs, which ports, which phases,
-# which step needs which servers) come from the YAML config's
-# `pipeline:` section. The shell only knows how to:
-#   1. ask python "what does this config look like?"
-#   2. start/stop server pools
-#   3. invoke `python -m partcraft.pipeline_v2.run --phase <name>`
+# Scheduling (GPUs, ports, which servers each stage needs) comes from the
+# YAML `pipeline:` + `services` sections. The shell:
+#   1. asks Python for the resolved plan
+#   2. starts/stops server pools
+#   3. invokes `python -m partcraft.pipeline_v2.run --stage <name>`
 #
 # Usage:
 #   bash scripts/tools/run_pipeline_v2_shard.sh shard01 \
 #        configs/pipeline_v2_shard01.yaml
 #
-#   PHASES="A,C,D,D2,E,F"  bash ... shard01 cfg     # custom subset
-#   PHASES=A               bash ... shard01 cfg     # single phase
-#   WITH_OPTIONAL=1        bash ... shard01 cfg     # include optional phases
+#   STAGES="A,C,D,D2,E,F"  bash ... shard01 cfg     # custom subset
+#   STAGES=A               bash ... shard01 cfg     # single stage
+#   WITH_OPTIONAL=1        bash ... shard01 cfg     # include optional stages
 #
-# Each phase logs to logs/v2_<tag>/<phase>.log; the script aborts on
-# the first non-zero exit and tears down any running server.
+# Each stage logs to logs/v2_<tag>/<stage>.log; aborts on first failure.
 
 set -euo pipefail
 
@@ -56,7 +54,7 @@ LOG_DIR="logs/v2_${TAG}"
 mkdir -p "$LOG_DIR"
 
 # ─── ask python for the run plan ─────────────────────────────────────
-# Sets: GPUS=(...) VLM_PORTS=(...) FLUX_PORTS=(...) DEFAULT_STAGES/DEFAULT_PHASES=(...)
+# Sets: GPUS=(...) VLM_PORTS=(...) FLUX_PORTS=(...) DEFAULT_STAGES/ALL_STAGES=(...)
 plan=$(
     "$PY_PIPE" -c "
 import sys, yaml
@@ -66,26 +64,16 @@ print(dump_shell_env(cfg))
 "
 )
 eval "$plan"
-# Backward compat if an older scheduler omitted *_STAGES arrays
-if [ ${#ALL_STAGES[@]} -eq 0 ] && [ ${#ALL_PHASES[@]} -gt 0 ]; then
-    ALL_STAGES=("${ALL_PHASES[@]}")
-fi
-if [ ${#DEFAULT_STAGES[@]} -eq 0 ] && [ ${#DEFAULT_PHASES[@]} -gt 0 ]; then
-    DEFAULT_STAGES=("${DEFAULT_PHASES[@]}")
-fi
 N_GPUS=${#GPUS[@]}
 N_VLM_SERVERS="${N_VLM_SERVERS:-$N_GPUS}"
 
-# Stage selection: STAGES (preferred) > PHASES (deprecated) > default
+# Stage selection: env STAGES override > default list from config
 if [ -n "${STAGES:-}" ]; then
-    IFS=',' read -r -a SELECTED_PHASES <<< "$STAGES"
-elif [ -n "${PHASES:-}" ]; then
-    echo "[WARN] PHASES is deprecated; use STAGES" >&2
-    IFS=',' read -r -a SELECTED_PHASES <<< "$PHASES"
+    IFS=',' read -r -a SELECTED_STAGES <<< "$STAGES"
 elif [ "$WITH_OPTIONAL" = "1" ]; then
-    SELECTED_PHASES=("${ALL_STAGES[@]}")
+    SELECTED_STAGES=("${ALL_STAGES[@]}")
 else
-    SELECTED_PHASES=("${DEFAULT_STAGES[@]}")
+    SELECTED_STAGES=("${DEFAULT_STAGES[@]}")
 fi
 
 echo "============================================================"
@@ -96,7 +84,7 @@ echo "  config      : $CFG"
 echo "  gpus        : ${GPUS[*]}  (N=$N_GPUS)"
 echo "  vlm_ports   : ${VLM_PORTS[*]}"
 echo "  flux_ports  : ${FLUX_PORTS[*]}"
-echo "  stages      : ${SELECTED_PHASES[*]}"
+echo "  stages      : ${SELECTED_STAGES[*]}"
 echo "  log dir     : $LOG_DIR"
 echo "============================================================"
 
@@ -197,28 +185,27 @@ trap cleanup_all EXIT
 
 # ─── per-phase invocation ────────────────────────────────────────────
 
-run_pipeline_phase() {
-    local phase="$1"
-    local log="$LOG_DIR/phase${phase}.log"
+run_pipeline_stage() {
+    local stage="$1"
+    local log="$LOG_DIR/stage_${stage}.log"
 
-    # Ask python what this phase needs
     eval "$(
         "$PY_PIPE" -c "
 import yaml
 from partcraft.pipeline_v2.scheduler import dump_shell_env
 cfg = yaml.safe_load(open('$CFG'))
-print(dump_shell_env(cfg, phase_name='$phase'))
+print(dump_shell_env(cfg, stage_name='$stage'))
 "
     )"
 
     echo
-    echo "▶ Phase ${PHASE_NAME} — ${PHASE_DESC}  (steps=${PHASE_STEPS[*]} servers=${PHASE_SERVERS} use_gpus=${PHASE_USE_GPUS})"
+    echo "▶ Stage ${STAGE_NAME} — ${STAGE_DESC}  (steps=${STAGE_STEPS[*]} servers=${STAGE_SERVERS} use_gpus=${STAGE_USE_GPUS})"
 
-    case "$PHASE_SERVERS" in
+    case "$STAGE_SERVERS" in
         vlm)  start_vlm ;;
         flux) start_flux ;;
         none) ;;
-        *) echo "[scheduler] unknown servers=$PHASE_SERVERS"; return 1 ;;
+        *) echo "[scheduler] unknown servers=$STAGE_SERVERS"; return 1 ;;
     esac
 
     ATTN_BACKEND=flash_attn \
@@ -226,25 +213,25 @@ print(dump_shell_env(cfg, phase_name='$phase'))
         --config "$CFG" \
         --shard "${TAG#shard}" \
         --all \
-        --phase "$phase" \
+        --stage "$stage" \
         2>&1 | tee "$log"
     local rc=${PIPESTATUS[0]}
 
-    case "$PHASE_SERVERS" in
+    case "$STAGE_SERVERS" in
         vlm)  stop_vlm ;;
         flux) stop_flux ;;
     esac
 
     if [ "$rc" != 0 ]; then
-        echo "[scheduler] phase $phase exit=$rc — aborting"
+        echo "[scheduler] stage $stage exit=$rc — aborting"
         exit "$rc"
     fi
 }
 
 # ═══ MAIN LOOP ═══════════════════════════════════════════════════════
-for phase in "${SELECTED_PHASES[@]}"; do
-    run_pipeline_phase "$phase"
+for stage in "${SELECTED_STAGES[@]}"; do
+    run_pipeline_stage "$stage"
 done
 
 echo
-echo "=== ALL PHASES DONE ==="
+echo "=== ALL STAGES DONE ==="

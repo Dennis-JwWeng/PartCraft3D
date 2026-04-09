@@ -16,7 +16,7 @@
 #   bash scripts/tools/run_pipeline_v2_parallel.sh shard01 configs/pipeline_v2.yaml
 #
 #   # Run subset of phases on all workers:
-#   PHASES="A,C,D"  bash ... shard01 cfg
+#   STAGES="A,C,D"  bash ... shard01 cfg
 #
 #   # Override number of workers (uses first N GPUs from config):
 #   N_WORKERS=2     bash ... shard01 cfg
@@ -77,11 +77,11 @@ print(dump_shell_env(cfg))
 N="${N_WORKERS:-${#GPUS[@]}}"    # may be fewer than total GPUs for testing
 SHARD="${TAG#shard}"             # "shard01" → "01"; "01" → "01"
 
-# Phase selection
-if [ -n "${PHASES:-}" ]; then
-    IFS=',' read -r -a SELECTED_PHASES <<< "$PHASES"
+# Stage selection
+if [ -n "${STAGES:-}" ]; then
+    IFS=',' read -r -a SELECTED_STAGES <<< "$STAGES"
 else
-    SELECTED_PHASES=("${DEFAULT_PHASES[@]}")
+    SELECTED_STAGES=("${DEFAULT_STAGES[@]}")
 fi
 
 LOG_DIR="logs/v2_${TAG}"
@@ -93,20 +93,20 @@ echo "============================================================"
 echo "  tag      : $TAG   shard=$SHARD"
 echo "  config   : $CFG"
 echo "  workers  : $N  (GPUs: ${GPUS[*]:0:$N})"
-echo "  phases   : ${SELECTED_PHASES[*]}"
+echo "  stages   : ${SELECTED_STAGES[*]}"
 echo "  log dir  : $LOG_DIR"
 echo "============================================================"
 
 # ─── helper: query phase metadata ───────────────────────────────────
-# Sets PHASE_SERVERS, PHASE_STEPS, PHASE_USE_GPUS for a given phase name.
-phase_meta() {
-    local phase="$1"
+# Sets STAGE_SERVERS, STAGE_STEPS, STAGE_USE_GPUS for a given phase name.
+stage_meta() {
+    local stage="$1"
     eval "$(
         "$PY_PIPE" -c "
 import yaml
 from partcraft.pipeline_v2.scheduler import dump_shell_env
 cfg = yaml.safe_load(open('$CFG'))
-print(dump_shell_env(cfg, phase_name='$phase'))
+print(dump_shell_env(cfg, stage_name='$stage'))
 "
     )"
 }
@@ -206,14 +206,14 @@ run_worker() {
     ' EXIT
 
     local rc=0
-    for phase in "${SELECTED_PHASES[@]}"; do
+    for stage in "${SELECTED_STAGES[@]}"; do
 
-        phase_meta "$phase"   # sets PHASE_SERVERS, PHASE_DESC
+        stage_meta "$stage"   # sets STAGE_SERVERS, STAGE_DESC
 
-        echo "[worker $i] ▶ phase $phase — $PHASE_DESC"
+        echo "[worker $i] ▶ stage $stage — $STAGE_DESC"
 
         # ── start service if this phase needs one ───────────────────
-        case "$PHASE_SERVERS" in
+        case "$STAGE_SERVERS" in
             vlm)  w_start_vlm  "$gpu" "$vlm_port"  "$wlog" || { rc=1; break; } ;;
             flux) w_start_flux "$gpu" "$flux_port" "$wlog" || { rc=1; break; } ;;
         esac
@@ -225,25 +225,25 @@ run_worker() {
                 --config "$CFG" \
                 --shard  "$SHARD" \
                 --all \
-                --phase  "$phase" \
+                --stage  "$stage" \
                 --single-gpu \
                 --gpu-shard "${i}/${N}" \
                 --vlm-url  "http://localhost:${vlm_port}/v1" \
                 --flux-url "http://localhost:${flux_port}" \
-                2>&1 | tee "$wlog/phase_${phase}.log"
+                2>&1 | tee "$wlog/stage_${stage}.log"
         rc=${PIPESTATUS[0]}
 
         # ── stop service ────────────────────────────────────────────
-        case "$PHASE_SERVERS" in
+        case "$STAGE_SERVERS" in
             vlm)  w_stop_vlm  "$vlm_port"  "$wlog" ;;
             flux) w_stop_flux "$flux_port" "$wlog" ;;
         esac
 
         if [ "$rc" -ne 0 ]; then
-            echo "[worker $i] phase $phase FAILED (rc=$rc) — aborting worker"
+            echo "[worker $i] stage $stage FAILED (rc=$rc) — aborting worker"
             break
         fi
-        echo "[worker $i] ✓ phase $phase done"
+        echo "[worker $i] ✓ stage $stage done"
     done
 
     echo "[worker $i] exit rc=$rc"

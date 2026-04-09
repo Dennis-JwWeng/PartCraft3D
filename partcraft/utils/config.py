@@ -382,11 +382,11 @@ def _apply_ckpt_root(cfg: dict) -> None:
 
     Writes absolute string to ``cfg["ckpt_root"]``.
 
-    When ``phase0.vlm_backend`` is ``local``, relative ``local_model_path`` and
+    When ``services.vlm.vlm_backend`` / ``services.vlm.backend`` is ``local``, relative ``local_model_path`` and
     ``vlm_model`` values (no ``/`` in the string) are joined to ``ckpt_root``
     so API-style model ids like ``gemini-…`` are unchanged.
 
-    ``phase2_5.trellis_text_ckpt`` / ``trellis_image_ckpt``: relative paths and
+    ``services.image_edit.trellis_text_ckpt`` / ``trellis_image_ckpt``: relative paths and
     ``checkpoints/...`` prefixes are resolved under ``ckpt_root``; absolute paths kept.
     """
     env = os.environ.get("PARTCRAFT_CKPT_ROOT", "").strip()
@@ -404,24 +404,29 @@ def _apply_ckpt_root(cfg: dict) -> None:
     if not root.is_dir():
         raise _config_error("ckpt_root", str(root), _get_source(cfg, "ckpt_root"), "directory does not exist")
 
-    p25 = cfg.setdefault("phase2_5", {})
-    for key in ("trellis_text_ckpt", "trellis_image_ckpt"):
-        v = p25.get(key)
-        if isinstance(v, str) and v.strip():
-            p25[key] = _resolve_trellis_ckpt_path(v.strip(), root)
+    srv = cfg.get("services")
+    if isinstance(srv, dict):
+        p25 = srv.get("image_edit")
+        if isinstance(p25, dict):
+            for key in ("trellis_text_ckpt", "trellis_image_ckpt"):
+                v = p25.get(key)
+                if isinstance(v, str) and v.strip():
+                    p25[key] = _resolve_trellis_ckpt_path(v.strip(), root)
 
-    if cfg.get("phase0", {}).get("vlm_backend") == "local":
-        p0 = cfg.setdefault("phase0", {})
-        for key in ("local_model_path", "vlm_model"):
-            v = p0.get(key)
-            if not isinstance(v, str) or not v.strip():
-                continue
-            v = v.strip()
-            if v.startswith("http://") or v.startswith("https://"):
-                continue
-            if os.path.isabs(v) or "/" in v:
-                continue
-            p0[key] = str((root / v).resolve())
+        p0 = srv.get("vlm")
+        if isinstance(p0, dict):
+            backend = p0.get("vlm_backend") or p0.get("backend")
+            if backend == "local":
+                for key in ("local_model_path", "vlm_model", "model"):
+                    v = p0.get(key)
+                    if not isinstance(v, str) or not v.strip():
+                        continue
+                    v = v.strip()
+                    if v.startswith("http://") or v.startswith("https://"):
+                        continue
+                    if os.path.isabs(v) or "/" in v:
+                        continue
+                    p0[key] = str((root / v).resolve())
 
 
 def load_config(
@@ -440,9 +445,6 @@ def load_config(
         cfg = yaml.safe_load(f)
     _seed_sources_from_yaml(cfg)
 
-    from partcraft.utils.pipeline_yaml_aliases import apply_yaml_aliases
-    apply_yaml_aliases(cfg)
-
     _apply_data_roots_and_layout(cfg)
     if not for_prerender:
         _sync_pipeline_v2_data_paths(cfg)
@@ -452,17 +454,32 @@ def load_config(
         _apply_tool_paths(cfg)
         _validate_prerender_config(cfg, mode=prerender_mode)
 
-    # Resolve environment variables for API keys
-    phase0 = cfg.get("phase0", {})
-    api_key_env = phase0.get("vlm_api_key_env", "")
-    if api_key_env:
-        env_val = os.environ.get(api_key_env, "")
-        if env_val:
-            phase0["vlm_api_key"] = env_val
+    # Resolve environment variables for API keys (services.vlm)
+    srv = cfg.get("services")
+    if isinstance(srv, dict):
+        vlm = srv.get("vlm")
+        if isinstance(vlm, dict):
+            api_key_env = vlm.get("vlm_api_key_env", "")
+            if api_key_env:
+                env_val = os.environ.get(api_key_env, "")
+                if env_val:
+                    vlm["vlm_api_key"] = env_val
 
     # Resolve cache_dir paths relative to output_dir
     output_dir = cfg["data"]["output_dir"]
-    for phase_key in ["phase0", "phase1", "phase2", "phase2_5", "phase3", "phase4"]:
+    if isinstance(srv, dict):
+        vlm = srv.get("vlm")
+        if isinstance(vlm, dict):
+            cache = vlm.get("cache_dir", "")
+            if cache and not os.path.isabs(cache):
+                vlm["cache_dir"] = os.path.join(output_dir, cache)
+        ie = srv.get("image_edit")
+        if isinstance(ie, dict):
+            cache = ie.get("cache_dir", "")
+            if cache and not os.path.isabs(cache):
+                ie["cache_dir"] = os.path.join(output_dir, cache)
+
+    for phase_key in ["phase1", "phase2", "phase3", "phase4"]:
         cache = cfg.get(phase_key, {}).get("cache_dir", "")
         if cache and not os.path.isabs(cache):
             cfg[phase_key]["cache_dir"] = os.path.join(output_dir, cache)

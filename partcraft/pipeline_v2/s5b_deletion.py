@@ -37,6 +37,7 @@ sys.path.insert(0, str(_ROOT / "scripts" / "tools"))
 from .paths import ObjectContext
 from .specs import EditSpec, iter_deletion_specs
 from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
+from . import services_cfg as psvc
 from .s5_trellis_3d import _ensure_refiner
 
 
@@ -139,7 +140,7 @@ def run_mesh_delete(
 
     refiner = None
     if use_refiner:
-        p25 = cfg.get("phase2_5") or {}
+        p25 = psvc.trellis_image_edit_flat(cfg)
         data_cfg = cfg.get("data") or {}
         refiner = _ensure_refiner(
             p25, cfg.get("ckpt_root"),

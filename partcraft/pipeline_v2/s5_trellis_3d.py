@@ -42,6 +42,8 @@ sys.path.insert(0, str(_ROOT))
 
 from partcraft.pipeline_v2.s5_3d_utils import resolve_2d_conditioning  # noqa: E402
 from .paths import ObjectContext
+from . import services_cfg as psvc
+
 from .specs import EditSpec, iter_flux_specs
 from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
 
@@ -240,7 +242,7 @@ def run(
     log = logger or logging.getLogger("pipeline_v2.s5")
     log.info("[s5] CUDA_VISIBLE_DEVICES=%s", os.environ.get("CUDA_VISIBLE_DEVICES"))
 
-    p25_cfg = cfg.get("phase2_5") or {}
+    p25_cfg = psvc.trellis_image_edit_flat(cfg)
     ckpt_root = cfg.get("ckpt_root")
     data_cfg = cfg.get("data") or {}
     slat_dir = data_cfg.get("slat_dir")

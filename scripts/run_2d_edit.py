@@ -410,8 +410,13 @@ def main():
 
     cfg = load_config(args.config)
     logger = setup_logging(cfg, "2d_edit")
-    p0 = cfg["phase0"]
-    p25 = cfg.get("phase2_5", {})
+    p0 = (cfg.get("services") or {}).get("vlm")
+    if not isinstance(p0, dict):
+        raise SystemExit("[CONFIG] services.vlm is required")
+    p25 = (cfg.get("services") or {}).get("image_edit") or {}
+    if not isinstance(p25, dict):
+        p25 = {}
+
 
     # --- Image edit backend ---
     image_edit_backend = p25.get("image_edit_backend", "api")
@@ -442,14 +447,14 @@ def main():
             if default_cfg_path.exists():
                 with open(default_cfg_path) as f:
                     default_cfg = yaml.safe_load(f)
-                api_key = default_cfg.get("phase0", {}).get("vlm_api_key", "")
+                api_key = (default_cfg.get("services") or {}).get("vlm", {}).get("vlm_api_key", "")
         if not api_key:
             env_var = p0.get("vlm_api_key_env", "")
             if env_var:
                 import os
                 api_key = os.environ.get(env_var, "")
         if not api_key:
-            print("ERROR: No API key. Set phase0.vlm_api_key in config or default.yaml")
+            print("ERROR: No API key. Set services.vlm.vlm_api_key in config or default.yaml")
             sys.exit(1)
 
         image_edit_url = p25.get("image_edit_base_url") or p0.get("vlm_base_url", "")
