@@ -33,7 +33,6 @@ from PIL import Image
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT / "scripts" / "standalone"))
-sys.path.insert(0, str(_ROOT / "scripts" / "tools"))
 
 from .paths import ObjectContext
 from .specs import VIEW_INDICES
@@ -54,7 +53,7 @@ def _lazy_helpers():
     from render_phase1v2_3d_results import (  # type: ignore
         frame_to_extrinsic_intrinsic, render_one_view, load_slat,
     )
-    from render_part_overview import load_views_from_npz  # type: ignore
+    from partcraft.render.overview import load_views_from_npz
     return frame_to_extrinsic_intrinsic, render_one_view, load_slat, load_views_from_npz
 
 

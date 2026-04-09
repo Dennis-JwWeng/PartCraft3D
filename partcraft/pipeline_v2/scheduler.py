@@ -81,8 +81,11 @@ def n_vlm_servers(cfg: dict) -> int:
     return n_gpus(cfg)
 
 
+def vlm_urls_for(cfg: dict) -> list[str]:
+    """One VLM /v1 URL per server instance.
 
-    """Override via ``phase0.vlm_base_urls`` if you want remote servers."""
+    Override via ``phase0.vlm_base_urls`` for remote or pre-started servers.
+    """
     override = (cfg.get("phase0") or {}).get("vlm_base_urls")
     if override:
         return list(override)

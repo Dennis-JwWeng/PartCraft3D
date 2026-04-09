@@ -21,7 +21,6 @@ NOT batch across objects here — keep object isolation.
 from __future__ import annotations
 
 import json
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,12 +28,8 @@ from typing import Iterable
 
 import cv2
 
-_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(_ROOT / "scripts" / "tools"))
-from render_part_highlight import render_highlight  # noqa: E402
-from render_part_overview import (  # noqa: E402
-    VIEW_INDICES, load_views_from_npz,
-)
+from partcraft.render.highlight import render_highlight
+from partcraft.render.overview import VIEW_INDICES, load_views_from_npz
 
 from .paths import ObjectContext
 from .status import update_step, STATUS_OK, STATUS_FAIL, STATUS_SKIP, step_done

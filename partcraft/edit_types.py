@@ -106,6 +106,18 @@ TYPE_ORDER = {
 }
 
 # ---------------------------------------------------------------------------
+# Pipeline routing (authoritative for pipeline_v2 step routing)
+# ---------------------------------------------------------------------------
+
+# Edit types that require a FLUX 2D edited image as conditioning input.
+# Single source of truth — imported by pipeline_v2.paths.
+FLUX_TYPES: frozenset[str] = frozenset({MODIFICATION, SCALE, MATERIAL, GLOBAL})
+
+# Canonical edit_type → edit_id prefix.
+# Same content as ID_PREFIX; aliased so pipeline_v2.paths has one import point.
+EDIT_TYPE_PREFIX: dict[str, str] = ID_PREFIX
+
+# ---------------------------------------------------------------------------
 # Programmatic edit templates
 # ---------------------------------------------------------------------------
 

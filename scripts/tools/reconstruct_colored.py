@@ -52,7 +52,7 @@ def main():
     logger = setup_logging(cfg, "reconstruct")
     p25_cfg = cfg.get("phase2_5", {})
 
-    from partcraft.phase2_assembly.trellis_refine import TrellisRefiner
+    from partcraft.trellis.refiner import TrellisRefiner
 
     # ---- Load dataset ----
     dataset = HY3DPartDataset(

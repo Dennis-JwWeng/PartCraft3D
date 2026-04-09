@@ -103,17 +103,23 @@ def _decompose_local(desc: str) -> tuple[str, str]:
     return s1, s2
 
 
-def build_prompts_from_spec(spec) -> dict:
+def build_prompts_from_spec(spec, override_type: str | None = None) -> dict:
     """Build the prompt dict expected by interweave_Trellis_TI.
 
-    Maps Phase 0/1 pre-computed descriptions to the format Vinedresser3D uses
-    after its 7 VLM/LLM calls (obtain_overall_prompts, decompose_prompt,
-    identify_ori_part, identify_new_part).
+    Maps Phase 1 VLM-pre-computed descriptions to the format Vinedresser3D
+    uses after its 7 VLM/LLM calls.
 
-    Key difference from the original: decomposes descriptions into
-    structure (s1) and appearance (s2) channels locally, matching VD's
-    decompose_prompt() which uses an LLM to strip shape-adjectives
-    for s2 and color/material-adjectives for s1.
+    S1/S2 decomposition strategy (in priority order):
+      1. Use VLM-generated ``spec.object_desc_s1/s2`` and ``spec.after_desc_s1/s2``
+         when available — these are the per-edit stage fields produced by the
+         Phase 1 VLM prompt (``after_desc_stage1/2``, ``full_desc_stage1/2``).
+      2. Fall back to ``_decompose_local()`` keyword stripping when the VLM
+         fields are empty (old parsed.json or deletion edits).
+
+    ``override_type`` is set by ``s5_trellis_3d`` when ``build_part_mask``
+    promotes a part edit to Global due to large coverage; when given, the
+    object-level descriptions are substituted into the part-level slots so
+    the mask scope and the prompt scope stay consistent.
 
     Supports all edit types from partcraft.edit_types:
       - modification/scale → Modification (S1+S2 repaint)
@@ -126,41 +132,69 @@ def build_prompts_from_spec(spec) -> dict:
     from partcraft.edit_types import trellis_effective_type
 
     raw_type = spec.edit_type
-    edit_type = trellis_effective_type(raw_type)
+    effective_type = override_type or trellis_effective_type(raw_type)
 
     obj_desc = spec.object_desc or ""
-    after_desc = spec.after_desc or obj_desc
-    edit_prompt = spec.edit_prompt or ""
+    edit_prompt = spec.prompt or ""
 
-    # Deletion now uses the "Deletion" path in interweave_Trellis_TI
-    # which directly removes voxels (no S1 repaint), so the "smooth
-    # closed surface" prompt enrichment is no longer needed.
+    # ── Determine after_desc and part-level anchors ────────────────────────
+    # When a part edit is promoted to Global (override_type == "Global" and
+    # the original type was not "global"), we substitute the object-level
+    # description into every part-level slot so that the full 64^3 mask and
+    # the prompts stay semantically consistent.
+    promoted_to_global = (
+        effective_type == "Global" and raw_type not in ("global", "Global")
+    )
+    if promoted_to_global:
+        after_desc = obj_desc
+        before_part = obj_desc
+        after_part = obj_desc
+    else:
+        after_desc = spec.new_parts_desc or obj_desc
+        before_part = spec.target_part_desc or ""
+        after_part = spec.new_parts_desc or spec.target_part_desc or ""
 
     old_label = getattr(spec, 'old_label', '') or ''
-    before_part = getattr(spec, 'before_part_desc', '') or old_label
-    after_part = getattr(spec, 'after_part_desc', '') or old_label
 
-    # Decompose complete descriptions into structure / appearance
-    ori_s1_cpl, ori_s2_cpl = _decompose_local(obj_desc)
-    new_s1_cpl, new_s2_cpl = _decompose_local(after_desc)
+    # ── S1 / S2 decomposition ──────────────────────────────────────────────
+    # Object-level: prefer VLM-generated stage fields; fall back to local.
+    if promoted_to_global:
+        # Re-decompose the promoted object desc locally since the stage fields
+        # belong to the original (non-global) edit.
+        ori_s1_cpl, ori_s2_cpl = _decompose_local(obj_desc)
+        new_s1_cpl, new_s2_cpl = _decompose_local(after_desc)
+    else:
+        ori_s1_cpl = spec.object_desc_s1 or _decompose_local(obj_desc)[0]
+        ori_s2_cpl = spec.object_desc_s2 or _decompose_local(obj_desc)[1]
+        new_s1_cpl = spec.after_desc_s1 or _decompose_local(after_desc)[0]
+        new_s2_cpl = spec.after_desc_s2 or _decompose_local(after_desc)[1]
 
-    # Decompose part-level descriptions
-    ori_s1_part, ori_s2_part = _decompose_local(before_part)
-    new_s1_part, new_s2_part = _decompose_local(after_part)
+    # Part-level: prefer VLM-generated new_parts_desc stage fields; fall back.
+    if promoted_to_global or not before_part:
+        ori_s1_part, ori_s2_part = _decompose_local(before_part)
+    else:
+        ori_s1_part = _decompose_local(before_part)[0]
+        ori_s2_part = _decompose_local(before_part)[1]
+
+    if promoted_to_global or not after_part:
+        new_s1_part, new_s2_part = _decompose_local(after_part)
+    else:
+        new_s1_part = spec.new_parts_desc_s1 or _decompose_local(after_part)[0]
+        new_s2_part = spec.new_parts_desc_s2 or _decompose_local(after_part)[1]
 
     return {
         "edit_prompt": edit_prompt,
-        "edit_type": edit_type,         # TRELLIS-level type
+        "edit_type": effective_type,    # TRELLIS-level type
         "raw_edit_type": raw_type,      # PartCraft-level type
         "editing_part": old_label,
         "target_part": after_part,
         # Complete descriptions (ori = before, new = after)
         "ori_cpl": obj_desc,
         "new_cpl": after_desc,
-        # Structure descriptions (shape adjectives only)
+        # Structure descriptions (geometry-only, no appearance words)
         "ori_s1_cpl": ori_s1_cpl,
         "new_s1_cpl": new_s1_cpl,
-        # Appearance descriptions (color/material adjectives only)
+        # Appearance descriptions (material/color-only, no shape words)
         "ori_s2_cpl": ori_s2_cpl,
         "new_s2_cpl": new_s2_cpl,
         # Part-level descriptions

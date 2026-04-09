@@ -9,94 +9,10 @@
     - 服务/GPU/端口完全由 config 的 `pipeline:` 段（`gpus`、`vlm_port_base/stride`、`flux_port_base/stride`）派生，N-GPU agnostic
   - 模块布局：`partcraft/pipeline_v2/{run,scheduler,specs,paths,status,validators,s1_phase1_vlm,s2_highlights,s4_flux_2d,s5_trellis_3d,s5b_deletion,s6_render_3d,s7_addition_backfill}.py`
   - Resume：每 step 跑完调用 `validators.apply_check`,根据磁盘产物把 `status.json` 翻成 OK/FAIL/SKIP；下一轮 step 在 per-edit 粒度上只补缺失文件
-- Batch 主入口（v1，旧 batch 流）：`scripts/run_pipeline.py`
-- Streaming 主入口：`scripts/run_streaming.py`
-- 约束：新增编排能力只能进入上述入口或其共享模块，不再新增并行的 standalone 编排前门。
+- 约束：所有编排能力只能进入 pipeline_v2 入口及其模块，不再新增任何并行编排入口。
 
-## 共享编排层
 
-- `scripts/pipeline_common.py`：配置读取、路径规范化、数据集构建、日志等共享能力。
-- `scripts/pipeline_orchestrator.py`：`run_pipeline` 的主编排流程（context 构建、步骤执行、summary 收口）。
-- `scripts/pipeline_paths.py`：shard/run token/report/manifest 路径派生与链接同步。
-- `scripts/pipeline_jsonl.py`：JSONL 读写、去重、resume done 集合等通用逻辑。
-- `scripts/pipeline_dispatch.py`：Step1/Step4 的多 worker 分发、等待、合并校验协议。
-- `scripts/pipeline_diagnostics.py`：各 step 的统计诊断输出。
-- `scripts/pipeline_step_3d.py`：Step4 3D 编辑核心逻辑拆分实现。
 
-## Batch 流程职责
-
-`scripts/run_pipeline.py` 负责 Step1-7 的可恢复批处理：
-
-1. Step1 语义与 enrich
-2. Step2 规划
-3. Step3 2D 编辑预生成
-4. Step4 TRELLIS 3D 编辑（支持多 GPU 分发）
-5. Step5 质量评估
-6. Step6 导出
-7. Step7 数据清洗（opt-in，需 `--steps 7 --cleaning-input-dir`）
-
-输出遵循 shard 目录下 `pipeline/reports` 与 `pipeline/manifests`，保持 JSONL/resume 兼容。
-
-### Step4 编辑产物格式（2026-04-04 对齐）
-
-Step4 每个编辑对保存为 `mesh_pairs/{edit_id}/before.npz` + `after.npz`，每个 npz 包含：
-
-- `slat_feats` `[N, C_slat]`：Stage-2 structured latent 特征
-- `slat_coords` `[N, 4]`：体素坐标 `[batch, x, y, z]`
-- `ss` `[C_ss, R, R, R]`：Stage-1 sparse structure VAE latent
-所有编辑类型均产出完整的 SS + SLAT 对，但生产方式因类型而异：
-
-#### 各编辑类型的 SLAT+SS 生产路径（2026-04-04 对齐）
-
-Step4 产出 PLY + 初始 SLAT+SS（TRELLIS 生成），后处理 Phase 5 对 deletion 做完整重编码。
-
-| 类型 | Step4 产出 | 后处理 Phase 5 | 最终 after.npz 来源 |
-|------|-----------|---------------|-------------------|
-| **modification / scale** | TRELLIS S1+S2 → SLAT+SS + `after.ply` | 不处理（已有有效 SLAT+SS） | TRELLIS 直接产出 |
-| **material / global** | TRELLIS S2-only → SLAT+SS + `after.ply` | 不处理 | TRELLIS 直接产出 |
-| **deletion** | `direct_delete_mesh()` → `before.ply` + `after.ply`（无有效 SLAT） | 渲染 `after.ply` → DINOv2 → SLAT encoder → SS encoder → **完整重写 `after.npz`** | Phase 5 重编码 |
-| **addition** | 无独立产出 | Phase 3 复制 deletion 的 before/after 互换 | 来自 deletion |
-| **identity** | 无独立产出 | Phase 4 硬链接同物体 `original.npz` | 来自原始物体预编码 |
-
-#### Deletion 旧方案废弃说明
-
-旧方案（Phase 2）对原始 SLAT 做 `feats[keep]` / `coords[keep]` mask 子集化。SLAT 特征是在完整物体上下文中由 DINOv2 多视角聚合 + SLAT encoder 编码的，直接丢弃子集体素后特征不自洽，TRELLIS Gaussian decode 时出现严重毛边/模糊。Phase 5 用渲染重编码替代，产出的 latent 与删除后的几何完全一致。
-
-#### PLY 渲染-编码参数
-
-| 参数 | Phase 5 渲染 | 原始物体预渲染 |
-|------|-------------|---------------|
-| views | 40 | 150 |
-| resolution | 512 | 512 |
-| engine | CYCLES GPU | CYCLES |
-| voxel_size | 1/64 (64³) | 1/64 (64³) |
-| fov / sampling | 40° / sphere_hammersley | 40° / sphere_hammersley |
-
-旧格式（`before_slat/feats.pt` + `coords.pt` 目录）由下游消费者兼容读取。
-
-### Step1/Step4 中断恢复协议（2026-03-29 对齐）
-
-Step1 与 Step4 的多 worker 执行统一采用“先合并、再失败”的恢复语义，避免 worker crash 时已完成结果丢失：
-
-- `scripts/pipeline_dispatch.py`
-  - `wait_for_workers(..., fail_fast=False)` 支持返回失败 worker 列表，交由调用方先做 merge/reconcile 再决定是否中断。
-  - `discover_step1_worker_results()` 用于发现历史 `semantic_labels*_w*.jsonl` worker 产物。
-  - `reconcile_worker_results(...)` 作为 Step1/Step4 通用合并校验入口（`reconcile_step4_results` 保留兼容包装）。
-- `scripts/run_pipeline.py`
-  - `run_step_semantic_multi_gpu` 在分发前先合并历史 worker 产物并计算 pending；worker crash 时先 merge 再 raise。
-  - `run_step_3d_edit_multi_gpu` 同样改为 crash 时先 merge 再 raise。
-  - worker 子进程日志落盘到 `cache/phase0/worker_w{i}.log`（Step1）用于定位 crash 原因。
-
-### Step1 Prompt 生成职责（2026-03-29 对齐）
-
-Step1 的 prompt 生成分为“VLM 主生成 + 模板兜底”两层：
-
-- `partcraft/phase1_planning/enricher.py`：扩展 VLM 输出字段，新增 per-part `scale_edits`，并增强 `materials` 与 `global_edits` 的多样性指令。
-- `partcraft/phase1_planning/planner.py`：接入 `type=="scale"` 与 VLM material/scale 结果，仅对未覆盖 part 应用模板 fallback。
-
-## Streaming 流程职责
-
-`scripts/run_streaming.py` 负责对象级流式处理，面向吞吐优先场景。与 batch 共用核心 phase 模块与 Step4 TRELLIS 能力。
 
 ## 数据预处理入口（scripts/datasets）
 
@@ -156,7 +72,7 @@ Step1 的 prompt 生成分为“VLM 主生成 + 模板兜底”两层：
 - 关键路径不再在运行时隐式 fallback（例如 `dataset_root`、`slat_dir`、`img_enc_dir`、`image_edit_base_url`）。
 - 缺失配置或路径无效时，直接抛出 `[CONFIG_ERROR]` 并包含 key、解析后的值、来源（config/env_override/derived）。
 - `partcraft/utils/config.py` 会在加载后打印 `[CONFIG_PATH]`，用于审计最终生效路径与来源。
-- `run_pipeline.py` / `run_streaming.py` / `prerender.py` 在 Step3/Step4 与 prerender 输入阶段执行强校验，不再“warning 后跳过步骤”。
+- `partcraft.pipeline_v2.run` 与 `prerender.py` 在 step 入口执行强校验，不再警告后跳过。
 
 ### PartVerse 预处理链
 
@@ -188,8 +104,7 @@ Step1 的 prompt 生成分为“VLM 主生成 + 模板兜底”两层：
   - 150 视角渲染 + SLAT 编码入口，使用 `paths.*` 统一读写目录。
 - `scripts/datasets/partobjaverse/pack_npz.py`
   - 将 prerender 产物整理成 pipeline 输入 NPZ。
-- `scripts/datasets/partobjaverse/build_dataset.py`
-  - 从 pipeline 输出反向构建训练数据 JSON（后处理用途）。
+
 
 ## 端到端数据流
 
@@ -200,59 +115,31 @@ flowchart TD
   preprocessEntry --> slat[slat feats and coords]
   preprocessEntry --> packNpz[pack to images and mesh npz]
   packNpz --> datasetContract[PartCraftDatasetContract]
-  datasetContract --> batchEntry[run_pipeline.py]
-  datasetContract --> streamingEntry[run_streaming.py]
-  batchEntry --> outputs[outputs and reports]
-  streamingEntry --> outputs
+  datasetContract --> pipelineEntry[partcraft.pipeline_v2.run]
+  pipelineEntry --> outputs[outputs and reports]
 ```
 
-`scripts/pipeline_common.py` 的 `create_dataset()` 使用配置中的 `data.image_npz_dir` 与 `data.mesh_npz_dir` 构造 `PartCraftDataset`。因此 datasets 脚本与编辑入口之间的关键契约是 `images/mesh` NPZ 结构一致性。
+`partcraft/pipeline_v2/` 各 step 通过 `ObjectContext` 访问每个对象的 `image_npz` / `mesh_npz` 路径。datasets 脚本与编辑入口之间的关键契约是 `images/mesh` NPZ 结构一致性。
 
 ## 保留目录
 
 - `scripts/datasets/`：数据构建、预处理、打包、校验。
 - `scripts/tools/`：运维与辅助工具（服务、下载、对比、测试等）。
 - `scripts/vis/`：可视化与渲染辅助（见下方「可视化工具」一节）。
-- `scripts/standalone/encode_slat.py`：保留为编码工具脚本（非主入口）。
 
-## 已清理的冗余入口/模块
 
-### Phase 1 v2（prompt-driven，当前重构分支）
 
-`scripts/standalone/run_phase1_v2.py` 是新的 phase 1 入口（branch `feature/prompt-driven-part-selection`），跳过 phase0 group，一次 VLM 调用直接产出 object 元信息 + 动态配额的 N 条编辑（deletion ≈ modification ≈ N）。
+## 管线运行入口
 
-- 视觉输入：`scripts/tools/render_part_overview.py` 渲染 5×2 grid，4 张俯视 + 1 张仰视（dataset idx `[89,90,91,100,8]`），底排是 `scripts/blender_render_parts.py` 用 16 名色调色板染色后的 part-only Workbench 渲染。
-- 输出包含 `view_index ∈ [0,4]`（VLM 自选最能看清 target 的视角）和双轨 stage1/stage2 描述（供 TRELLIS 两阶段条件）。
-- N>16 的对象自动跳过（3 shard 共 178/3609，4.9%）。
-- 多 GPU：`--vlm-url url1,url2,...`，每 server 一个 semaphore 串行，避免 SGLang KV thrashing。
+推荐使用 `bash scripts/tools/run_pipeline_v2_shard.sh <tag> <config_yaml>` 作为 shard 级运行入口，或直接调用 `python -m partcraft.pipeline_v2.run`（见上方主入口约定）。
 
-详细配额表、规则 R1-R9 与 schema 见 `docs/AI_LOG.md` 2026-04-07 条目。
+### tmux 会话（长期跑 / 多面板）
 
-### 已删除 standalone 入口
-
-- `scripts/standalone/run_all.py`
-- `scripts/standalone/run_phase0.py`
-- `scripts/standalone/run_phase1.py`
-- `scripts/standalone/run_phase2.py`
-- `scripts/standalone/run_phase2_5.py`
-- `scripts/standalone/run_phase3.py`
-- `scripts/standalone/run_enrich.py`
-- `scripts/standalone/test_editformer.py`
-
-### 已删除未使用阶段模块
-
-- `partcraft/phase3_render/renderer.py`
-
-## 非删除保留（风险控制）
-
-以下文件虽非双入口直接 import，但属于可选路径或潜在配置分支，当前保留：
-
-- `partcraft/phase3_filter/_mesh_metrics.py`（原 `filter.py`，仅 vlm_filter 的 mesh prefilter 使用）
-- `partcraft/phase2_assembly/alignment.py`
-
-## Batch 管线运行器
-
-`scripts/tools/run_shard_batch_pipeline.sh` 是 shard 级 batch 运行的推荐入口，按阶段顺序执行 Step12 → 3 → 4 → 5 → 6，自动管理服务启停和 GPU 资源复用。
+- **适用**：SSH 易断线、phase 耗时长、需要同时看日志与交互式 tail；**在仓库根**执行（`run_pipeline_v2_shard.sh` 会 `cd` 到项目根）。
+- **单会话跑完整 shard**：`tmux new -s pc3d` → 在会话内 `export` 需要的 `PHASES` / `MACHINE_ENV`（可选）→ 执行 `bash scripts/tools/run_pipeline_v2_shard.sh <tag> <config_yaml>`；断线后 `tmux attach -t pc3d` 回到同一进程。
+- **常用快捷键**：`Ctrl-b d` detach；`Ctrl-b c` 新窗口；`Ctrl-b "` / `%` 分屏；`Ctrl-b [` 进入滚动/复制模式。
+- **多面板拆分（示例）**：窗口 0 跑管线编排；若需**手动**起 VLM / FLUX（与脚本自动起停并存时以脚本为准），另开窗口按机器上的 `scripts/tools/launch_local_vlm.sh`、`scripts/tools/image_edit_server.py` 等启动，端口须与 config 中 `pipeline.vlm_port_base` / `flux_port_base` 及 `pipeline.gpus` 派生结果一致。
+- **环境变量**：tmux 面板继承启动该面板的 shell 环境；跨机器请优先把路径写进 `configs/machine/$(hostname).env`，或用 `MACHINE_ENV=configs/machine/xxx.env` 单次注入，避免只在某一面板 `export` 导致另一面板缺变量。
 
 ### 机器配置驱动
 
@@ -260,12 +147,13 @@ flowchart TD
 
 1. `cp configs/machine/node39.env configs/machine/<新主机名>.env`
 2. 编辑路径
-3. `SHARD=01 bash scripts/tools/run_shard_batch_pipeline.sh`
+3. `SHARD=01 bash scripts/tools/run_pipeline_v2_shard.sh <tag> <config_yaml>`
 
 当前仓库已提供：
 
 - `configs/machine/node39.env`
 - `configs/machine/H200.env`（本机命名模板）
+- `configs/machine/dedicated-developjob-saining-data-rio9a.env`（本机实际配置，blender/ckpt 路径已对齐）
 
 ### 环境初始化脚本（部署/管线分离）
 
@@ -275,7 +163,7 @@ flowchart TD
   - 配置并校验 `CONDA_ENV_SERVER`（VLM + image edit 服务环境）
   - 默认读取 `configs/machine/$(hostname).env`，可用 `--machine-env` 覆盖
 - `scripts/tools/setup_pipeline_env.sh`
-  - 配置并校验 `CONDA_ENV_PIPELINE`（`run_pipeline.py` / `run_streaming.py` 运行环境）
+  - 配置并校验 `CONDA_ENV_PIPELINE`（`partcraft.pipeline_v2` 管线运行环境）
   - 默认读取 `configs/machine/$(hostname).env`，可用 `--machine-env` 覆盖
 
 常用命令：
@@ -291,29 +179,23 @@ bash scripts/tools/setup_pipeline_env.sh --check
 
 本机适配示例：
 
-- `configs/machine/wm1A800.env`
-- 路径根统一到 `/mnt/cfs/vffey4/3dedit`（`ckpts` / `data/partverse` / `outputs/partverse`）
+- `configs/machine/<hostname>.env`（机器相关路径集中在此文件，无需修改代码）
 
 ### 环境变量
 
 | 变量 | 说明 | 示例 |
 |------|------|------|
-| `SHARD` | 目标 shard | `01` |
-| `STEPS` | 执行步骤 | `12,3,4` 或 `all` |
+| `PHASES` | 执行阶段（对应 config `pipeline.phases[].name`） | `A,C,D,D2,E,F` 或省略（跑全部） |
 | `LIMIT` | 限制对象数（调试用） | `3` |
-| `VLM_GPUS` | VLM 服务 GPU | `0,4,5,6,7` |
-| `VLM_TP` | VLM tensor parallel | `1`（单卡）或 `2` |
-| `EDIT_GPUS` | 图像编辑服务 GPU | `0,4,5,6,7` |
-| `STEP4_GPUS` | TRELLIS 3D GPU | `0,4,5,6,7` |
 
 ### GPU 资源生命周期
 
-同一组 GPU 在步骤间复用，每步结束后自动 kill 服务释放显存：
+同一组 GPU 在 phase 间复用，每 phase 结束后自动 kill 服务释放显存：
 
-- Step12：启动 VLM → 语义+规划 → kill VLM
-- Step3：启动 FLUX → 2D 编辑 → kill FLUX
-- Step4：子进程加载 TRELLIS → 3D 编辑 → 子进程退出
-- Step5/6：CPU 为主
+- Phase A（s1 VLM）：启动 SGLang VLM → Phase 1 推理 → kill VLM
+- Phase C（s4 FLUX）：启动 FLUX 服务 → 2D 编辑 → kill FLUX
+- Phase D（s5 TRELLIS）：子进程加载 TRELLIS → 3D 编辑 → 子进程退出
+- Phase D2（s5b deletion）、E（s6 rerender）、F（s7 backfill）：CPU 为主或短 GPU burst
 
 ### machine env 必填字段
 
@@ -325,13 +207,10 @@ DATA_DIR, OUTPUT_ROOT
 
 ### 权重下载与目录规范（本机）
 
-- 权重根目录建议固定为：`/mnt/cfs/vffey4/3dedit/ckpts`
+- 权重根目录由 machine env 的 `PARTCRAFT_CKPT_ROOT` 或 `VLM_CKPT` / `EDIT_CKPT` / `TRELLIS_CKPT_ROOT` 指定。
 - 缺失本地推理权重时，使用：
   - `bash scripts/tools/download_local_missing_weights.sh`
-- 脚本默认下载目录名与 machine env 对齐：
-  - `Qwen3.5-27B`
-  - `FLUX.2-klein-9B`
-- 可通过环境变量覆盖仓库与目标目录（`VLM_REPO_ID` / `EDIT_REPO_ID` / `PARTCRAFT_CKPT_ROOT`），无需修改代码。
+- 可通过 `VLM_REPO_ID` / `EDIT_REPO_ID` / `PARTCRAFT_CKPT_ROOT` 覆盖默认仓库与目录，无需修改代码。
 
 ## 训练数据契约（Object-Centric Edit Pairs）
 
@@ -428,13 +307,13 @@ Phase 3/4（addition backfill + identity backfill）
 
 **主路径：VLM 清洗**（`scripts/tools/run_vlm_cleaning.py`）
 - 渲染 before/after **3 视角**对比图 → Qwen VLM 结构化评分 → tier 分类
-- **8 维评分**（统一 prompt，`partcraft/phase3_filter/vlm_filter.py:build_judge_prompt`）：
+- **8 维评分**（统一 prompt，`partcraft/cleaning/vlm_filter.py:build_judge_prompt`）：
   - Part 1 编辑质量：edit_executed、correct_region、preserve_other、visual_quality、artifact_free
   - Part 2 Prompt 质量：prompt_quality (1-5)、improved_prompt、improved_after_desc
 - 两种渲染路径：PLY → Blender（deletion）/ NPZ → TRELLIS Gaussian（其他类型）
 - 空 prompt 时 VLM 从图像推断编辑内容并生成 prompt
-- 核心函数在 `partcraft/phase3_filter/vlm_filter.py`
-- Mesh prefilter 函数在 `partcraft/phase3_filter/_mesh_metrics.py`（内部模块）
+- 核心函数在 `partcraft/cleaning/vlm_filter.py`
+- Mesh prefilter 函数在 `partcraft/cleaning/_mesh_metrics.py`（内部模块）
 
 **3-view 最优覆盖角度**（Blender 与 TRELLIS Gaussian 统一）：
 
@@ -503,7 +382,7 @@ python scripts/tools/migrate_slat_to_npz.py --phase 3,4 ...
 | **global** | 同 modification | 是 | |
 | **identity** | 不评（自动 high） | — | 引用同一 `original.npz` |
 
-**评分维度**（统一 prompt，`partcraft/phase3_filter/vlm_filter.py`）：
+**评分维度**（统一 prompt，`partcraft/cleaning/vlm_filter.py`）：
 
 | 维度 | 类型 | 说明 |
 |------|------|------|
@@ -552,7 +431,7 @@ GPUS=0,3,4,5,6,7 SHARD=01 ONLY_TYPES=deletion \
 ### 其他入口（仍可用）
 
 - **计算型清洗**：`scripts/tools/run_cleaning.py --input-dir partverse_pairs [--shards ...] [--workers N]`
-- **管线集成**：`python scripts/run_pipeline.py --steps 7 --cleaning-input-dir partverse_pairs`
+- **管线集成**：`python -m partcraft.pipeline_v2.run --config <yaml> --shard <NN> --phase F`（旧 run_pipeline.py 已删除）
 
 ### 输出
 
@@ -597,6 +476,6 @@ python scripts/vis/render_edit_gallery.py \
 
 ## 后续演进规则
 
-- 不新增第三条主编排入口。
-- 若引入新步骤，优先扩展 `run_pipeline` 的 step 体系和共享 `pipeline_*` 模块。
-- streaming 侧只保留对象级增量能力，避免重复实现 batch 的全量编排语义。
+- 只有 pipeline_v2 这一条编排入口，禁止新增。
+- 若引入新步骤，在 `partcraft/pipeline_v2/` 内新增 `s*_*.py` 模块并在 `run.py` + `scheduler.py` 中注册。
+- 新功能模块放入 `partcraft/trellis/`（3D 相关）或 `partcraft/cleaning/`（质量过滤）或 `partcraft/pipeline_v2/`（编排），不再创建新的 `phase*` 目录。

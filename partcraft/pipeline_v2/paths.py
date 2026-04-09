@@ -25,22 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-# Maps phase1_v2 edit_type → edit_id prefix.
-# Shared seq across mod/scl/mat/glb (matches parsed_to_edit_specs.py);
-# del has its own seq; addition is backfilled from deletion.
-EDIT_TYPE_PREFIX: dict[str, str] = {
-    "modification": "mod",
-    "scale":        "scl",
-    "material":     "mat",
-    "global":       "glb",
-    "deletion":     "del",
-    "addition":     "add",
-}
-
-# Edit types that need a FLUX 2D edited image.
-FLUX_TYPES: frozenset[str] = frozenset(
-    {"modification", "scale", "material", "global"}
-)
+from partcraft.edit_types import EDIT_TYPE_PREFIX, FLUX_TYPES  # noqa: F401 — single source of truth
 
 
 def normalize_shard(shard: str | int | None) -> str:

@@ -51,7 +51,7 @@ from tqdm import tqdm
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from partcraft.phase3_filter.vlm_filter import (
+from partcraft.cleaning.vlm_filter import (
     VLMScore,
     call_vlm_judge,
     classify_tier,
@@ -95,7 +95,7 @@ def _load_existing_scores(path: Path) -> dict[str, dict]:
 # ─── Rendering ─────────────────────────────────────────────────────
 
 # Import 3-view angles from the single source of truth.
-from partcraft.phase3_filter.vlm_filter import _VLM_YAWS, _VLM_PITCHES
+from partcraft.cleaning.vlm_filter import _VLM_YAWS, _VLM_PITCHES
 
 
 def _render_ply_pair(

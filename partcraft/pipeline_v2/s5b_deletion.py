@@ -37,7 +37,7 @@ sys.path.insert(0, str(_ROOT / "scripts" / "tools"))
 from .paths import ObjectContext
 from .specs import EditSpec, iter_deletion_specs
 from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
-from .s5_trellis_3d import _adapt_spec, _ensure_refiner
+from .s5_trellis_3d import _ensure_refiner
 
 
 # ─────────────────── s5b: mesh-direct delete (CPU) ────────────────────
@@ -58,7 +58,7 @@ def run_mesh_delete_for_object(
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> DelMeshResult:
-    from partcraft.phase2_assembly.trellis_refine import TrellisRefiner
+    from partcraft.trellis.refiner import TrellisRefiner
     log = logger or logging.getLogger("pipeline_v2.s5b")
     res = DelMeshResult(obj_id=ctx.obj_id)
 
@@ -85,7 +85,6 @@ def run_mesh_delete_for_object(
                         "(PLY pair will still be written)", ctx.obj_id, e)
 
     for spec in specs:
-        legacy = _adapt_spec(spec)
         pair_dir = ctx.edit_3d_dir(spec.edit_id)
         a_ply = pair_dir / "after.ply"
         if a_ply.is_file() and not force:
@@ -94,13 +93,13 @@ def run_mesh_delete_for_object(
         try:
             pair_dir.mkdir(parents=True, exist_ok=True)
             TrellisRefiner.direct_delete_mesh(
-                obj_record, legacy.remove_part_ids, pair_dir, export_ply=True,
+                obj_record, spec.selected_part_ids, pair_dir, export_ply=True,
             )
             # Rough SLAT pair (s6b will overwrite after.npz).
             if refiner is not None and ori_slat is not None:
                 try:
                     mask, _ = refiner.build_part_mask(
-                        ctx.obj_id, obj_record, legacy.remove_part_ids,
+                        ctx.obj_id, obj_record, spec.selected_part_ids,
                         ori_slat, "Deletion",
                     )
                     refiner.export_deletion_pair(ori_slat, mask, pair_dir)

@@ -36,10 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-# Pull legacy helpers in-place (single source of truth for the prompt + render).
-_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(_ROOT / "scripts" / "standalone"))
-from run_phase1_v2 import (  # noqa: E402
+from partcraft.pipeline_v2.s1_vlm_core import (  # noqa: E402
     SYSTEM_PROMPT, USER_PROMPT_TEMPLATE,
     build_part_menu, render_overview_png,
     call_vlm_async, extract_json_object, validate, quota_for,
@@ -62,9 +59,12 @@ class Phase1Result:
 
 # ─────────────────── render-only (cheap, sequential) ──────────────────
 
-def prerender(ctx: ObjectContext, blender: str) -> tuple[bytes, str, list[int], dict] | None:
+def prerender(ctx: ObjectContext, blender: str) -> tuple[bytes, str, list[int], dict, str] | None:
     """Render overview + build menu + quota. Returns ``None`` if the
     object exceeds ``MAX_PARTS``.
+
+    Returns ``(png, user_msg, pids, quota, menu)``; menu is needed by
+    ``_call_one`` to rebuild the prompt with a halved quota on retry.
 
     Side effect: writes ``ctx.overview_path``.
     """
@@ -88,50 +88,112 @@ def prerender(ctx: ObjectContext, blender: str) -> tuple[bytes, str, list[int], 
         n_scale=quota["scale"], n_material=quota["material"],
         n_global=quota["global"],
     )
-    return png, user_msg, pids, quota
+    return png, user_msg, pids, quota, menu
+
+
+# ─────────────────── VLM quota halving for retry ──────────────────────
+
+def _halve_quota(quota: dict) -> dict:
+    """Return a reduced quota for the retry attempt.
+
+    Halving produces a shorter response (less truncation risk) while still
+    covering all edit types.  Deletion and modification get at least 1 each;
+    scale/material/global get at least 1 only when the original had >= 2.
+    """
+    out: dict = {}
+    for k, v in quota.items():
+        halved = max(1, v // 2) if k in ("deletion", "modification") else max(0, v // 2)
+        out[k] = halved
+    return out
+
+
+def _rebuild_user_msg(menu: str, quota: dict) -> str:
+    """Rebuild the user prompt with a new quota (used on retry)."""
+    return USER_PROMPT_TEMPLATE.format(
+        part_menu=menu,
+        n_total=sum(quota.values()),
+        n_deletion=quota["deletion"],
+        n_modification=quota["modification"],
+        n_scale=quota["scale"],
+        n_material=quota["material"],
+        n_global=quota["global"],
+    )
 
 
 # ─────────────────── single-object VLM call ───────────────────────────
 
 async def _call_one(client, ctx: ObjectContext, png: bytes, user_msg: str,
                     valid_pids: list[int], quota: dict, model: str,
-                    sem: asyncio.Semaphore) -> Phase1Result:
+                    sem: asyncio.Semaphore,
+                    part_menu: str = "") -> Phase1Result:
+    """Make up to 2 VLM attempts for one object.
+
+    Attempt 1: full quota, full user_msg.
+    Attempt 2 (on exception or JSON parse failure only): halved quota,
+        rebuilt user_msg — shorter response reduces truncation risk.
+    If attempt 2 also fails, status is written as FAIL.
+    If attempt 1 succeeds but validation ok=False, the partial result is
+    saved and returned as-is (downstream uses whatever edits passed).
+    """
     async with sem:
         t0 = time.time()
-        try:
-            raw = await call_vlm_async(
-                client, png, SYSTEM_PROMPT, user_msg, model, max_tokens=12288,
+        last_error: str = ""
+
+        for attempt in range(2):
+            eff_quota = quota if attempt == 0 else _halve_quota(quota)
+            eff_msg = user_msg if attempt == 0 else _rebuild_user_msg(part_menu, eff_quota)
+
+            try:
+                raw = await call_vlm_async(
+                    client, png, SYSTEM_PROMPT, eff_msg, model, max_tokens=12288,
+                )
+            except Exception as e:
+                last_error = str(e)
+                if attempt == 0:
+                    continue  # retry
+                update_step(ctx, "s1_phase1", status=STATUS_FAIL,
+                            error=last_error, attempts=2)
+                return Phase1Result(ctx.obj_id, ok=False, error=last_error)
+
+            ctx.raw_response_path.write_text(raw)
+            parsed = extract_json_object(raw)
+            if parsed is None:
+                last_error = "parse_error"
+                if attempt == 0:
+                    continue  # retry with halved quota
+                update_step(ctx, "s1_phase1", status=STATUS_FAIL,
+                            error=last_error, raw_len=len(raw), attempts=2)
+                return Phase1Result(ctx.obj_id, ok=False, error=last_error)
+
+            # Parsed successfully — save result regardless of validation score.
+            dt = time.time() - t0
+            rep = validate(parsed, set(valid_pids), quota=eff_quota)
+            out = {
+                "obj_id": ctx.obj_id,
+                "shard": ctx.shard,
+                "validation": rep,
+                "parsed": parsed,
+            }
+            ctx.parsed_path.write_text(json.dumps(out, indent=2, ensure_ascii=False))
+            update_step(
+                ctx, "s1_phase1",
+                status=STATUS_OK if rep["ok"] else STATUS_FAIL,
+                n_edits=len(parsed.get("edits") or []),
+                n_kept=rep["n_kept_edits"],
+                type_counts=rep.get("type_counts"),
+                wall_s=round(dt, 2),
+                attempts=attempt + 1,
             )
-        except Exception as e:
-            update_step(ctx, "s1_phase1", status=STATUS_FAIL, error=str(e))
-            return Phase1Result(ctx.obj_id, ok=False, error=str(e))
-        dt = time.time() - t0
-        ctx.raw_response_path.write_text(raw)
-        parsed = extract_json_object(raw)
-        if parsed is None:
-            update_step(ctx, "s1_phase1", status=STATUS_FAIL,
-                        error="parse_error", raw_len=len(raw))
-            return Phase1Result(ctx.obj_id, ok=False, error="parse_error")
-        rep = validate(parsed, set(valid_pids), quota=quota)
-        out = {
-            "obj_id": ctx.obj_id,
-            "shard": ctx.shard,
-            "validation": rep,
-            "parsed": parsed,
-        }
-        ctx.parsed_path.write_text(json.dumps(out, indent=2, ensure_ascii=False))
-        update_step(
-            ctx, "s1_phase1",
-            status=STATUS_OK if rep["ok"] else STATUS_FAIL,
-            n_edits=len(parsed.get("edits") or []),
-            n_kept=rep["n_kept_edits"],
-            type_counts=rep.get("type_counts"),
-            wall_s=round(dt, 2),
-        )
-        return Phase1Result(
-            ctx.obj_id, ok=rep["ok"], n_kept=rep["n_kept_edits"],
-            n_total=sum(quota.values()), type_counts=rep.get("type_counts"),
-        )
+            return Phase1Result(
+                ctx.obj_id, ok=rep["ok"], n_kept=rep["n_kept_edits"],
+                n_total=sum(eff_quota.values()),
+                type_counts=rep.get("type_counts"),
+            )
+
+        # Should never reach here (loop covers both attempts), but be safe.
+        update_step(ctx, "s1_phase1", status=STATUS_FAIL,
+                    error=last_error or "unknown", attempts=2)
+        return Phase1Result(ctx.obj_id, ok=False, error=last_error)
 
 
 # ─────────────────── public entrypoints ──────────────────────────────
@@ -150,13 +212,13 @@ def run_one(
     if pre is None:
         update_step(ctx, "s1_phase1", status=STATUS_SKIP, reason="too_many_parts")
         return Phase1Result(ctx.obj_id, ok=False, error="too_many_parts")
-    png, user_msg, pids, quota = pre
+    png, user_msg, pids, quota, menu = pre
 
     async def _go():
         client = AsyncOpenAI(base_url=vlm_url, api_key="EMPTY")
         sem = asyncio.Semaphore(1)
         return await _call_one(client, ctx, png, user_msg, pids, quota,
-                               vlm_model, sem)
+                               vlm_model, sem, part_menu=menu)
 
     return asyncio.run(_go())
 
@@ -226,11 +288,11 @@ async def run_many_async(
     clients = [AsyncOpenAI(base_url=u, api_key="EMPTY") for u in vlm_urls]
     sems = [asyncio.Semaphore(1) for _ in clients]
     tasks = []
-    for i, (ctx, png, user_msg, pids, quota) in enumerate(pending):
+    for i, (ctx, png, user_msg, pids, quota, menu) in enumerate(pending):
         idx = i % len(clients)
         tasks.append(_call_one(
             clients[idx], ctx, png, user_msg, pids, quota,
-            vlm_model, sems[idx],
+            vlm_model, sems[idx], part_menu=menu,
         ))
     results.extend(await asyncio.gather(*tasks))
     return results
@@ -247,11 +309,7 @@ def _prerender_worker(args: tuple) -> tuple | None:
     """
     mesh_npz, image_npz, blender, overview_path = args
     from pathlib import Path as _P
-    import sys as _sys
-    _here = _P(__file__).resolve().parents[2] / "scripts" / "standalone"
-    if str(_here) not in _sys.path:
-        _sys.path.insert(0, str(_here))
-    from run_phase1_v2 import (  # type: ignore
+    from partcraft.pipeline_v2.s1_vlm_core import (  # noqa: E402
         build_part_menu as _bpm,
         render_overview_png as _rov,
         USER_PROMPT_TEMPLATE as _U,
@@ -275,7 +333,7 @@ def _prerender_worker(args: tuple) -> tuple | None:
         n_scale=quota["scale"], n_material=quota["material"],
         n_global=quota["global"],
     )
-    return png, user_msg, pids, quota
+    return png, user_msg, pids, quota, menu
 
 
 async def run_many_streaming(
@@ -382,9 +440,9 @@ async def run_many_streaming(
             if item is None:
                 return
             ctx, pre = item
-            png, user_msg, pids, quota = pre
+            png, user_msg, pids, quota, menu = pre
             res = await _call_one(client, ctx, png, user_msg, pids, quota,
-                                  vlm_model, sem)
+                                  vlm_model, sem, part_menu=menu)
             results.append(res)
             n_done += 1
             if n_done % log_every == 0 or n_done == n_total:

@@ -40,7 +40,7 @@ from typing import Iterable
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT))
 
-from scripts.pipeline_step_3d import resolve_2d_conditioning  # noqa: E402
+from partcraft.pipeline_v2.s5_3d_utils import resolve_2d_conditioning  # noqa: E402
 from .paths import ObjectContext
 from .specs import EditSpec, iter_flux_specs
 from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
@@ -63,7 +63,7 @@ class Trellis3DResult:
 def _ensure_refiner(p25_cfg: dict, ckpt_root: str | None,
                     slat_dir: str | None, img_enc_dir: str | None,
                     debug: bool, logger):
-    from partcraft.phase2_assembly.trellis_refine import TrellisRefiner
+    from partcraft.trellis.refiner import TrellisRefiner
     refiner = TrellisRefiner(
         cache_dir=str(Path(p25_cfg.get("cache_dir", "/tmp/pcv2_trellis"))),
         device="cuda",
@@ -80,10 +80,6 @@ def _ensure_refiner(p25_cfg: dict, ckpt_root: str | None,
     return refiner
 
 
-def _adapt_spec(spec: EditSpec):
-    """Adapt our EditSpec → legacy planner.EditSpec for refiner / helpers."""
-    from partcraft.phase1_planning.planner import EditSpec as LegacyEditSpec
-    return LegacyEditSpec(**spec.to_legacy_dict())
 
 
 def run_for_object(
@@ -99,24 +95,23 @@ def run_for_object(
     logger: logging.Logger | None = None,
 ) -> Trellis3DResult:
     """Edit all GPU specs for one object using a pre-loaded ``refiner``."""
-    from partcraft.phase2_assembly.trellis_refine import build_prompts_from_spec
+    from partcraft.trellis.refiner import build_prompts_from_spec
 
     log = logger or logging.getLogger("pipeline_v2.s5")
     res = Trellis3DResult(obj_id=ctx.obj_id)
 
-    legacy_specs = []
-    pending: list[tuple[EditSpec, "object"]] = []
+    all_specs = []
+    pending: list[EditSpec] = []
     for spec in iter_flux_specs(ctx):
-        legacy = _adapt_spec(spec)
-        legacy_specs.append((spec, legacy))
+        all_specs.append(spec)
         before = ctx.edit_3d_npz(spec.edit_id, "before")
         after = ctx.edit_3d_npz(spec.edit_id, "after")
         if before.is_file() and after.is_file() and not force:
             res.n_skip += 1
             continue
-        pending.append((spec, legacy))
+        pending.append(spec)
 
-    if not legacy_specs:
+    if not all_specs:
         update_step(ctx, "s5_trellis", status=STATUS_OK, n=0, reason="no_specs")
         return res
     if not pending:
@@ -148,12 +143,13 @@ def run_for_object(
     scale_large = float(scale_large) if scale_large is not None else None
 
     t0 = time.time()
-    for spec, legacy in pending:
+    for spec in pending:
         et_cap = spec.edit_type.capitalize()
         if et_cap in ("Modification", "Scale"):
-            edit_part_ids = (legacy.remove_part_ids or [legacy.old_part_id])
+            edit_part_ids = (spec.selected_part_ids
+                             or ([spec.selected_part_ids[0]] if spec.selected_part_ids else []))
         elif et_cap == "Material":
-            edit_part_ids = [legacy.old_part_id]
+            edit_part_ids = [spec.selected_part_ids[0]] if spec.selected_part_ids else []
         elif et_cap == "Global":
             edit_part_ids = []
         else:
@@ -172,12 +168,10 @@ def run_for_object(
                 res.n_fail += 1
                 continue
 
-            prompts = build_prompts_from_spec(legacy)
-            if prompts.get("edit_type") != effective_type:
-                prompts["edit_type"] = effective_type
+            prompts = build_prompts_from_spec(spec, override_type=effective_type)
 
             img_cond = resolve_2d_conditioning(
-                spec=legacy,
+                spec=spec,
                 obj_id=ctx.obj_id,
                 obj_record=obj_record,
                 ori_gaussian=ori_gaussian,

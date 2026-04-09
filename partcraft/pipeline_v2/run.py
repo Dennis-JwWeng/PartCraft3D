@@ -132,7 +132,9 @@ def run_step(
     if step == "s1":
         from .s1_phase1_vlm import run_many_streaming
         import asyncio
-        urls = sched.vlm_urls_for(cfg)
+        urls = ([u.strip() for u in args.vlm_url.split(",") if u.strip()]
+                if getattr(args, "vlm_url", None)
+                else sched.vlm_urls_for(cfg))
         model = (cfg.get("phase0") or {}).get("vlm_model", "Qwen3.5-27B")
         blender = cfg.get("blender",
                           "/Node11_nvme/artgen/lac/.tools/blender-4.2.0-linux-x64/blender")
@@ -151,7 +153,9 @@ def run_step(
 
     elif step == "s4":
         from .s4_flux_2d import run as s4_run
-        urls = sched.flux_urls_for(cfg)
+        urls = ([u.strip() for u in args.flux_url.split(",") if u.strip()]
+                if getattr(args, "flux_url", None)
+                else sched.flux_urls_for(cfg))
         if not urls:
             raise SystemExit("[CONFIG] no FLUX urls (set pipeline.gpus or phase2_5.image_edit_base_urls)")
         s4_run(ctxs, edit_urls=urls,
@@ -279,6 +283,12 @@ def main():
     ap.add_argument("--gpus", default=None,
                     help="comma list e.g. 4,5,6,7. If omitted, falls back "
                          "to pipeline.gpus from the config when needed.")
+    ap.add_argument("--vlm-url", dest="vlm_url", default=None,
+                    help="Override VLM URL(s), comma-separated. Single URL "
+                         "used by per-GPU workers in parallel mode.")
+    ap.add_argument("--flux-url", dest="flux_url", default=None,
+                    help="Override FLUX URL(s), comma-separated. Single URL "
+                         "used by per-GPU workers in parallel mode.")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
 
@@ -296,6 +306,10 @@ def main():
     root = resolve_root(cfg)
     ctxs = resolve_ctxs(root, cfg, shard=args.shard,
                         obj_ids=args.obj_ids, all_objs=args.all)
+    if args.gpu_shard:
+        _i, _n = (int(x) for x in args.gpu_shard.split("/"))
+        ctxs = slice_for_gpu(ctxs, _i, _n)
+        LOG.info("gpu-shard %d/%d → %d objects", _i, _n, len(ctxs))
     LOG.info("root=%s shard=%s objects=%d", root.root, args.shard, len(ctxs))
 
     if args.dry_run:

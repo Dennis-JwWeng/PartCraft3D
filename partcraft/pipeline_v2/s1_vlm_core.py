@@ -1,42 +1,28 @@
-#!/usr/bin/env python3
-"""Phase 1 v2 prototype: one-shot VLM call producing object meta + 9 edits.
+"""Core VLM helpers for Phase 1 v2 (one-shot edit generation).
 
-For each obj_id:
-  1. Render the 4×2 colored overview (top = 4 photos, bottom = colored parts)
-  2. Build the part menu from the mesh + cluster_size hints
-  3. Build the unified VLM prompt (system + user + image)
-  4. Call the local Qwen3.5-VL server (OpenAI-compatible)
-  5. Parse + lightly validate the JSON response
-  6. Save raw + parsed to outputs/_debug/phase1_v2/{obj_id}.json
+Previously lived in ``scripts/standalone/run_phase1_v2.py`` and was
+imported via a ``sys.path`` hack. Moved here so it can be imported as a
+proper package module.
 
-Usage:
-    python scripts/standalone/run_phase1_v2.py \
-        --obj-ids 112204b2a12c4e25bbbdcc0d196b1ad5 19e9f218f8c84af0af0b9ed8e930775e \
-        --shard 01
+Exports used by :mod:`partcraft.pipeline_v2.s1_phase1_vlm`:
+    SYSTEM_PROMPT, USER_PROMPT_TEMPLATE, MAX_PARTS,
+    build_part_menu, render_overview_png,
+    call_vlm_async, extract_json_object, validate, quota_for
 """
 from __future__ import annotations
-import argparse
-import asyncio
+
 import base64
-import io
 import json
-import sys
 import tempfile
-import time
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(_ROOT / "scripts" / "tools"))
-from render_part_overview import (  # noqa: E402
+from partcraft.render.overview import (
     VIEW_INDICES, _PALETTE, _PALETTE_NAMES,
     extract_parts, load_views_from_npz, run_blender, stitch_two_rows,
 )
-
-
-# ─────────────────────────── prompt construction ───────────────────────────
 
 SYSTEM_PROMPT = """You are a 3D Spatial Reasoning Engine generating a JSON dataset for 3D part editing. \
 You are given a 5x2 grid: TOP row = 5 RGB photos of one 3D object from 5 cameras; \
@@ -425,157 +411,11 @@ def validate(parsed: dict, valid_pids: set[int], quota: dict | None = None) -> d
 
 # ─────────────────────────────── main ───────────────────────────────────────
 
-def process_one(obj_id: str, shard: str, mesh_root: Path, images_root: Path,
-                blender: str, vlm_url: str, vlm_model: str, out_dir: Path):
-    print(f"\n{'='*70}\n[{obj_id}]")
-    mesh_npz = mesh_root / shard / f"{obj_id}.npz"
-    img_npz = images_root / shard / f"{obj_id}.npz"
 
-    print("  rendering 4×2 overview…")
-    img_png = render_overview_png(mesh_npz, img_npz, blender)
-    overview_path = out_dir / f"{obj_id}.overview.png"
-    overview_path.write_bytes(img_png)
-    print(f"    → {overview_path}")
-
-    pids, menu = build_part_menu(mesh_npz, img_npz)
-    print(f"  part menu ({len(pids)} parts):")
-    for line in menu.splitlines():
-        print(line)
-
-    user_msg = USER_PROMPT_TEMPLATE.format(part_menu=menu)
-    print(f"  calling VLM ({vlm_model})…")
-    raw = call_vlm(img_png, SYSTEM_PROMPT, user_msg, vlm_url, vlm_model)
-    raw_path = out_dir / f"{obj_id}.raw.txt"
-    raw_path.write_text(raw)
-    print(f"    raw len={len(raw)}  → {raw_path}")
-
-    parsed = extract_json_object(raw)
-    if parsed is None:
-        print("  [ERR] failed to parse JSON from VLM output")
-        return
-    valid_pids = set(pids)
-    rep = validate(parsed, valid_pids)
-    out = {"obj_id": obj_id, "shard": shard,
-           "validation": rep, "parsed": parsed}
-    parsed_path = out_dir / f"{obj_id}.parsed.json"
-    parsed_path.write_text(json.dumps(out, indent=2, ensure_ascii=False))
-    print(f"  parsed: ok={rep['ok']} kept={rep['n_kept_edits']}/{len(parsed.get('edits', []))} "
-          f"types={rep.get('type_counts')}")
-    if rep["errors"]:
-        print(f"  ERRORS: {rep['errors']}")
-    if rep["warnings"]:
-        print(f"  WARNINGS ({len(rep['warnings'])} edits with issues):")
-        for w in rep["warnings"][:5]:
-            print(f"    {w}")
-    print(f"    → {parsed_path}")
-
-
-def prerender_one(obj_id: str, shard: str, mesh_root: Path, images_root: Path,
-                  blender: str, out_dir: Path):
-    """Render overview + build menu. Returns (obj_id, png, user_prompt, pids, quota) or None."""
-    try:
-        mesh_npz = mesh_root / shard / f"{obj_id}.npz"
-        img_npz = images_root / shard / f"{obj_id}.npz"
-        pids, menu = build_part_menu(mesh_npz, img_npz)
-        if len(pids) > MAX_PARTS:
-            print(f"  [SKIP] {obj_id}: {len(pids)} parts > MAX_PARTS={MAX_PARTS}")
-            return None
-        quota = quota_for(len(pids))
-        png = render_overview_png(mesh_npz, img_npz, blender)
-        (out_dir / f"{obj_id}.overview.png").write_bytes(png)
-        user_msg = USER_PROMPT_TEMPLATE.format(
-            part_menu=menu, n_total=sum(quota.values()),
-            n_deletion=quota["deletion"], n_modification=quota["modification"],
-            n_scale=quota["scale"], n_material=quota["material"],
-            n_global=quota["global"])
-        return obj_id, png, user_msg, pids, quota
-    except Exception as e:
-        print(f"  [PRERENDER FAIL] {obj_id}: {e}")
-        return None
-
-
-async def vlm_one(client, obj_id, png, user_msg, valid_pids, quota, model, out_dir, sem):
-    async with sem:
-        t0 = time.time()
-        try:
-            raw = await call_vlm_async(client, png, SYSTEM_PROMPT, user_msg, model,
-                                       max_tokens=12288)
-        except Exception as e:
-            print(f"  [VLM FAIL] {obj_id}: {e}")
-            return obj_id, None
-        dt = time.time() - t0
-        (out_dir / f"{obj_id}.raw.txt").write_text(raw)
-        parsed = extract_json_object(raw)
-        if parsed is None:
-            print(f"  [{obj_id}] {dt:.1f}s  PARSE_ERROR  raw_len={len(raw)}")
-            return obj_id, None
-        rep = validate(parsed, set(valid_pids), quota=quota)
-        out = {"obj_id": obj_id, "validation": rep, "parsed": parsed}
-        (out_dir / f"{obj_id}.parsed.json").write_text(
-            json.dumps(out, indent=2, ensure_ascii=False))
-        target = sum(quota.values())
-        print(f"  [{obj_id}] {dt:.1f}s  N={len(valid_pids)}  ok={rep['ok']}  "
-              f"kept={rep['n_kept_edits']}/{target}  types={rep.get('type_counts')}")
-        return obj_id, rep
-
-
-async def run_async(args, jobs):
-    from openai import AsyncOpenAI
-    urls = [u.strip() for u in args.vlm_url.split(",") if u.strip()]
-    clients = [AsyncOpenAI(base_url=u, api_key="EMPTY") for u in urls]
-    # One semaphore per server → each server stays sequential (avoid KV thrash)
-    sems = [asyncio.Semaphore(1) for _ in clients]
-    print(f"  using {len(clients)} VLM server(s): {urls}")
-    tasks = []
-    for i, (oid, png, msg, pids, quota) in enumerate(jobs):
-        idx = i % len(clients)
-        tasks.append(vlm_one(clients[idx], oid, png, msg, pids, quota,
-                             args.vlm_model, args.out_dir, sems[idx]))
-    results = await asyncio.gather(*tasks)
-    return results
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--obj-ids", nargs="+", required=True)
-    ap.add_argument("--shard", default="01")
-    ap.add_argument("--mesh-root", default="data/partverse/mesh", type=Path)
-    ap.add_argument("--images-root", default="data/partverse/images", type=Path)
-    ap.add_argument("--blender",
-                    default="/Node11_nvme/artgen/lac/.tools/blender-4.2.0-linux-x64/blender")
-    ap.add_argument("--vlm-url", default="http://localhost:8002/v1")
-    ap.add_argument("--vlm-model", default="Qwen3.5-27B")
-    ap.add_argument("--out-dir", type=Path,
-                    default=Path("outputs/_debug/phase1_v2"))
-    ap.add_argument("--concurrency", type=int, default=1,
-                    help="Max concurrent VLM requests. Default 1 (sequential). "
-                         "Higher values cause KV-cache thrashing on this 27B model — "
-                         "use multi-GPU servers for parallelism instead.")
-    args = ap.parse_args()
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Phase A: pre-render all overviews + build menus (sequential, fast with Workbench)
-    print(f"[A] Pre-rendering {len(args.obj_ids)} overviews…")
-    t0 = time.time()
-    jobs = []
-    for oid in args.obj_ids:
-        r = prerender_one(oid, args.shard, args.mesh_root, args.images_root,
-                          args.blender, args.out_dir)
-        if r is not None:
-            jobs.append(r)
-    print(f"[A] Done in {time.time() - t0:.1f}s ({len(jobs)}/{len(args.obj_ids)} ok)")
-
-    # Phase B: concurrent VLM calls
-    print(f"[B] Calling VLM with concurrency={args.concurrency}…")
-    t0 = time.time()
-    results = asyncio.run(run_async(args, jobs))
-    dt = time.time() - t0
-    n_ok = sum(1 for _, r in results if r and r.get("ok"))
-    n_total = len(results)
-    print(f"[B] Done in {dt:.1f}s — {n_ok}/{n_total} ok  "
-          f"({dt/max(1,n_total):.1f}s/obj wall, "
-          f"{dt*args.concurrency/max(1,n_total):.1f}s/obj cpu-equiv)")
-
-
-if __name__ == "__main__":
-    main()
+__all__ = [
+    "SYSTEM_PROMPT", "USER_PROMPT_TEMPLATE", "MAX_PARTS",
+    "EDIT_TYPES", "ALLOWED_VERBS", "REQUIRED_AFTER_FIELDS", "N_VIEWS",
+    "build_part_menu", "render_overview_png",
+    "call_vlm", "call_vlm_async",
+    "extract_json_object", "validate", "quota_for",
+]

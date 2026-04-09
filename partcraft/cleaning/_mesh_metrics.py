@@ -295,7 +295,7 @@ def metric_penetration(new_part: trimesh.Trimesh, body: trimesh.Trimesh,
     """New part shouldn't be mostly inside the body mesh. For swap/graft."""
     max_pen = cfg["phase3"].get("max_penetration", 0.3)
     try:
-        from partcraft.phase2_assembly.alignment import compute_penetration_ratio
+        from partcraft.trellis.alignment import compute_penetration_ratio
         pen = compute_penetration_ratio(new_part, body)
     except Exception:
         pen = 0.0
@@ -311,7 +311,7 @@ def metric_gap_distance(new_part: trimesh.Trimesh, body: trimesh.Trimesh,
     if max_gap <= 0:
         return MetricResult("gap_distance", 0.0, True, weight=1.0)
     try:
-        from partcraft.phase2_assembly.alignment import compute_gap_distance
+        from partcraft.trellis.alignment import compute_gap_distance
         gap = compute_gap_distance(new_part, body)
         extent = body.bounding_box.extents.max()
         ratio = gap / max(extent, 1e-8)

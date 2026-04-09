@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Standalone 2D edit utility.
 
-This script is soft-archived for debugging/offline generation. For the main
-pipeline path, prefer `scripts/run_pipeline.py --steps 3`.
+This module is imported by ``partcraft.pipeline_v2.s4_flux_2d`` (Step 4)
+and ``partcraft.pipeline_v2.s5_3d_utils`` to provide 2D image editing helpers.
 
 Phase 2D: Batch 2D image editing for TRELLIS-bound edit specs.
 
@@ -47,7 +47,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from partcraft.utils.config import load_config
 from partcraft.utils.logging import setup_logging
 from partcraft.io.hy3d_loader import HY3DPartDataset
-from partcraft.phase1_planning.planner import EditSpec
+from partcraft.pipeline_v2.specs import EditSpec
 
 
 def select_best_view(obj_record, edit_part_ids: list[int]) -> int:
@@ -310,18 +310,18 @@ def process_one(spec: EditSpec, dataset, client, output_dir: Path,
     try:
         obj = dataset.load_object(spec.shard, spec.obj_id)
         if spec.edit_type == "deletion":
-            edit_part_ids = spec.remove_part_ids
+            edit_part_ids = spec.selected_part_ids
         elif spec.edit_type == "global":
             edit_part_ids = []  # no specific part — whole object
-        elif spec.edit_type == "modification" and spec.remove_part_ids:
+        elif spec.edit_type == "modification" and spec.selected_part_ids:
             # Group modification: use all parts in the group
-            edit_part_ids = spec.remove_part_ids
+            edit_part_ids = spec.selected_part_ids
         else:
-            edit_part_ids = [spec.old_part_id]
+            edit_part_ids = [spec.selected_part_ids[0]] if spec.selected_part_ids else []
 
         # 1. Select best view — prefer Step 1's orthogonal selection
-        if hasattr(spec, 'best_view') and spec.best_view >= 0:
-            best_view = spec.best_view
+        if hasattr(spec, 'npz_view') and spec.npz_view >= 0:
+            best_view = spec.npz_view
         else:
             best_view = select_best_view(obj, edit_part_ids or
                                          [p.part_id for p in obj.parts])
@@ -335,13 +335,13 @@ def process_one(spec: EditSpec, dataset, client, output_dir: Path,
         pil_img.save(str(input_path))
 
         # 3. Edit image — local server or API
-        after_desc = spec.after_desc or spec.after_part_desc or ""
-        before_desc = getattr(spec, 'before_part_desc', '') or ''
+        after_desc = spec.new_parts_desc or ""
+        before_desc = spec.target_part_desc or ''
 
         # Build part label: use all remove_labels for groups,
         # fallback to old_label for single-part edits
-        remove_labels = getattr(spec, 'remove_labels', [])
-        old_label = getattr(spec, 'old_label', '') or ''
+        remove_labels = spec.part_labels
+        old_label = spec.part_labels[0] if spec.part_labels else ''
         if remove_labels and len(remove_labels) > 1:
             part_label = ", ".join(remove_labels)
         elif remove_labels:
@@ -351,12 +351,12 @@ def process_one(spec: EditSpec, dataset, client, output_dir: Path,
 
         if edit_server_url is not None:
             edited = call_local_edit(
-                edit_server_url, img_bytes, spec.edit_prompt, after_desc,
+                edit_server_url, img_bytes, spec.prompt, after_desc,
                 old_part_label=part_label, before_part_desc=before_desc,
                 edit_type=spec.edit_type)
         else:
             edited = call_vlm_edit(
-                client, img_bytes, spec.edit_prompt,
+                client, img_bytes, spec.prompt,
                 after_desc, model,
                 old_part_label=part_label, before_part_desc=before_desc,
                 edit_type=spec.edit_type)
@@ -520,7 +520,7 @@ def main():
         if args.workers <= 1:
             for i, spec in enumerate(pending):
                 logger.info(f"[{i+1}/{len(pending)}] {spec.edit_id}: "
-                            f"{spec.edit_prompt[:60]}...")
+                            f"{spec.prompt[:60]}...")
                 result = process_one(spec, dataset, client, output_dir,
                                      model, logger,
                                      edit_server_url=edit_server_url)

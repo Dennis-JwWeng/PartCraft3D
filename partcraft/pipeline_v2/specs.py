@@ -32,10 +32,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from .paths import EDIT_TYPE_PREFIX, FLUX_TYPES, ObjectContext
-
-# Phase1 VLM view_index ∈ [0,4] → NPZ frame index in the partverse images
-# npz. Must stay in lockstep with ``scripts/tools/render_part_overview.py``.
-VIEW_INDICES: tuple[int, ...] = (89, 90, 91, 100, 8)
+from .s1_vlm_core import VIEW_INDICES  # single source of truth; defined in s1_vlm_core.py
 
 
 @dataclass
@@ -55,6 +52,15 @@ class EditSpec:
     new_parts_desc: str = ""
     edit_params: dict[str, Any] = field(default_factory=dict)
     object_desc: str = ""
+    # VLM-generated S1/S2 decompositions — all default to "" for backward
+    # compat with old parsed.json files.  build_prompts_from_spec falls back
+    # to _decompose_local() when these are empty.
+    object_desc_s1: str = ""     # object.full_desc_stage1 (geometry-only)
+    object_desc_s2: str = ""     # object.full_desc_stage2 (appearance-only)
+    after_desc_s1: str = ""      # edit.after_desc_stage1  (non-deletion)
+    after_desc_s2: str = ""      # edit.after_desc_stage2  (non-deletion)
+    new_parts_desc_s1: str = ""  # edit.new_parts_desc_stage1 (modification)
+    new_parts_desc_s2: str = ""  # edit.new_parts_desc_stage2 (modification)
 
     # ─── factory ─────────────────────────────────────────────────────
 
@@ -67,6 +73,8 @@ class EditSpec:
         seq: int,
         parts_by_id: dict[int, dict],
         object_desc: str,
+        object_desc_s1: str = "",
+        object_desc_s2: str = "",
     ) -> "EditSpec":
         et = edit.get("edit_type", "?")
         vi = int(edit.get("view_index", 0))
@@ -90,6 +98,12 @@ class EditSpec:
                             or edit.get("target_part_desc") or ""),
             edit_params=dict(edit.get("edit_params") or {}),
             object_desc=object_desc,
+            object_desc_s1=object_desc_s1,
+            object_desc_s2=object_desc_s2,
+            after_desc_s1=edit.get("after_desc_stage1") or "",
+            after_desc_s2=edit.get("after_desc_stage2") or "",
+            new_parts_desc_s1=edit.get("new_parts_desc_stage1") or "",
+            new_parts_desc_s2=edit.get("new_parts_desc_stage2") or "",
         )
 
     # ─── interop ─────────────────────────────────────────────────────
@@ -132,16 +146,24 @@ class EditSpec:
 
 # ─────────────────── parsing helpers ──────────────────────────────────
 
-def _load_parsed(ctx: ObjectContext) -> tuple[list[dict], dict[int, dict], str]:
-    """Return ``(edits, parts_by_id, object_desc)`` from parsed.json."""
+def _load_parsed(
+    ctx: ObjectContext,
+) -> tuple[list[dict], dict[int, dict], str, str, str]:
+    """Return ``(edits, parts_by_id, object_desc, object_desc_s1, object_desc_s2)``."""
     if not ctx.parsed_path.is_file():
-        return [], {}, ""
+        return [], {}, "", "", ""
     j = json.loads(ctx.parsed_path.read_text())
     parsed = j.get("parsed") or {}
     obj = parsed.get("object") or {}
     parts_by_id = {p["part_id"]: p for p in (obj.get("parts") or [])
                    if isinstance(p, dict) and "part_id" in p}
-    return (parsed.get("edits") or []), parts_by_id, obj.get("full_desc", "") or ""
+    return (
+        parsed.get("edits") or [],
+        parts_by_id,
+        obj.get("full_desc", "") or "",
+        obj.get("full_desc_stage1", "") or "",
+        obj.get("full_desc_stage2", "") or "",
+    )
 
 
 # ─────────────────── public iterators ─────────────────────────────────
@@ -149,7 +171,7 @@ def _load_parsed(ctx: ObjectContext) -> tuple[list[dict], dict[int, dict], str]:
 def iter_all_specs(ctx: ObjectContext) -> Iterator[EditSpec]:
     """Yield every spec for the object in parsed-edits order, with
     correct edit_id sequencing across types."""
-    edits, parts_by_id, object_desc = _load_parsed(ctx)
+    edits, parts_by_id, object_desc, object_desc_s1, object_desc_s2 = _load_parsed(ctx)
     flux_seq = 0
     del_seq = 0
     for idx, e in enumerate(edits):
@@ -167,7 +189,8 @@ def iter_all_specs(ctx: ObjectContext) -> Iterator[EditSpec]:
         else:
             continue
         yield EditSpec.from_parsed_edit(
-            ctx, idx, e, seq, parts_by_id, object_desc
+            ctx, idx, e, seq, parts_by_id,
+            object_desc, object_desc_s1, object_desc_s2,
         )
 
 

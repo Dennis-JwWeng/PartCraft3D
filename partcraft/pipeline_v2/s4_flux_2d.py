@@ -8,10 +8,6 @@ a pool of FLUX servers, writing into ``ctx.edits_2d_dir``::
         {edit_id}_input.png
         {edit_id}_edited.png
 
-The legacy worker expects a ``partcraft.phase1_planning.planner.EditSpec``
-dataclass; we adapt our :class:`partcraft.pipeline_v2.specs.EditSpec`
-via ``to_legacy_dict()``.
-
 Multi-server scheduling matches the legacy
 ``scripts.standalone.run_phase1_v2_2d_edit``: round-robin URL
 assignment, ``workers = max(N, N * workers_per_server)``,
@@ -34,7 +30,6 @@ from typing import Iterable
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT))
 
-from partcraft.phase1_planning.planner import EditSpec as LegacyEditSpec  # noqa: E402
 from scripts.run_2d_edit import process_one, check_edit_server  # noqa: E402
 
 from .paths import ObjectContext
@@ -50,8 +45,6 @@ class Flux2DResult:
     n_skip: int = 0
 
 
-def _to_legacy(spec: EditSpec) -> LegacyEditSpec:
-    return LegacyEditSpec(**spec.to_legacy_dict())
 
 
 def _live_servers(urls: list[str]) -> list[str]:
@@ -110,7 +103,7 @@ def run(
         for i, (ctx, spec) in enumerate(jobs):
             url = live[i % len(live)]
             fut = pool.submit(
-                process_one, _to_legacy(spec), dataset, None,
+                process_one, spec, dataset, None,
                 ctx.edits_2d_dir, "flux", log, edit_server_url=url,
             )
             futures[fut] = (ctx, spec)

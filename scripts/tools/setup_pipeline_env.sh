@@ -13,7 +13,7 @@ if [[ "${SHOW_HELP}" == "1" ]]; then
   cat <<EOF
 Usage: bash scripts/tools/setup_pipeline_env.sh [options]
 
-Setup pipeline runtime environment (run_pipeline.py / run_streaming.py).
+Setup pipeline runtime environment for partcraft.pipeline_v2.
 Installs all required dependencies including CUDA-matched spconv, attention
 backend (flash_attn preferred, xformers as fallback), and warp-lang.
 

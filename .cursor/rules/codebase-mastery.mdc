@@ -12,26 +12,63 @@ Use these habits so the agent builds a reliable model before editing and keeps c
 Human-written docs live under **`docs/`** at the repository root (not under `.cursor/`). **Read them when changing architecture, pipeline behavior, data layout, or historical decisions.**
 
 | Path | Role |
-|------|------|
+|---|---|
 | `docs/ARCH.md` | **Primary architecture & data contracts** — pipeline steps, configs, I/O layout. Prefer this over guessing. |
 | `docs/AI_LOG.md` | Chronological decisions and migrations; cross-check with **current code** if something looks stale. |
 | `docs/Explore.md` | Exploration / notes as applicable. |
 
-**How to “see” docs:** open these paths in the workspace (same as any file), or ask to read `docs/ARCH.md` (or a section) before large edits. Do not assume behavior that is only documented in chat — **verify in `docs/` + code.**
+**How to "see" docs:** open these paths in the workspace (same as any file), or ask to read `docs/ARCH.md` (or a section) before large edits. Do not assume behavior that is only documented in chat — **verify in `docs/` + code.**
+
+## Canonical Entrypoint (唯一编排入口)
+
+There is **exactly one** production pipeline entrypoint:
+
+- **Python**: `python -m partcraft.pipeline_v2.run --config <yaml> --shard <NN> --all --phase <A|C|D|D2|E|F>`
+- **Shell**: `bash scripts/tools/run_pipeline_v2_shard.sh <tag> <config_yaml>`
+
+All new orchestration capability goes into `partcraft/pipeline_v2/`. **Do NOT create** new top-level `scripts/run_*.py` or `scripts/pipeline_*.py` files — these patterns were deliberately eliminated.
+
+## Module Map (清洗后的模块位置)
+
+| Module | Role | Modify rule |
+|---|---|---|
+| `partcraft/pipeline_v2/` | Sole orchestration layer (s1–s7 steps, scheduler, specs, paths, status, validators) | Extend here for new pipeline capability |
+| `partcraft/pipeline_v2/s1_vlm_core.py` | VLM prompts, build_part_menu, call_vlm_async, validate, quota_for | Edit when changing Phase A VLM logic |
+| `partcraft/trellis/refiner.py` | TrellisRefiner — 3D editing core (1400+ lines) | Track all callers before changing field names |
+| `partcraft/trellis/alignment.py` | Geometry utils (penetration ratio, gap distance) | Used by `partcraft/cleaning/_mesh_metrics.py` |
+| `partcraft/cleaning/vlm_filter.py` | VLM quality judging (8-dim score, 3-view render) | Used by `scripts/tools/run_vlm_cleaning.py` |
+| `partcraft/cleaning/_mesh_metrics.py` | Mesh quality prefilter | Internal to cleaning pipeline |
+| `scripts/run_2d_edit.py` | FLUX 2D edit service calls (`process_one`, `call_local_edit`) | Uses `pipeline_v2.specs.EditSpec` fields |
+| `scripts/tools/run_vlm_cleaning.py` | VLM quality filter runner | Imports from `partcraft.cleaning` |
+
+## EditSpec contract
+
+`partcraft/pipeline_v2/specs.EditSpec` is the **single** spec type in the codebase. Key fields (used by trellis/refiner.py, run_2d_edit.py, s4, s5):
+
+| Field | Meaning |
+|---|---|
+| `prompt` | Edit instruction text (was `edit_prompt` in old pipeline) |
+| `selected_part_ids` | Target part IDs (was `remove_part_ids` / `old_part_id`) |
+| `new_parts_desc` | After-edit description (was `after_desc`) |
+| `target_part_desc` | Before-edit part description (was `before_part_desc`) |
+| `part_labels` | Text labels for selected parts (was `remove_labels`) |
+| `npz_view` | Best view frame index (was `best_view`) |
+
+Do **not** use `to_legacy_dict()` — it exists only for backwards-compat serialization. Pass `EditSpec` directly.
 
 ## Config-driven behavior & environment isolation
 
 Code must remain **adaptable across hosts** (paths, GPUs, conda envs, NFS mounts). Enforce:
 
-- **No hardcoded machine paths** in logic that should be configurable (data roots, checkpoints, outputs). Use **YAML config**, **`configs/machine/*.env`**, and documented **env overrides** (e.g. `PARTCRAFT_DATA_ROOT`) as the project already does — **extend that pattern** instead of embedding `/mnt/...` in new code.
-- **Single source of truth:** behavior switches belong in config or env, not scattered literals. When adding a path or toggle, wire it through the same loading path as sibling options (see `partcraft/utils/config.py` and existing scripts).
-- **Secrets & local state** stay out of committed defaults; document optional vars in comments or `docs/`, not only in one machine’s shell history.
-- **When suggesting commands** for the user, prefer placeholders or env-backed paths (`$DATA_DIR`, config values) over copying one developer’s absolute paths unless the task is explicitly bound to that host.
+- **No hardcoded machine paths** in logic that should be configurable. Use **YAML config**, **`configs/machine/*.env`**, and documented **env overrides** — extend that pattern instead of embedding `/mnt/...` in new code.
+- **Single source of truth:** behavior switches belong in config or env, not scattered literals. Wire new paths/toggles through `partcraft/utils/config.py`.
+- **Secrets & local state** stay out of committed defaults.
+- **When suggesting commands**, prefer placeholders (`$DATA_DIR`, config values) over absolute machine paths.
 
 ## 1. Orient from the outside in
 
-- After skimming `docs/ARCH.md`, locate **entrypoints** (CLI, `scripts/run_pipeline.py`, `package.json` / `pyproject` scripts).
-- Sketch **dependency direction**: scripts → `partcraft/` → `third_party/`. Do not reverse layers without an explicit design reason.
+- After skimming `docs/ARCH.md`, locate the **single entrypoint**: `python -m partcraft.pipeline_v2.run`.
+- Sketch **dependency direction**: `pipeline_v2/` → `partcraft/trellis/` + `partcraft/cleaning/` + `scripts/run_2d_edit.py` → `third_party/`. Do not reverse layers without an explicit design reason.
 
 ## 2. Establish ground truth in code, not memory
 
@@ -50,5 +87,5 @@ Code must remain **adaptable across hosts** (paths, GPUs, conda envs, NFS mounts
 
 ## 5. Verify when possible
 
-- Run the project’s tests/linters when available; if the environment is unknown, say what should be run.
+- Run the project's tests/linters when available; if the environment is unknown, say what should be run.
 - Distinguish **observed in repo** vs **inferred**; flag assumptions that break across machines or optional deps.
