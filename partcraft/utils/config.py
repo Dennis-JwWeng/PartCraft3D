@@ -440,6 +440,9 @@ def load_config(
         cfg = yaml.safe_load(f)
     _seed_sources_from_yaml(cfg)
 
+    from partcraft.utils.pipeline_yaml_aliases import apply_yaml_aliases
+    apply_yaml_aliases(cfg)
+
     _apply_data_roots_and_layout(cfg)
     if not for_prerender:
         _sync_pipeline_v2_data_paths(cfg)

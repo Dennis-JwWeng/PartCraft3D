@@ -104,9 +104,12 @@ def flux_urls_for(cfg: dict) -> list[str]:
 # ─────────────────── phase plan ───────────────────────────────────────
 
 def phases_for(cfg: dict) -> list[Phase]:
-    raw_list = _pipeline(cfg).get("phases") or []
+    from partcraft.utils.pipeline_yaml_aliases import apply_yaml_aliases
+    apply_yaml_aliases(cfg)
+    p = _pipeline(cfg)
+    raw_list = p.get("stages") or p.get("phases") or []
     if not raw_list:
-        raise ValueError("[CONFIG] pipeline.phases is empty")
+        raise ValueError("[CONFIG] pipeline.stages (or legacy pipeline.phases) is empty")
     out: list[Phase] = []
     for entry in raw_list:
         if not isinstance(entry, dict):
@@ -143,11 +146,21 @@ def select_phases(
     return [p for p in phases if with_optional or not p.optional]
 
 
+def get_stage(cfg: dict, name: str) -> Phase:
+    for st in phases_for(cfg):
+        if st.name == name:
+            return st
+    raise KeyError(f"stage {name!r} not in config")
+
+
 def get_phase(cfg: dict, name: str) -> Phase:
-    for p in phases_for(cfg):
-        if p.name == name:
-            return p
-    raise KeyError(f"phase {name!r} not in config")
+    """Backward-compatible alias for :func:`get_stage`."""
+    return get_stage(cfg, name)
+
+
+def stages_for(cfg: dict) -> list[Phase]:
+    """Alias for :func:`phases_for` (reads ``pipeline.stages`` or ``pipeline.phases``)."""
+    return phases_for(cfg)
 
 
 # ─────────────────── shell-eval dump ──────────────────────────────────
@@ -176,6 +189,8 @@ def dump_shell_env(cfg: dict, phase_name: str | None = None) -> str:
         f"FLUX_PORTS=({' '.join(str(flux_port(cfg, i)) for i in range(len(gpus)))})",
         f"DEFAULT_PHASES=({' '.join(p.name for p in select_phases(cfg))})",
         f"ALL_PHASES=({' '.join(p.name for p in phases_for(cfg))})",
+        f"DEFAULT_STAGES=({' '.join(p.name for p in select_phases(cfg))})",
+        f"ALL_STAGES=({' '.join(p.name for p in phases_for(cfg))})",
     ]
     if phase_name:
         ph = get_phase(cfg, phase_name)
@@ -195,6 +210,6 @@ __all__ = [
     "gpus_for", "n_gpus",
     "vlm_port", "flux_port",
     "vlm_urls_for", "flux_urls_for",
-    "phases_for", "select_phases", "get_phase",
+    "phases_for", "stages_for", "select_phases", "get_phase", "get_stage",
     "dump_shell_env",
 ]

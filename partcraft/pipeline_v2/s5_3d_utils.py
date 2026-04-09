@@ -87,7 +87,7 @@ def resolve_2d_conditioning(
                 edit_url = str(p25_cfg.get("image_edit_base_url", "")).strip()
                 if not edit_url:
                     raise ValueError(
-                        "[CONFIG_ERROR] phase2_5.image_edit_base_url <missing> config "
+                        "[CONFIG_ERROR] phase2_5.image_edit_base_url / services.image_edit.base_urls <missing> config "
                         "local_diffusers backend requires explicit URL"
                     )
                 edited = call_local_edit(

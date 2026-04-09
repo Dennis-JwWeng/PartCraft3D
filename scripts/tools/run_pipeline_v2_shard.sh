@@ -56,7 +56,7 @@ LOG_DIR="logs/v2_${TAG}"
 mkdir -p "$LOG_DIR"
 
 # ─── ask python for the run plan ─────────────────────────────────────
-# Sets: GPUS=(...) VLM_PORTS=(...) FLUX_PORTS=(...) DEFAULT_PHASES=(...)
+# Sets: GPUS=(...) VLM_PORTS=(...) FLUX_PORTS=(...) DEFAULT_STAGES/DEFAULT_PHASES=(...)
 plan=$(
     "$PY_PIPE" -c "
 import sys, yaml
@@ -66,16 +66,26 @@ print(dump_shell_env(cfg))
 "
 )
 eval "$plan"
+# Backward compat if an older scheduler omitted *_STAGES arrays
+if [ ${#ALL_STAGES[@]} -eq 0 ] && [ ${#ALL_PHASES[@]} -gt 0 ]; then
+    ALL_STAGES=("${ALL_PHASES[@]}")
+fi
+if [ ${#DEFAULT_STAGES[@]} -eq 0 ] && [ ${#DEFAULT_PHASES[@]} -gt 0 ]; then
+    DEFAULT_STAGES=("${DEFAULT_PHASES[@]}")
+fi
 N_GPUS=${#GPUS[@]}
 N_VLM_SERVERS="${N_VLM_SERVERS:-$N_GPUS}"
 
-# Phase selection: env PHASES override > default selection
-if [ -n "${PHASES:-}" ]; then
+# Stage selection: STAGES (preferred) > PHASES (deprecated) > default
+if [ -n "${STAGES:-}" ]; then
+    IFS=',' read -r -a SELECTED_PHASES <<< "$STAGES"
+elif [ -n "${PHASES:-}" ]; then
+    echo "[WARN] PHASES is deprecated; use STAGES" >&2
     IFS=',' read -r -a SELECTED_PHASES <<< "$PHASES"
 elif [ "$WITH_OPTIONAL" = "1" ]; then
-    SELECTED_PHASES=("${ALL_PHASES[@]}")
+    SELECTED_PHASES=("${ALL_STAGES[@]}")
 else
-    SELECTED_PHASES=("${DEFAULT_PHASES[@]}")
+    SELECTED_PHASES=("${DEFAULT_STAGES[@]}")
 fi
 
 echo "============================================================"
@@ -86,7 +96,7 @@ echo "  config      : $CFG"
 echo "  gpus        : ${GPUS[*]}  (N=$N_GPUS)"
 echo "  vlm_ports   : ${VLM_PORTS[*]}"
 echo "  flux_ports  : ${FLUX_PORTS[*]}"
-echo "  phases      : ${SELECTED_PHASES[*]}"
+echo "  stages      : ${SELECTED_PHASES[*]}"
 echo "  log dir     : $LOG_DIR"
 echo "============================================================"
 

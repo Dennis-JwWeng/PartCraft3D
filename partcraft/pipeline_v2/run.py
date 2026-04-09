@@ -8,6 +8,8 @@ Single entrypoint that selects which steps to run on which objects::
         --steps s1,s2,s4,s5,s6,s5b,s6b,s7 \\
         --obj-ids ABCDE...                # or --all (use existing object dirs)
 
+Stages (``pipeline.stages`` / legacy ``phases``) map to steps via ``--stage``.
+
 Per-step shape::
 
     s1 / s2 / s4   single process, multi-server fan-out where applicable
@@ -56,6 +58,8 @@ GPU_STEPS = frozenset({"s5", "s6", "s6b"})
 def load_config(path: Path) -> dict:
     cfg = yaml.safe_load(path.read_text())
     cfg.setdefault("data", {})
+    from partcraft.utils.pipeline_yaml_aliases import apply_yaml_aliases
+    apply_yaml_aliases(cfg)
     cfg.setdefault("phase2_5", {})
     return cfg
 
@@ -178,7 +182,7 @@ def run_step(
                 if getattr(args, "flux_url", None)
                 else sched.flux_urls_for(cfg))
         if not urls:
-            raise SystemExit("[CONFIG] no FLUX urls (set pipeline.gpus or phase2_5.image_edit_base_urls)")
+            raise SystemExit("[CONFIG] no FLUX urls (set pipeline.gpus or phase2_5.image_edit_base_urls / services.image_edit.base_urls)")
         s4_run(ctxs, edit_urls=urls,
                workers_per_server=cfg.get("phase2_5", {}).get("workers_per_server", 2),
                images_root=images_root, mesh_root=mesh_root, shard=shard,
@@ -297,10 +301,12 @@ def main():
     grp.add_argument("--all", action="store_true")
     ap.add_argument("--steps", default=None,
                     help=f"comma list, any of: {','.join(ALL_STEPS)} "
-                         "(mutually exclusive with --phase)")
+                         "(mutually exclusive with --stage/--phase)")
+    ap.add_argument("--stage", default=None,
+                    help="run a single pipeline stage by name (e.g. A,C,D) "
+                         "using pipeline.stages from the config")
     ap.add_argument("--phase", default=None,
-                    help="run a single phase by name (uses pipeline.phases "
-                         "from the config to derive steps + gpus + use_gpus)")
+                    help="deprecated: use --stage (same behavior)")
     ap.add_argument("--gpus", default=None,
                     help="comma list e.g. 4,5,6,7. If omitted, falls back "
                          "to pipeline.gpus from the config when needed.")
@@ -341,13 +347,19 @@ def main():
         print(json.dumps(manifest_summary(root), indent=2))
         return
 
-    # Resolve steps + use_gpus from --phase or --steps
+    # Resolve steps + use_gpus from --stage/--phase or --steps
+    if args.stage is not None and args.phase is not None:
+        raise SystemExit("[CLI] use only one of --stage or --phase")
+    run_stage = args.stage if args.stage is not None else args.phase
+    if args.phase is not None and args.stage is None:
+        LOG.warning("--phase is deprecated; use --stage")
+
     phase_use_gpus = False
-    if args.phase:
-        ph = sched.get_phase(cfg, args.phase)
+    if run_stage:
+        ph = sched.get_stage(cfg, run_stage)
         steps = list(ph.steps)
         phase_use_gpus = ph.use_gpus
-        LOG.info("phase %s (%s): steps=%s use_gpus=%s",
+        LOG.info("stage %s (%s): steps=%s use_gpus=%s",
                  ph.name, ph.desc, steps, phase_use_gpus)
     elif args.steps:
         steps = [s.strip() for s in args.steps.split(",") if s.strip()]
@@ -358,7 +370,7 @@ def main():
         raise SystemExit(f"unknown steps: {bad}")
 
     # Resolve gpu list: explicit --gpus first, then pipeline.gpus
-    if args.gpus is None and (phase_use_gpus or args.phase):
+    if args.gpus is None and (phase_use_gpus or run_stage):
         try:
             gpus_list = sched.gpus_for(cfg)
             args.gpus = ",".join(str(g) for g in gpus_list)
@@ -371,7 +383,7 @@ def main():
         # asked for it (or the user passed --gpus explicitly).
         wants_dispatch = (step in GPU_STEPS
                           and args.gpus
-                          and (phase_use_gpus or not args.phase)
+                          and (phase_use_gpus or not run_stage)
                           and not args.single_gpu)
         if wants_dispatch:
             rc = dispatch_gpus(step, args.config, args)
