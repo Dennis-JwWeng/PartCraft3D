@@ -136,3 +136,35 @@ class TestPostObjectFn:
 
         assert len(results) == 1
         assert results[0].ok is True
+
+    def test_hook_exception_does_not_abort_loop(self, tmp_path):
+        """A raising post_object_fn must not prevent other objects from completing."""
+        from partcraft.pipeline_v2.s1_phase1_vlm import run_many_streaming
+
+        ctxs = [_make_ctx(tmp_path, f"obj_{i:03d}") for i in range(3)]
+
+        async def _fake_call_one(client, ctx, png, user_msg, pids, quota,
+                                  model, sem, *, part_menu=""):
+            ctx.parsed_path.write_text(
+                json.dumps({"parsed": {"edits": [], "object": {"parts": []}}})
+            )
+            from partcraft.pipeline_v2.status import update_step, STATUS_OK
+            update_step(ctx, "s1_phase1", status=STATUS_OK, n_edits=0, resumed=False)
+            return Phase1Result(ctx.obj_id, ok=True)
+
+        async def _bad_hook(ctx, vlm_url):
+            raise RuntimeError("sq1 exploded")
+
+        with _stream_patches(), \
+             patch("partcraft.pipeline_v2.s1_phase1_vlm._prerender_worker",
+                   return_value=FAKE_PRE), \
+             patch("partcraft.pipeline_v2.s1_phase1_vlm._call_one",
+                   side_effect=_fake_call_one):
+            results = _run(run_many_streaming(
+                ctxs, blender="/fake/blender",
+                vlm_urls=["http://fake:8002/v1"], vlm_model="fake-model",
+                post_object_fn=_bad_hook, force=True,
+            ))
+
+        assert len(results) == 3
+        assert all(r.ok for r in results)

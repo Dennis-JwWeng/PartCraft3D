@@ -450,6 +450,8 @@ async def run_many_streaming(
                 log.info("s1 stream: %d/%d  ok_so_far=%d",
                          n_done, n_total,
                          sum(1 for r in results if r.ok))
+            # too_many_parts is filtered in render_one() (object never queued),
+            # so this guard is defensive — _call_one never emits that error code.
             if post_object_fn is not None and res.error != "too_many_parts":
                 try:
                     await post_object_fn(ctx, vlm_urls[idx])
