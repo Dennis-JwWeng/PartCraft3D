@@ -237,6 +237,8 @@ def run_step(
         from .sq3_qc_e import run as sq3_run
         urls = ([u.strip() for u in args.vlm_url.split(",") if u.strip()]
                 if getattr(args, "vlm_url", None) else sched.vlm_urls_for(cfg))
+        if not urls:
+            raise SystemExit("[CONFIG] no VLM urls for sq3 (set pipeline.gpus or services.vlm.base_urls)")
         sq3_run(ctxs, vlm_url=urls[0], vlm_model=psvc.vlm_model_name(cfg),
                 cfg=cfg, force=args.force)
 
