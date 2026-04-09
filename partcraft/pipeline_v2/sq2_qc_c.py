@@ -1,6 +1,5 @@
 from __future__ import annotations
 import asyncio, base64, logging
-from typing import Iterable
 import cv2, numpy as np
 from openai import AsyncOpenAI
 from .paths import ObjectContext
