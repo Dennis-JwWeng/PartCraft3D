@@ -45,6 +45,10 @@ def _dinov2_repo_root() -> Path:
     env = os.environ.get("PARTCRAFT_DINOV2_REPO", "").strip()
     if env:
         return Path(env).expanduser().resolve()
+    # Default: third_party/dinov2/ inside this repo (offline-safe, no torch hub needed)
+    _repo_bundled = Path(__file__).resolve().parent.parent / "dinov2"
+    if (_repo_bundled / "dinov2" / "hub" / "backbones.py").is_file():
+        return _repo_bundled
     return _hub_dir() / "facebookresearch_dinov2_main"
 
 

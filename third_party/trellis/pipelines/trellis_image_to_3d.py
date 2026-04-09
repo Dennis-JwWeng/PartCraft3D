@@ -69,8 +69,17 @@ class TrellisImageTo3DPipeline(Pipeline):
     def _init_image_cond_model(self, name: str):
         """
         Initialize the image conditioning model.
+        Loads from encode_asset/dinov2_hub.py which uses the official facebookresearch/dinov2
+        source bundled at third_party/dinov2/ (offline-safe, no torch.hub GitHub call).
         """
-        dinov2_model = torch.hub.load('facebookresearch/dinov2', name, pretrained=True)
+        import sys as _sys, os as _os
+        _encode_asset = _os.path.normpath(
+            _os.path.join(_os.path.dirname(__file__), '..', '..', 'encode_asset')
+        )
+        if _encode_asset not in _sys.path:
+            _sys.path.insert(0, _encode_asset)
+        from dinov2_hub import load_dinov2_vitl14_reg
+        dinov2_model = load_dinov2_vitl14_reg(pretrained=True)
         dinov2_model.eval()
         self.models['image_cond_model'] = dinov2_model
         transform = transforms.Compose([
