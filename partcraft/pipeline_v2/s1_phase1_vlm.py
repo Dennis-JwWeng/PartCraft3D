@@ -345,6 +345,7 @@ async def run_many_streaming(
     n_prerender_workers: int = 8,
     force: bool = False,
     log_every: int = 20,
+    post_object_fn=None,
 ) -> list[Phase1Result]:
     """Producer-consumer streaming s1: ``n_prerender_workers`` blender
     processes feed an asyncio queue consumed by ``len(vlm_urls)`` VLM
@@ -449,6 +450,11 @@ async def run_many_streaming(
                 log.info("s1 stream: %d/%d  ok_so_far=%d",
                          n_done, n_total,
                          sum(1 for r in results if r.ok))
+            if post_object_fn is not None and res.error != "too_many_parts":
+                try:
+                    await post_object_fn(ctx, vlm_urls[idx])
+                except Exception as _hook_exc:
+                    log.warning("post_object_fn %s: %s", ctx.obj_id[:12], _hook_exc)
 
     try:
         await asyncio.gather(producer(), *[consumer(i) for i in range(len(clients))])
