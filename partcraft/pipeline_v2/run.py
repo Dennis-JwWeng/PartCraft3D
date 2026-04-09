@@ -50,7 +50,7 @@ from . import services_cfg as psvc
 
 LOG = logging.getLogger("pipeline_v2")
 
-ALL_STEPS = ("s1", "s2", "s4", "s5", "s5b", "s6", "s6b", "s7")
+ALL_STEPS = ("s1", "s2", "sq1", "s4", "s5", "s5b", "sq2", "s6", "s6b", "s7", "sq3")
 GPU_STEPS = frozenset({"s5", "s6", "s6b"})
 
 
@@ -216,6 +216,29 @@ def run_step(
     elif step == "s7":
         from .s7_addition_backfill import run as s7_run
         s7_run(ctxs, force=args.force, logger=log)
+
+    elif step == "sq1":
+        from .sq1_qc_a import run as sq1_run
+        import asyncio
+        urls = ([u.strip() for u in args.vlm_url.split(",") if u.strip()]
+                if getattr(args, "vlm_url", None) else sched.vlm_urls_for(cfg))
+        asyncio.run(sq1_run(ctxs, vlm_urls=urls,
+                            vlm_model=psvc.vlm_model_name(cfg), force=args.force))
+
+    elif step == "sq2":
+        from .sq2_qc_c import run as sq2_run
+        import asyncio
+        urls = ([u.strip() for u in args.vlm_url.split(",") if u.strip()]
+                if getattr(args, "vlm_url", None) else sched.vlm_urls_for(cfg))
+        asyncio.run(sq2_run(ctxs, vlm_urls=urls,
+                            vlm_model=psvc.vlm_model_name(cfg), force=args.force))
+
+    elif step == "sq3":
+        from .sq3_qc_e import run as sq3_run
+        urls = ([u.strip() for u in args.vlm_url.split(",") if u.strip()]
+                if getattr(args, "vlm_url", None) else sched.vlm_urls_for(cfg))
+        sq3_run(ctxs, vlm_url=urls[0], vlm_model=psvc.vlm_model_name(cfg),
+                cfg=cfg, force=args.force)
 
     else:
         raise SystemExit(f"unknown step: {step}")
@@ -410,6 +433,7 @@ _STATUS_KEYS = {
     "s1": "s1_phase1", "s2": "s2_highlights", "s4": "s4_flux_2d",
     "s5": "s5_trellis", "s5b": "s5b_del_mesh", "s6": "s6_render_3d",
     "s6b": "s6b_del_reencode", "s7": "s7_add_backfill",
+    "sq1": "sq1_qc_A", "sq2": "sq2_qc_C", "sq3": "sq3_qc_E",
 }
 
 

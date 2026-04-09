@@ -177,6 +177,19 @@ def check_s7(ctx: ObjectContext) -> StepCheck:
     return _check_files("s7_add_backfill", paths)
 
 
+def check_sq1(ctx: ObjectContext) -> StepCheck:
+    return _check_files("sq1_qc_A", [("qc.json", ctx.qc_path)])
+
+def check_sq2(ctx: ObjectContext) -> StepCheck:
+    from .specs import iter_flux_specs
+    if not any(True for _ in iter_flux_specs(ctx)):
+        return StepCheck(step="sq2_qc_C", ok=True, expected=0, found=0, skip=True)
+    return _check_files("sq2_qc_C", [("qc.json", ctx.qc_path)])
+
+def check_sq3(ctx: ObjectContext) -> StepCheck:
+    return _check_files("sq3_qc_E", [("qc.json", ctx.qc_path)])
+
+
 VALIDATORS: dict[str, Callable[[ObjectContext], StepCheck]] = {
     "s1":  check_s1,
     "s2":  check_s2,
@@ -186,6 +199,9 @@ VALIDATORS: dict[str, Callable[[ObjectContext], StepCheck]] = {
     "s6":  check_s6,
     "s6b": check_s6b,
     "s7":  check_s7,
+    "sq1": check_sq1,
+    "sq2": check_sq2,
+    "sq3": check_sq3,
 }
 
 
