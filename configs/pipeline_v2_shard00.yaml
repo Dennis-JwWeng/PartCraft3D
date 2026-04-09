@@ -12,8 +12,8 @@ ckpt_root: /root/workspace/PartCraft3D/checkpoints
 blender: /usr/local/bin/blender
 data:
   output_dir: /mnt/zsn/data/partverse/outputs/partverse/pipeline_v2_shard00
-  mesh_root: /mnt/zsn/data/partverse/mesh
-  images_root: /mnt/zsn/data/partverse/images
+  mesh_root: /mnt/zsn/data/partverse/inputs/mesh
+  images_root: /mnt/zsn/data/partverse/inputs/images
   slat_dir: /mnt/zsn/data/partverse/slat
 pipeline:
   gpus:

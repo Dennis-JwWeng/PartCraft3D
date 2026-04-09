@@ -13,6 +13,11 @@ Each ``part_<id>.ply`` is imported as one Blender object and painted with
 ``palette[id]``. The mesh is consumed AS-IS — no recentering / rescaling — so
 the partverse-aligned coordinate frame is preserved and the camera matrices
 from ``transforms.json`` produce renders that overlay the original views.
+
+Render engine: CYCLES with emission shaders (4 samples, CPU).  This is more
+reliable than BLENDER_WORKBENCH in headless (-b) mode: Workbench's
+``film_transparent`` does not output a valid alpha channel in headless mode
+(all-zero alpha => pure white composite), while Cycles+emission does.
 """
 import argparse
 import json
@@ -25,24 +30,17 @@ from mathutils import Matrix
 
 
 def init_render(resolution=512):
-    """Workbench engine — fast flat-color rendering for part identification."""
+    """Cycles engine — flat emission rendering, 4 samples, transparent background."""
     sc = bpy.context.scene
-    sc.render.engine = 'BLENDER_WORKBENCH'
+    sc.render.engine = 'CYCLES'
+    sc.cycles.samples = 4
+    sc.cycles.use_denoising = False
+    sc.cycles.device = 'CPU'
     sc.render.resolution_x = sc.render.resolution_y = resolution
     sc.render.resolution_percentage = 100
     sc.render.image_settings.file_format = 'PNG'
     sc.render.image_settings.color_mode = 'RGBA'
     sc.render.film_transparent = True
-    # Workbench display: take color directly from material's Base Color,
-    # no lighting / shadows / specular.
-    shading = sc.display.shading
-    shading.light = 'FLAT'
-    shading.color_type = 'MATERIAL'
-    shading.show_shadows = False
-    shading.show_cavity = False
-    shading.show_object_outline = False
-    shading.show_specular_highlight = False
-    sc.display.render_aa = 'FXAA'  # cheap antialiasing
 
 
 def init_scene():
@@ -67,10 +65,18 @@ def _srgb_to_linear(c):
 
 
 def make_solid_material(name, rgb_255):
-    """Workbench FLAT/MATERIAL mode reads material.diffuse_color directly."""
+    """Emission shader: flat unlit color, correct sRGB to linear conversion."""
     r, g, b = [_srgb_to_linear(c) for c in rgb_255]
     mat = bpy.data.materials.new(name=name)
-    mat.diffuse_color = (r, g, b, 1.0)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+    emit = nodes.new('ShaderNodeEmission')
+    emit.inputs['Color'].default_value = (r, g, b, 1.0)
+    emit.inputs['Strength'].default_value = 1.0
+    out = nodes.new('ShaderNodeOutputMaterial')
+    links.new(emit.outputs['Emission'], out.inputs['Surface'])
     return mat
 
 
@@ -79,13 +85,9 @@ def init_camera():
     bpy.context.collection.objects.link(cam)
     bpy.context.scene.camera = cam
     cam.data.sensor_width = cam.data.sensor_height = 32
+    cam.data.clip_start = 0.001
+    cam.data.clip_end = 10000
     return cam
-
-
-def init_lighting():
-    """No lighting needed — Workbench FLAT shading uses material color directly."""
-    for obj in [o for o in bpy.context.scene.objects if o.type == 'LIGHT']:
-        bpy.data.objects.remove(obj, do_unlink=True)
 
 
 def main(args):
@@ -130,7 +132,6 @@ def main(args):
     print(f'[INFO] scene now has {len(bpy.data.objects)} objects total')
 
     cam = init_camera()
-    init_lighting()
 
     frames = json.loads(args.frames)
     for i, frame in enumerate(frames):
