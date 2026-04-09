@@ -173,6 +173,10 @@ class ObjectContext:
         return self.dir / "status.json"
 
     @property
+    def qc_path(self) -> Path:
+        return self.dir / "qc.json"
+
+    @property
     def phase1_dir(self) -> Path:
         return self.dir / "phase1"
 
