@@ -32,8 +32,7 @@ pipeline:
   flux_port_base: 8004
   flux_port_stride: 1
   stages:
-  - {name: A,    desc: "phase1 VLM",         servers: vlm,  steps: [s1]}
-  - {name: A_qc, desc: "QC-A instruction",   servers: vlm,  steps: [sq1]}
+  - {name: A,    desc: "phase1 VLM + QC-A",  servers: vlm,  steps: [s1, sq1]}
   - {name: B,    desc: "highlights",          servers: none, steps: [s2]}
   - {name: C,    desc: "FLUX 2D",             servers: flux, steps: [s4]}
   - {name: C_qc, desc: "QC-C 2D region",     servers: vlm,  steps: [sq2]}
