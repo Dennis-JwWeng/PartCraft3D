@@ -44,7 +44,11 @@ async def _process_one(ctx, vlm_url, vlm_model, force):
     if not ctx.parsed_path.is_file():
         update_step(ctx, "sq1_qc_A", status=STATUS_FAIL, error="missing_parsed_json")
         return {"obj_id": ctx.obj_id, "error": "missing_parsed_json"}
-    raw = json.loads(ctx.parsed_path.read_text())
+    try:
+        raw = json.loads(ctx.parsed_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        update_step(ctx, "sq1_qc_A", status=STATUS_FAIL, error=f"corrupt_parsed_json: {exc}")
+        return {"obj_id": ctx.obj_id, "error": "corrupt_parsed_json"}
     obj = (raw.get("parsed") or {}).get("object") or {}
     parts_by_id = {p["part_id"]: p for p in (obj.get("parts") or [])
                    if isinstance(p, dict) and "part_id" in p}
@@ -85,6 +89,8 @@ async def _process_one(ctx, vlm_url, vlm_model, force):
 
 
 async def run(ctxs: Iterable[ObjectContext], *, vlm_urls, vlm_model, force=False, concurrency=4):
+    if not vlm_urls:
+        raise ValueError("vlm_urls must not be empty")
     ctxs = list(ctxs); sem = asyncio.Semaphore(concurrency)
     async def _o(i, c):
         async with sem: return await _process_one(c, vlm_urls[i % len(vlm_urls)], vlm_model, force)
