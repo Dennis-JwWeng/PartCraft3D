@@ -22,6 +22,9 @@ EOF
 fi
 
 load_machine_env
+if [[ "${CHECK_ONLY}" == "1" ]]; then
+  validate_pipeline_machine_env_paths
+fi
 require_vars CONDA_ENV_SERVER
 init_conda
 

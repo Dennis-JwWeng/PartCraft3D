@@ -143,6 +143,8 @@ flowchart TD
 
 ### 机器配置驱动
 
+- **新机器 onboarding（唯一详细步骤）**：见 [`new-machine-onboarding.md`](new-machine-onboarding.md)。
+
 所有机器相关路径（conda、checkpoint、数据）集中在 `configs/machine/<hostname>.env`，脚本启动时按 `$(hostname)` 自动加载。迁移新机器只需：
 
 1. `cp configs/machine/node39.env configs/machine/<新主机名>.env`

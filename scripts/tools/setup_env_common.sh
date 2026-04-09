@@ -74,6 +74,66 @@ require_vars() {
   done
 }
 
+# Required for full pipeline_v2 (deploy + pipeline conda + ckpt roots + data roots).
+# CONDA_ENV_* values are conda environment *names*, not filesystem paths.
+PIPELINE_REQUIRED_MACHINE_VARS=(
+  CONDA_INIT
+  CONDA_ENV_SERVER
+  CONDA_ENV_PIPELINE
+  VLM_CKPT
+  EDIT_CKPT
+  TRELLIS_CKPT_ROOT
+  DATA_DIR
+  OUTPUT_ROOT
+)
+
+# Paths that must exist on disk (see validate_pipeline_machine_env_paths).
+PIPELINE_PATH_VARS=(
+  CONDA_INIT
+  VLM_CKPT
+  EDIT_CKPT
+  TRELLIS_CKPT_ROOT
+  DATA_DIR
+  OUTPUT_ROOT
+)
+
+validate_pipeline_machine_env_paths() {
+  local name val
+  require_vars "${PIPELINE_REQUIRED_MACHINE_VARS[@]}"
+
+  val="${CONDA_INIT}"
+  if [[ ! -f "${val}" ]]; then
+    echo "[ERROR] CONDA_INIT is not a file: ${val}"
+    echo "  Fix in: ${MACHINE_ENV}"
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  set +u; source "${CONDA_INIT}"; set -u
+  for name in CONDA_ENV_SERVER CONDA_ENV_PIPELINE; do
+    val="${!name}"
+    if ! conda env list 2>/dev/null | awk -v env="${val}" '$1 == env { found=1 } END { exit(found ? 0 : 1) }'; then
+      echo "[ERROR] ${name} conda env not found: ${val}"
+      echo "  Fix in: ${MACHINE_ENV}"
+      exit 1
+    fi
+  done
+
+  for name in "${PIPELINE_PATH_VARS[@]}"; do
+    [[ "${name}" == "CONDA_INIT" ]] && continue
+    val="${!name}"
+    if [[ ! -e "${val}" ]]; then
+      echo "[ERROR] ${name} path does not exist: ${val}"
+      echo "  Fix in: ${MACHINE_ENV}"
+      exit 1
+    fi
+  done
+
+  if [[ -n "${BLENDER_PATH:-}" ]] && [[ ! -f "${BLENDER_PATH}" ]] && [[ ! -x "${BLENDER_PATH}" ]]; then
+    echo "[WARN] BLENDER_PATH set but not a file: ${BLENDER_PATH}"
+  fi
+  echo "[CHECK] Machine env OK (conda envs + paths): ${PIPELINE_REQUIRED_MACHINE_VARS[*]}"
+}
+
 init_conda() {
   require_vars CONDA_INIT
   if [[ ! -f "${CONDA_INIT}" ]]; then
