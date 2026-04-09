@@ -35,6 +35,7 @@ from scripts.run_2d_edit import process_one, check_edit_server  # noqa: E402
 from .paths import ObjectContext
 from .specs import EditSpec, iter_flux_specs
 from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
+from .qc_io import is_edit_qc_failed
 
 
 @dataclass
@@ -82,6 +83,10 @@ def run(
         per_obj_results[ctx.obj_id] = Flux2DResult(ctx.obj_id)
         ctx.edits_2d_dir.mkdir(parents=True, exist_ok=True)
         for spec in iter_flux_specs(ctx):
+            if is_edit_qc_failed(ctx, spec.edit_id):
+                log.info("[s4] skip %s (qc_fail)", spec.edit_id)
+                per_obj_results[ctx.obj_id].n_skip += 1
+                continue
             out = ctx.edit_2d_output(spec.edit_id)
             if out.is_file() and not force:
                 per_obj_results[ctx.obj_id].n_skip += 1

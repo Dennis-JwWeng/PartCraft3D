@@ -46,6 +46,7 @@ from . import services_cfg as psvc
 
 from .specs import EditSpec, iter_flux_specs
 from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
+from .qc_io import is_edit_qc_failed
 
 
 GPU_TYPES = frozenset({"modification", "scale", "material", "global"})
@@ -106,6 +107,10 @@ def run_for_object(
     pending: list[EditSpec] = []
     for spec in iter_flux_specs(ctx):
         all_specs.append(spec)
+        if is_edit_qc_failed(ctx, spec.edit_id):
+            log.debug("[s5] skip %s (qc_fail)", spec.edit_id)
+            res.n_skip += 1
+            continue
         before = ctx.edit_3d_npz(spec.edit_id, "before")
         after = ctx.edit_3d_npz(spec.edit_id, "after")
         if before.is_file() and after.is_file() and not force:
