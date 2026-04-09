@@ -1,6 +1,5 @@
 from __future__ import annotations
 import logging
-from typing import Iterable
 import cv2, numpy as np
 from openai import OpenAI
 from .paths import ObjectContext
