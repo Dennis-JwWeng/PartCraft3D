@@ -165,6 +165,14 @@ async def _call_one(client, ctx: ObjectContext, png: bytes, user_msg: str,
                             error=last_error, raw_len=len(raw), attempts=2)
                 return Phase1Result(ctx.obj_id, ok=False, error=last_error)
 
+            # Normalize: Qwen sometimes nests edits inside object rather than
+            # as a top-level sibling.  Hoist to the expected schema so that
+            # validate() can find them.
+            if "edits" not in parsed and isinstance(
+                (parsed.get("object") or {}).get("edits"), list
+            ):
+                parsed["edits"] = parsed["object"].pop("edits")
+
             # Parsed successfully — save result regardless of validation score.
             dt = time.time() - t0
             rep = validate(parsed, set(valid_pids), quota=eff_quota)
@@ -253,6 +261,11 @@ async def run_many_async(
         if not force and ctx.parsed_path.is_file():
             try:
                 _j = json.loads(ctx.parsed_path.read_text())
+                _p = _j.get("parsed") or {}
+                if "edits" not in _p and isinstance((_p.get("object") or {}).get("edits"), list):
+                    _p["edits"] = _p["object"].pop("edits")
+                    _j["parsed"] = _p
+                    ctx.parsed_path.write_text(json.dumps(_j, indent=2, ensure_ascii=False))
                 if (_j.get("parsed") or {}).get("edits") is not None:
                     # backfill status if it's missing
                     if not step_done(ctx, "s1_phase1"):
@@ -368,6 +381,11 @@ async def run_many_streaming(
         if not force and ctx.parsed_path.is_file():
             try:
                 _j = json.loads(ctx.parsed_path.read_text())
+                _p = _j.get("parsed") or {}
+                if "edits" not in _p and isinstance((_p.get("object") or {}).get("edits"), list):
+                    _p["edits"] = _p["object"].pop("edits")
+                    _j["parsed"] = _p
+                    ctx.parsed_path.write_text(json.dumps(_j, indent=2, ensure_ascii=False))
                 if (_j.get("parsed") or {}).get("edits") is not None:
                     if not step_done(ctx, "s1_phase1"):
                         update_step(
