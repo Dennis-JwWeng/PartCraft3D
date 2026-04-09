@@ -36,6 +36,8 @@ def _seed_sources_from_yaml(cfg: dict) -> None:
     for key, val in (
         ("data.data_dir", data.get("data_dir")),
         ("data.output_dir", data.get("output_dir")),
+        ("data.images_root", data.get("images_root")),
+        ("data.mesh_root", data.get("mesh_root")),
         ("data.image_npz_dir", data.get("image_npz_dir")),
         ("data.mesh_npz_dir", data.get("mesh_npz_dir")),
         ("data.slat_dir", data.get("slat_dir")),
@@ -63,6 +65,8 @@ def _log_resolved_paths(cfg: dict, *, for_prerender: bool) -> None:
     entries = [
         ("data.data_dir", data.get("data_dir")),
         ("data.output_dir", data.get("output_dir")),
+        ("data.images_root", data.get("images_root")),
+        ("data.mesh_root", data.get("mesh_root")),
         ("data.image_npz_dir", data.get("image_npz_dir")),
         ("data.mesh_npz_dir", data.get("mesh_npz_dir")),
         ("data.slat_dir", data.get("slat_dir")),
@@ -137,6 +141,47 @@ def _apply_data_roots_and_layout(cfg: dict) -> None:
         if v is None or (isinstance(v, str) and not v.strip()):
             data[key] = str(base / sub)
             _mark_source(cfg, f"data.{key}", "derived")
+
+
+def _norm_abs_path(value: str | None) -> str | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    return str(Path(s).expanduser().resolve())
+
+
+def _sync_pipeline_v2_data_paths(cfg: dict) -> None:
+    """Align ``data.images_root`` / ``data.mesh_root`` with ``image_npz_dir`` / ``mesh_npz_dir``.
+
+    ``partcraft.pipeline_v2`` reads ``images_root`` and ``mesh_root``; older docs and
+    ``derive_dataset_subpaths`` populate ``image_npz_dir`` / ``mesh_npz_dir``. When only
+    one naming scheme is set, copy to the other. If both disagree, fail fast.
+    """
+    data = cfg.setdefault("data", {})
+    pairs = (
+        ("images_root", "image_npz_dir"),
+        ("mesh_root", "mesh_npz_dir"),
+    )
+    for root_key, npz_key in pairs:
+        raw_r = data.get(root_key)
+        raw_n = data.get(npz_key)
+        abs_r = _norm_abs_path(raw_r) if raw_r is not None else None
+        abs_n = _norm_abs_path(raw_n) if raw_n is not None else None
+        if abs_r and abs_n and abs_r != abs_n:
+            raise _config_error(
+                f"data.{root_key} vs data.{npz_key}",
+                f"{raw_r} vs {raw_n}",
+                "config",
+                "paths must match when both are set (same dataset roots)",
+            )
+        if abs_r and not abs_n:
+            data[npz_key] = abs_r
+            _mark_source(cfg, f"data.{npz_key}", f"derived_from_{root_key}")
+        elif abs_n and not abs_r:
+            data[root_key] = abs_n
+            _mark_source(cfg, f"data.{root_key}", f"derived_from_{npz_key}")
 
 
 def _resolve_path(raw: str | Path | None, *, base: Path) -> str | None:
@@ -396,6 +441,8 @@ def load_config(
     _seed_sources_from_yaml(cfg)
 
     _apply_data_roots_and_layout(cfg)
+    if not for_prerender:
+        _sync_pipeline_v2_data_paths(cfg)
     _apply_ckpt_root(cfg)
     if for_prerender:
         _apply_prerender_paths(cfg)

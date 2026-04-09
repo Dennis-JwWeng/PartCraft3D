@@ -33,6 +33,7 @@ from PIL import Image
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT / "scripts" / "standalone"))
+sys.path.insert(0, str(_ROOT / "third_party"))
 
 from .paths import ObjectContext
 from .specs import VIEW_INDICES

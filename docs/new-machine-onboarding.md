@@ -2,6 +2,8 @@
 
 本文是 **新主机** 上从「已有打包数据」到 **跑完 `pipeline_v2` 各阶段** 的唯一详细步骤说明；`docs/ARCH.md` 仅作索引与契约摘要，不重复本页流程。
 
+数据目录键名（`images_root` / `image_npz_dir` 等）与 `load_config` 对齐规则见 [`dataset-path-contract.md`](dataset-path-contract.md)。
+
 ## 目标与前提
 
 - **目标**：在新机器上配置 conda / 路径一次，然后用仓库约定的 shell 入口跑 **全部** `pipeline_v2` 阶段（`A`、`C`、`D`、`D2`、`E`、`F`；可选阶段 `B` 是否启用以所选 YAML 的 `pipeline.phases` 为准）。

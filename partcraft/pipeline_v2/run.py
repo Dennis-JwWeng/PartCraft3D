@@ -39,7 +39,8 @@ from typing import Iterable
 
 import yaml
 
-from .paths import PipelineRoot, ObjectContext, normalize_shard
+from .paths import (DatasetRoots, PipelineRoot, ObjectContext, normalize_shard,
+                      resolve_blender_executable)
 from .status import rebuild_manifest, manifest_summary, step_done
 from .validators import apply_check
 from . import scheduler as sched
@@ -77,8 +78,7 @@ def resolve_ctxs(
     all_objs: bool,
 ) -> list[ObjectContext]:
     shard = normalize_shard(shard)
-    mesh_root = Path(cfg["data"].get("mesh_root", "data/partverse/mesh"))
-    images_root = Path(cfg["data"].get("images_root", "data/partverse/images"))
+    roots = DatasetRoots.from_pipeline_cfg(cfg)
 
     if obj_ids:
         ids = obj_ids
@@ -90,7 +90,7 @@ def resolve_ctxs(
             ids = [d.name for d in sorted(root.shard_dir(shard).iterdir())
                    if d.is_dir()]
         if not ids:
-            mesh_shard = mesh_root / shard
+            mesh_shard = roots.mesh_root / shard
             if mesh_shard.is_dir():
                 ids = sorted(p.stem for p in mesh_shard.glob("*.npz"))
     else:
@@ -98,16 +98,38 @@ def resolve_ctxs(
 
     ctxs: list[ObjectContext] = []
     for oid in ids:
+        mesh_npz, image_npz = roots.input_npz_paths(shard, oid)
         ctxs.append(root.context(
             shard, oid,
-            mesh_npz=mesh_root / shard / f"{oid}.npz",
-            image_npz=images_root / shard / f"{oid}.npz",
+            mesh_npz=mesh_npz,
+            image_npz=image_npz,
         ))
     return ctxs
 
 
 def slice_for_gpu(ctxs: list[ObjectContext], i: int, n: int) -> list[ObjectContext]:
     return [c for k, c in enumerate(ctxs) if k % n == i]
+
+
+def _apply_obj_limit(ctxs: list[ObjectContext]) -> list[ObjectContext]:
+    """Trim object list using env ``LIMIT`` (positive integer).
+
+    Documented in ``docs/ARCH.md``. Applied after ``--gpu-shard`` slicing.
+    """
+    raw = os.environ.get("LIMIT", "").strip()
+    if not raw:
+        return ctxs
+    try:
+        n = int(raw)
+    except ValueError:
+        LOG.warning("LIMIT=%r is not an integer — ignoring", raw)
+        return ctxs
+    if n <= 0:
+        return ctxs
+    if len(ctxs) > n:
+        LOG.info("LIMIT=%s → using first %d of %d objects", n, n, len(ctxs))
+        return ctxs[:n]
+    return ctxs
 
 
 # ─────────────────── step dispatch ───────────────────────────────────
@@ -125,8 +147,9 @@ def run_step(
     if not ctxs:
         return
 
-    images_root = Path(cfg["data"].get("images_root", "data/partverse/images"))
-    mesh_root = Path(cfg["data"].get("mesh_root", "data/partverse/mesh"))
+    roots = DatasetRoots.from_pipeline_cfg(cfg)
+    images_root = roots.images_root
+    mesh_root = roots.mesh_root
     shard = ctxs[0].shard
 
     if step == "s1":
@@ -136,8 +159,7 @@ def run_step(
                 if getattr(args, "vlm_url", None)
                 else sched.vlm_urls_for(cfg))
         model = (cfg.get("phase0") or {}).get("vlm_model", "Qwen3.5-27B")
-        blender = cfg.get("blender",
-                          "/Node11_nvme/artgen/lac/.tools/blender-4.2.0-linux-x64/blender")
+        blender = resolve_blender_executable(cfg)
         n_pre = int((cfg.get("pipeline") or {}).get("prerender_workers", 8))
         asyncio.run(run_many_streaming(
             ctxs, blender=blender, vlm_urls=urls,
@@ -147,8 +169,7 @@ def run_step(
 
     elif step == "s2":
         from .s2_highlights import run_many
-        blender = cfg.get("blender",
-                          "/Node11_nvme/artgen/lac/.tools/blender-4.2.0-linux-x64/blender")
+        blender = resolve_blender_executable(cfg)
         run_many(ctxs, blender=blender, force=args.force)
 
     elif step == "s4":
@@ -185,8 +206,7 @@ def run_step(
 
     elif step == "s6b":
         from .s5b_deletion import run_reencode
-        blender = cfg.get("blender",
-                          "/Node11_nvme/artgen/lac/.tools/blender-4.2.0-linux-x64/blender")
+        blender = resolve_blender_executable(cfg)
         run_reencode(ctxs, cfg=cfg, blender_path=blender,
                      num_views=cfg.get("phase5", {}).get("num_views", 40),
                      force=args.force, logger=log)
@@ -260,6 +280,7 @@ def run_single_gpu(
         i, n = (int(x) for x in args.gpu_shard.split("/"))
         ctxs = slice_for_gpu(ctxs, i, n)
         LOG.info("[%s] gpu shard %d/%d -> %d objects", step, i, n, len(ctxs))
+    ctxs = _apply_obj_limit(ctxs)
     run_step(step, ctxs, cfg, args)
     rebuild_manifest(root)
     return 0
@@ -310,6 +331,7 @@ def main():
         _i, _n = (int(x) for x in args.gpu_shard.split("/"))
         ctxs = slice_for_gpu(ctxs, _i, _n)
         LOG.info("gpu-shard %d/%d → %d objects", _i, _n, len(ctxs))
+    ctxs = _apply_obj_limit(ctxs)
     LOG.info("root=%s shard=%s objects=%d", root.root, args.shard, len(ctxs))
 
     if args.dry_run:

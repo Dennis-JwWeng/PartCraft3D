@@ -14,8 +14,9 @@ blender: /usr/local/bin/blender
 
 data:
   output_dir:   /mnt/zsn/data/partverse/outputs/partverse/pipeline_v2_shard00
-  mesh_root:    data/partverse/mesh
-  images_root:  data/partverse/images
+  mesh_root:    /mnt/zsn/data/partverse/mesh
+  images_root:  /mnt/zsn/data/partverse/images
+  slat_dir:     /mnt/zsn/data/partverse/slat
 
 pipeline:
   gpus: [0, 1, 2, 3, 4, 5, 6, 7]
@@ -46,12 +47,12 @@ pipeline:
     - { name: F,  desc: "addition backfill",  servers: none, steps: [s7] }
 
 phase0:
-  vlm_model: Qwen3.5-27B
+  vlm_model: /mnt/zsn/ckpts/Qwen3.5-27B
   # vlm_base_urls auto-derived from pipeline.gpus + vlm_port_base at runtime
 
 phase2_5:
   enabled: true
-  trellis_text_ckpt: checkpoints/TRELLIS-text-xlarge
+  trellis_text_ckpt: /root/workspace/PartCraft3D/checkpoints/TRELLIS-text-xlarge
   image_edit_backend: local_diffusers
   # image_edit_base_urls auto-derived from pipeline.gpus + flux_port_base at runtime
   workers_per_server: 2

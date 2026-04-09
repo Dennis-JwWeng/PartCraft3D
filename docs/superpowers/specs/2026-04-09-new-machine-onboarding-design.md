@@ -87,3 +87,7 @@
 - **Consistency:** Scope A + full phases + "no duplicate config values" as principle is consistent; duplicate literals are explicitly **debt** until removed.
 - **Ambiguity:** "Authoritative" path when env and YAML still differ pre-refactor — addressed by **minimal compatibility table** during transition only.
 
+
+---
+
+**其它 scope 字母表（B–E）**：见 [`refactor-scopes.md`](../refactor-scopes.md)（仅索引，正式设计另起 spec）。

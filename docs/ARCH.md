@@ -24,6 +24,9 @@
 
 ### 管线 vs 预渲染数据路径职责（2026-03-30 对齐）
 
+- **Pipeline `data.*` 键名与 `image_npz_dir` 对齐规则**：见 [`dataset-path-contract.md`](dataset-path-contract.md)。
+
+
 - **预渲染**产出并依赖 `img_Enc/`（`paths.img_enc_dir`）：原始渲染图 + `mesh.ply`
 - **编辑管线**只依赖打包后的产物：`images/*.npz`、`mesh/*.npz`、`slat/`
 - `derive_dataset_subpaths: true` 只自动派生 `image_npz_dir`、`mesh_npz_dir`、`slat_dir`，**不派生 `img_enc_dir`**
@@ -131,6 +134,8 @@ flowchart TD
 
 ## 管线运行入口
 
+- **Smoke / 调试子集：** 见 [`smoke-pipeline.md`](smoke-pipeline.md)（`--dry-run`、`LIMIT`）。
+
 推荐使用 `bash scripts/tools/run_pipeline_v2_shard.sh <tag> <config_yaml>` 作为 shard 级运行入口，或直接调用 `python -m partcraft.pipeline_v2.run`（见上方主入口约定）。
 
 ### tmux 会话（长期跑 / 多面板）
@@ -188,7 +193,7 @@ bash scripts/tools/setup_pipeline_env.sh --check
 | 变量 | 说明 | 示例 |
 |------|------|------|
 | `PHASES` | 执行阶段（对应 config `pipeline.phases[].name`） | `A,C,D,D2,E,F` 或省略（跑全部） |
-| `LIMIT` | 限制对象数（调试用） | `3` |
+| `LIMIT` | 限制对象数（调试用）；`pipeline_v2.run` 在解析对象列表并经过 `--gpu-shard` 后取前 N 个 | `3` |
 
 ### GPU 资源生命周期
 

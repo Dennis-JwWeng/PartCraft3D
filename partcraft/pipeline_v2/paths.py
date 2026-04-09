@@ -23,6 +23,7 @@ This module replaces the shard-centric :mod:`scripts.pipeline_paths`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 from partcraft.edit_types import EDIT_TYPE_PREFIX, FLUX_TYPES  # noqa: F401 — single source of truth
@@ -33,6 +34,58 @@ def normalize_shard(shard: str | int | None) -> str:
     if shard is None or str(shard).strip() == "":
         raise ValueError("shard is required")
     return str(shard).strip().zfill(2)
+
+
+DEFAULT_IMAGES_ROOT = "data/partverse/images"
+DEFAULT_MESH_ROOT = "data/partverse/mesh"
+
+
+@dataclass(frozen=True)
+class DatasetRoots:
+    """Canonical input dataset roots for pipeline_v2 (packed NPZ trees)."""
+
+    images_root: Path
+    mesh_root: Path
+
+    @classmethod
+    def from_pipeline_cfg(cls, cfg: dict) -> "DatasetRoots":
+        data = cfg.get("data") or {}
+        return cls(
+            images_root=Path(data.get("images_root", DEFAULT_IMAGES_ROOT)),
+            mesh_root=Path(data.get("mesh_root", DEFAULT_MESH_ROOT)),
+        )
+
+    def input_npz_paths(self, shard: str | int, obj_id: str) -> tuple[Path, Path]:
+        """Return ``(mesh_npz, image_npz)`` under ``<root>/<shard>/<obj_id>.npz``."""
+        s = normalize_shard(shard)
+        return (
+            self.mesh_root / s / f"{obj_id}.npz",
+            self.images_root / s / f"{obj_id}.npz",
+        )
+
+
+
+def resolve_blender_executable(cfg: dict) -> str:
+    """Resolve Blender executable for pipeline_v2 steps.
+
+    Precedence:
+      1. ``cfg["tools"]["blender_path"]`` (if set)
+      2. Legacy top-level ``cfg["blender"]`` (common in pipeline YAML)
+      3. ``BLENDER_PATH`` environment variable (deprecated; still honored)
+      4. ``"blender"`` on ``PATH`` (no machine-specific hardcoded default)
+    """
+    tools = cfg.get("tools") or {}
+    bp = tools.get("blender_path")
+    if isinstance(bp, str) and bp.strip():
+        return bp.strip()
+    legacy = cfg.get("blender")
+    if isinstance(legacy, str) and legacy.strip():
+        return legacy.strip()
+    env = os.environ.get("BLENDER_PATH", "").strip()
+    if env:
+        return env
+    return "blender"
+
 
 
 @dataclass(frozen=True)
