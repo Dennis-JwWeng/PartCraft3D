@@ -1,5 +1,4 @@
 from __future__ import annotations
-import logging
 import cv2, numpy as np
 from openai import OpenAI
 from .paths import ObjectContext
@@ -7,7 +6,6 @@ from .specs import iter_all_specs
 from .status import update_step, STATUS_OK, step_done
 from .qc_io import update_edit_gate, is_edit_qc_failed
 
-LOG = logging.getLogger("pipeline_v2.sq3")
 _DEFS = {
     "deletion":     {"min_visual_quality": 3, "require_preserve_other": False},
     "modification": {"min_visual_quality": 3, "require_preserve_other": True},
@@ -26,9 +24,12 @@ def _collage(b, a):
     return buf.tobytes() if ok else None
 
 def _passes(j, et, thr):
-    t = thr.get(et, _DEFS.get(et, {}))
+    t = {**_DEFS.get(et, {}), **(thr.get(et) or {})}
     if not j.get("edit_executed", False): return False
-    if j.get("visual_quality", 0) < t.get("min_visual_quality", 3): return False
+    vq = j.get("visual_quality", 0)
+    try: vq = int(vq)
+    except (TypeError, ValueError): vq = 0
+    if vq < t.get("min_visual_quality", 3): return False
     if et == "deletion" and not j.get("correct_region", False): return False
     if t.get("require_preserve_other") and not j.get("preserve_other", False): return False
     return True
