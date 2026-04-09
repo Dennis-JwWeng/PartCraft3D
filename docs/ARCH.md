@@ -10,7 +10,7 @@
   - 模块布局：`partcraft/pipeline_v2/{run,scheduler,specs,paths,status,validators,s1_phase1_vlm,s2_highlights,s4_flux_2d,s5_trellis_3d,s5b_deletion,s6_render_3d,s7_addition_backfill}.py`
   - Resume：每 step 跑完调用 `validators.apply_check`,根据磁盘产物把 `status.json` 翻成 OK/FAIL/SKIP；下一轮 step 在 per-edit 粒度上只补缺失文件
 - 约束：所有编排能力只能进入 pipeline_v2 入口及其模块，不再新增任何并行编排入口。
-- **配置命名（迁移中）**：推荐顶层 `services.vlm` / `services.image_edit`、`pipeline.stages`、`step_params.s5`；加载时由 `apply_yaml_aliases` 合并到仍被广泛读取的 `phase0` / `phase2_5` / `phase5` / `pipeline.phases`（PR-A 兼容层）。
+- **配置命名**：`configs/pipeline_v2_*.yaml` 已采用 `services.*`、`pipeline.stages`、`step_params`；加载时仍由 `apply_yaml_aliases` 合并到 `phase0` / `phase2_5` / `phase5` / `pipeline.phases` 供尚未改动的代码路径读取。
 
 
 

@@ -9,41 +9,75 @@
 #   /mnt/zsn/data/partverse/outputs/partverse/pipeline_v2_shard02/
 
 ckpt_root: /mnt/zsn/zsn_workspace/PartCraft3D/checkpoints
-
 blender: /mnt/zsn/data/3DEditVerse/render_package_extracted/render_package/blender-3.5.1-linux-x64/blender
-
 data:
-  output_dir:  /mnt/zsn/data/partverse/outputs/partverse/pipeline_v2_shard02
-  mesh_root:   /mnt/zsn/data/partverse/mesh
+  output_dir: /mnt/zsn/data/partverse/outputs/partverse/pipeline_v2_shard02
+  mesh_root: /mnt/zsn/data/partverse/mesh
   images_root: /mnt/zsn/data/partverse/images
-  slat_dir:    /mnt/zsn/data/partverse/slat
-
+  slat_dir: /mnt/zsn/data/partverse/slat
 pipeline:
-  gpus: [0, 1, 2, 3, 4, 5, 6, 7]
+  gpus:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
   prerender_workers: 8
-
-  vlm_port_base:    8002
-  vlm_port_stride:  10
-  flux_port_base:   8004
+  vlm_port_base: 8002
+  vlm_port_stride: 10
+  flux_port_base: 8004
   flux_port_stride: 1
-
-  phases:
-    - { name: A,  desc: "phase1 VLM",        servers: vlm,  steps: [s1] }
-    - { name: B,  desc: "highlights",        servers: none, steps: [s2], optional: true }
-    - { name: C,  desc: "FLUX 2D",           servers: flux, steps: [s4] }
-    - { name: D,  desc: "TRELLIS 3D edit",   servers: none, steps: [s5],       use_gpus: true }
-    - { name: D2, desc: "deletion mesh",     servers: none, steps: [s5b] }
-    - { name: E,  desc: "3D rerender",       servers: none, steps: [s6, s6b],  use_gpus: true }
-    - { name: F,  desc: "addition backfill", servers: none, steps: [s7] }
-
-phase0:
-  vlm_model: /mnt/zsn/ckpts/Qwen3.5-27B
-
-phase2_5:
-  enabled: true
-  trellis_text_ckpt: /mnt/zsn/zsn_workspace/PartCraft3D/checkpoints/TRELLIS-text-xlarge
-  image_edit_backend: local_diffusers
-  image_edit_base_urls:
+  stages:
+  - name: A
+    desc: phase1 VLM
+    servers: vlm
+    steps:
+    - s1
+  - name: B
+    desc: highlights
+    servers: none
+    steps:
+    - s2
+    optional: true
+  - name: C
+    desc: FLUX 2D
+    servers: flux
+    steps:
+    - s4
+  - name: D
+    desc: TRELLIS 3D edit
+    servers: none
+    steps:
+    - s5
+    use_gpus: true
+  - name: D2
+    desc: deletion mesh
+    servers: none
+    steps:
+    - s5b
+  - name: E
+    desc: 3D rerender
+    servers: none
+    steps:
+    - s6
+    - s6b
+    use_gpus: true
+  - name: F
+    desc: addition backfill
+    servers: none
+    steps:
+    - s7
+services:
+  vlm:
+    model: /mnt/zsn/ckpts/Qwen3.5-27B
+  image_edit:
+    enabled: true
+    trellis_text_ckpt: /mnt/zsn/zsn_workspace/PartCraft3D/checkpoints/TRELLIS-text-xlarge
+    image_edit_backend: local_diffusers
+    base_urls:
     - http://localhost:8004
     - http://localhost:8005
     - http://localhost:8006
@@ -52,10 +86,10 @@ phase2_5:
     - http://localhost:8009
     - http://localhost:8010
     - http://localhost:8011
-  workers_per_server: 2
-  export_ply: false
-  export_ply_for_deletion: true
-  large_part_threshold: 0.35
-
-phase5:
-  num_views: 40
+    workers_per_server: 2
+    export_ply: false
+    export_ply_for_deletion: true
+    large_part_threshold: 0.35
+step_params:
+  s5:
+    num_views: 40

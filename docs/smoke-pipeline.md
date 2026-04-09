@@ -38,10 +38,10 @@ LIMIT=1 python -m partcraft.pipeline_v2.run \
   --config configs/pipeline_v2_shard00.yaml \
   --shard 00 \
   --all \
-  --phase A
+  --stage A
 ```
 
-(Phase A still needs VLM + data; this only caps object count.)
+(Stage A still needs VLM + data; this only caps object count.)
 
 ## 5. Full phased run
 

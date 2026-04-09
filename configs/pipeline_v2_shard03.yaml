@@ -34,51 +34,73 @@
 #       --steps s5,s5b,s6,s6b,s7 --gpus 3,4,6,7
 
 ckpt_root: /Node11_nvme/wjw/3D_Editing/PartCraft3D/checkpoints
-
 blender: /Node11_nvme/artgen/lac/.tools/blender-4.2.0-linux-x64/blender
-
 data:
-  output_dir:  /Node11_nvme/wjw/3D_Editing/data/outputs/pipeline_v2_shard03
-  mesh_root:   /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/mesh
+  output_dir: /Node11_nvme/wjw/3D_Editing/data/outputs/pipeline_v2_shard03
+  mesh_root: /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/mesh
   images_root: /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/images
-  slat_dir:    /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/slat
-
+  slat_dir: /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/slat
 pipeline:
-  # GPUs in use: 3, 4, 6.
-  # One VLM server per GPU (ports 8002/8012/8022, stride=10).
-  # One FLUX server per GPU (ports 8004/8005/8006, stride=1).
-  gpus: [3, 4, 6]
+  gpus:
+  - 3
+  - 4
+  - 6
   prerender_workers: 8
-
-  vlm_port_base:    8002
-  vlm_port_stride:  10
-  flux_port_base:   8004
+  vlm_port_base: 8002
+  vlm_port_stride: 10
+  flux_port_base: 8004
   flux_port_stride: 1
-
-  phases:
-    - { name: A,  desc: "phase1 VLM",        servers: vlm,  steps: [s1] }
-    - { name: B,  desc: "highlights",        servers: none, steps: [s2], optional: true }
-    - { name: C,  desc: "FLUX 2D",           servers: flux, steps: [s4] }
-    - { name: D,  desc: "TRELLIS 3D edit",   servers: none, steps: [s5],  use_gpus: true }
-    - { name: D2, desc: "deletion mesh",     servers: none, steps: [s5b] }
-    - { name: E,  desc: "3D rerender",       servers: none, steps: [s6, s6b], use_gpus: true }
-    - { name: F,  desc: "addition backfill", servers: none, steps: [s7] }
-
-phase0:
-  vlm_model: Qwen3.5-27B
-  # 3 VLM servers auto-derived from pipeline.gpus + vlm_port_base/stride:
-  #   GPU 3 → port 8002,  GPU 4 → port 8012,  GPU 6 → port 8022
-
-phase2_5:
-  enabled: true
-  trellis_text_ckpt: checkpoints/TRELLIS-text-xlarge
-  image_edit_backend: local_diffusers
-  # 3 FLUX servers auto-derived from pipeline.gpus + flux_port_base/stride:
-  #   GPU 3 → port 8004,  GPU 4 → port 8005,  GPU 6 → port 8006
-  workers_per_server: 2
-  export_ply: false
-  export_ply_for_deletion: true
-  large_part_threshold: 0.35
-
-phase5:
-  num_views: 40
+  stages:
+  - name: A
+    desc: phase1 VLM
+    servers: vlm
+    steps:
+    - s1
+  - name: B
+    desc: highlights
+    servers: none
+    steps:
+    - s2
+    optional: true
+  - name: C
+    desc: FLUX 2D
+    servers: flux
+    steps:
+    - s4
+  - name: D
+    desc: TRELLIS 3D edit
+    servers: none
+    steps:
+    - s5
+    use_gpus: true
+  - name: D2
+    desc: deletion mesh
+    servers: none
+    steps:
+    - s5b
+  - name: E
+    desc: 3D rerender
+    servers: none
+    steps:
+    - s6
+    - s6b
+    use_gpus: true
+  - name: F
+    desc: addition backfill
+    servers: none
+    steps:
+    - s7
+services:
+  vlm:
+    model: Qwen3.5-27B
+  image_edit:
+    enabled: true
+    trellis_text_ckpt: checkpoints/TRELLIS-text-xlarge
+    image_edit_backend: local_diffusers
+    workers_per_server: 2
+    export_ply: false
+    export_ply_for_deletion: true
+    large_part_threshold: 0.35
+step_params:
+  s5:
+    num_views: 40

@@ -21,48 +21,71 @@
 
 # 权重根：相对仓库根；也可改成绝对路径。
 ckpt_root: checkpoints
-
-# Blender（改成本机路径，或与 machine env 中 BLENDER_PATH 一致）
 blender: /usr/local/bin/blender
-
 data:
-  # 产物树写在软链 `outputs/` 下，便于与仓库分离
   output_dir: outputs/pipeline_v2_local
-  # 输入 NPZ 根：相对仓库根 → 解析到 `data/partverse/...` 软链目标
   mesh_root: data/partverse/mesh
   images_root: data/partverse/images
-
 pipeline:
-  # 本机调试：单卡；有多卡可改为 [0,1,...] 并相应调大 n_vlm_servers
-  gpus: [0]
+  gpus:
+  - 0
   prerender_workers: 4
   n_vlm_servers: 1
-
   vlm_port_base: 8002
   vlm_port_stride: 10
   flux_port_base: 8004
   flux_port_stride: 1
-
-  phases:
-    - { name: A,  desc: "phase1 VLM",        servers: vlm,  steps: [s1] }
-    - { name: B,  desc: "highlights",        servers: none, steps: [s2], optional: true }
-    - { name: C,  desc: "FLUX 2D",           servers: flux, steps: [s4] }
-    - { name: D,  desc: "TRELLIS 3D edit",   servers: none, steps: [s5],       use_gpus: true }
-    - { name: D2, desc: "deletion mesh",     servers: none, steps: [s5b] }
-    - { name: E,  desc: "3D rerender",       servers: none, steps: [s6, s6b],  use_gpus: true }
-    - { name: F,  desc: "addition backfill", servers: none, steps: [s7] }
-
-phase0:
-  vlm_model: Qwen3.5-27B
-
-phase2_5:
-  enabled: true
-  trellis_text_ckpt: checkpoints/TRELLIS-text-xlarge
-  image_edit_backend: local_diffusers
-  workers_per_server: 2
-  export_ply: false
-  export_ply_for_deletion: true
-  large_part_threshold: 0.35
-
-phase5:
-  num_views: 40
+  stages:
+  - name: A
+    desc: phase1 VLM
+    servers: vlm
+    steps:
+    - s1
+  - name: B
+    desc: highlights
+    servers: none
+    steps:
+    - s2
+    optional: true
+  - name: C
+    desc: FLUX 2D
+    servers: flux
+    steps:
+    - s4
+  - name: D
+    desc: TRELLIS 3D edit
+    servers: none
+    steps:
+    - s5
+    use_gpus: true
+  - name: D2
+    desc: deletion mesh
+    servers: none
+    steps:
+    - s5b
+  - name: E
+    desc: 3D rerender
+    servers: none
+    steps:
+    - s6
+    - s6b
+    use_gpus: true
+  - name: F
+    desc: addition backfill
+    servers: none
+    steps:
+    - s7
+services:
+  vlm:
+    model: Qwen3.5-27B
+  image_edit:
+    enabled: true
+    trellis_text_ckpt: checkpoints/TRELLIS-text-xlarge
+    image_edit_backend: local_diffusers
+    workers_per_server: 2
+    export_ply: false
+    export_ply_for_deletion: true
+    large_part_threshold: 0.35
+step_params:
+  s5:
+    num_views: 40

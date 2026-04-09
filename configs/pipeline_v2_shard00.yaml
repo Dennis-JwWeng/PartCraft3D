@@ -5,60 +5,83 @@
 #   bash scripts/tools/run_pipeline_v2_shard.sh shard00 \
 #       configs/pipeline_v2_shard00.yaml
 #
-#   PHASES="A,C,D,D2,E,F"  bash ...   # skip highlights (phase B)
-#   PHASES=A                bash ...   # only VLM phase
+#   STAGES="A,C,D,D2,E,F"  bash ...   # skip highlights (stage B)
+#   STAGES=A                bash ...   # only VLM stage
 
 ckpt_root: /root/workspace/PartCraft3D/checkpoints
-
 blender: /usr/local/bin/blender
-
 data:
-  output_dir:   /mnt/zsn/data/partverse/outputs/partverse/pipeline_v2_shard00
-  mesh_root:    /mnt/zsn/data/partverse/mesh
-  images_root:  /mnt/zsn/data/partverse/images
-  slat_dir:     /mnt/zsn/data/partverse/slat
-
+  output_dir: /mnt/zsn/data/partverse/outputs/partverse/pipeline_v2_shard00
+  mesh_root: /mnt/zsn/data/partverse/mesh
+  images_root: /mnt/zsn/data/partverse/images
+  slat_dir: /mnt/zsn/data/partverse/slat
 pipeline:
-  gpus: [0, 1, 2, 3, 4, 5, 6, 7]
+  gpus:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
   prerender_workers: 8
-
-  # Limit VLM instances to 4: each 27B model needs ~48GB, and 8 simultaneous
-  # instances exhaust system thread limits on this node.
-  # FLUX (phase C) and TRELLIS (phase D/E) still use all 8 GPUs.
   n_vlm_servers: 4
-
-  # VLM: 8 instances, one per GPU
-  # ports: 8002, 8012, 8022, 8032, 8042, 8052, 8062, 8072  (auto-derived)
-  vlm_port_base:   8002
+  vlm_port_base: 8002
   vlm_port_stride: 10
-
-  # FLUX: 8 instances, one per GPU
-  # ports: 8004, 8005, 8006, 8007, 8008, 8009, 8010, 8011  (auto-derived)
-  flux_port_base:   8004
+  flux_port_base: 8004
   flux_port_stride: 1
-
-  phases:
-    - { name: A,  desc: "phase1 VLM",        servers: vlm,  steps: [s1] }
-    - { name: B,  desc: "highlights",         servers: none, steps: [s2], optional: true }
-    - { name: C,  desc: "FLUX 2D",            servers: flux, steps: [s4] }
-    - { name: D,  desc: "TRELLIS 3D edit",    servers: none, steps: [s5],       use_gpus: true }
-    - { name: D2, desc: "deletion mesh",      servers: none, steps: [s5b] }
-    - { name: E,  desc: "3D rerender",        servers: none, steps: [s6, s6b],  use_gpus: true }
-    - { name: F,  desc: "addition backfill",  servers: none, steps: [s7] }
-
-phase0:
-  vlm_model: /mnt/zsn/ckpts/Qwen3.5-27B
-  # vlm_base_urls auto-derived from pipeline.gpus + vlm_port_base at runtime
-
-phase2_5:
-  enabled: true
-  trellis_text_ckpt: /root/workspace/PartCraft3D/checkpoints/TRELLIS-text-xlarge
-  image_edit_backend: local_diffusers
-  # image_edit_base_urls auto-derived from pipeline.gpus + flux_port_base at runtime
-  workers_per_server: 2
-  export_ply: false
-  export_ply_for_deletion: true
-  large_part_threshold: 0.35
-
-phase5:
-  num_views: 40
+  stages:
+  - name: A
+    desc: phase1 VLM
+    servers: vlm
+    steps:
+    - s1
+  - name: B
+    desc: highlights
+    servers: none
+    steps:
+    - s2
+    optional: true
+  - name: C
+    desc: FLUX 2D
+    servers: flux
+    steps:
+    - s4
+  - name: D
+    desc: TRELLIS 3D edit
+    servers: none
+    steps:
+    - s5
+    use_gpus: true
+  - name: D2
+    desc: deletion mesh
+    servers: none
+    steps:
+    - s5b
+  - name: E
+    desc: 3D rerender
+    servers: none
+    steps:
+    - s6
+    - s6b
+    use_gpus: true
+  - name: F
+    desc: addition backfill
+    servers: none
+    steps:
+    - s7
+services:
+  vlm:
+    model: /mnt/zsn/ckpts/Qwen3.5-27B
+  image_edit:
+    enabled: true
+    trellis_text_ckpt: /root/workspace/PartCraft3D/checkpoints/TRELLIS-text-xlarge
+    image_edit_backend: local_diffusers
+    workers_per_server: 2
+    export_ply: false
+    export_ply_for_deletion: true
+    large_part_threshold: 0.35
+step_params:
+  s5:
+    num_views: 40
