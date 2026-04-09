@@ -141,6 +141,7 @@ def run_step(
     ctxs: list[ObjectContext],
     cfg: dict,
     args: argparse.Namespace,
+    post_object_fn=None,
 ) -> None:
     log = LOG.getChild(step)
     log.info("=" * 60)
@@ -167,6 +168,7 @@ def run_step(
             ctxs, blender=blender, vlm_urls=urls,
             vlm_model=model, n_prerender_workers=n_pre,
             force=args.force,
+            post_object_fn=post_object_fn,
         ))
 
     elif step == "s2":
@@ -396,6 +398,19 @@ def main():
 
     exit_rc = 0
     for step in steps:
+        # look-ahead: inject sq1 as per-object post-hook when s1 and sq1
+        # share the same VLM stage, so sq1 runs immediately after each
+        # object's s1 completes without a VLM restart.
+        _post_fn = None
+        if step == "s1" and "sq1" in steps:
+            from .sq1_qc_a import _process_one as _sq1_process_one
+            _vlm_model = psvc.vlm_model_name(cfg)
+            _force = args.force
+            async def _sq1_hook(ctx, vlm_url,
+                                _m=_vlm_model, _f=_force):
+                await _sq1_process_one(ctx, vlm_url, _m, _f)
+            _post_fn = _sq1_hook
+
         # GPU dispatch only when this step is GPU-bound AND the stage
         # asked for it (or the user passed --gpus explicitly).
         wants_dispatch = (step in GPU_STEPS
@@ -408,7 +423,7 @@ def main():
                 LOG.error("[%s] dispatch_gpus returned rc=%d — aborting", step, rc)
                 exit_rc = rc
         else:
-            run_step(step, ctxs, cfg, args)
+            run_step(step, ctxs, cfg, args, post_object_fn=_post_fn)
         # post-step validation: rewrite status to reflect product reality
         n_pass = n_fail = 0
         for c in ctxs:

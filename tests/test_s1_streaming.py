@@ -168,3 +168,21 @@ class TestPostObjectFn:
 
         assert len(results) == 3
         assert all(r.ok for r in results)
+
+
+class TestRunStepLookahead:
+    def test_run_step_accepts_post_object_fn(self):
+        """run_step('s1', ...) accepts post_object_fn without raising TypeError."""
+        import inspect
+        from partcraft.pipeline_v2.run import run_step
+        sig = inspect.signature(run_step)
+        assert "post_object_fn" in sig.parameters, (
+            "run_step must accept post_object_fn keyword argument"
+        )
+
+    def test_post_object_fn_default_is_none(self):
+        """run_step post_object_fn defaults to None (backward compat)."""
+        import inspect
+        from partcraft.pipeline_v2.run import run_step
+        sig = inspect.signature(run_step)
+        assert sig.parameters["post_object_fn"].default is None
