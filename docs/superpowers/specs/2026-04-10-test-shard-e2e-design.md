@@ -90,6 +90,10 @@ for step in sorted(step_counts):
 
 失败分析：每个对象的 `status.json` 记录 fail step 及原因；stage 日志在 tmux 终端。
 
+> ⚠️ **端口冲突约束**：test_shard00 使用 `vlm_port_stride: 1`（端口 8002~8009），
+> 而正式 shard00/shard02 用 `vlm_port_stride: 10`（端口 8002,8012,...）。
+> 两个管线**不能同时运行 VLM/FLUX server**，运行 test_shard 前需确认正式管线已停止。
+
 ## Implementation Plan
 
 1. 新建 `configs/pipeline_v2_test_shard00.yaml`（基于 shard00，改 output_dir 和 n_vlm_servers）
