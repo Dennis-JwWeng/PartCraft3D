@@ -31,45 +31,16 @@ pipeline:
   flux_port_base: 8004
   flux_port_stride: 1
   stages:
-  - name: A
-    desc: phase1 VLM
-    servers: vlm
-    steps:
-    - s1
-  - name: B
-    desc: highlights
-    servers: none
-    steps:
-    - s2
-    optional: true
-  - name: C
-    desc: FLUX 2D
-    servers: flux
-    steps:
-    - s4
-  - name: D
-    desc: TRELLIS 3D edit
-    servers: none
-    steps:
-    - s5
-    use_gpus: true
-  - name: D2
-    desc: deletion mesh
-    servers: none
-    steps:
-    - s5b
-  - name: E
-    desc: 3D rerender
-    servers: none
-    steps:
-    - s6
-    - s6b
-    use_gpus: true
-  - name: F
-    desc: addition backfill
-    servers: none
-    steps:
-    - s7
+  - {name: A,    desc: "phase1 VLM",         servers: vlm,  steps: [s1]}
+  - {name: A_qc, desc: "QC-A instruction",   servers: vlm,  steps: [sq1]}
+  - {name: B,    desc: "highlights",          servers: none, steps: [s2]}
+  - {name: C,    desc: "FLUX 2D",             servers: flux, steps: [s4]}
+  - {name: C_qc, desc: "QC-C 2D region",     servers: vlm,  steps: [sq2]}
+  - {name: D,    desc: "TRELLIS 3D edit",     servers: none, steps: [s5],      use_gpus: true}
+  - {name: D2,   desc: "deletion mesh",       servers: none, steps: [s5b]}
+  - {name: E,    desc: "3D rerender",         servers: none, steps: [s6, s6b], use_gpus: true}
+  - {name: E_qc, desc: "QC-E final quality",  servers: vlm,  steps: [sq3]}
+  - {name: F,    desc: "addition backfill",   servers: none, steps: [s7]}
 services:
   vlm:
     model: /mnt/zsn/ckpts/Qwen3.5-27B
@@ -93,3 +64,13 @@ services:
 step_params:
   s5:
     num_views: 40
+qc:
+  vlm_score_threshold: 0.7
+  thresholds_by_type:
+    deletion:     {min_visual_quality: 3}
+    modification: {min_visual_quality: 3, require_preserve_other: true}
+    scale:        {min_visual_quality: 3, require_preserve_other: true}
+    material:     {min_visual_quality: 3}
+    global:       {min_visual_quality: 3}
+    addition:     {min_visual_quality: 3}
+
