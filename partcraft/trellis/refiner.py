@@ -618,8 +618,8 @@ class TrellisRefiner:
                            "Coordinate space may be misaligned.")
         if slat_total > 0 and slat_in_edit / slat_total > 0.95 and edit_type != "Global":
             logger.warning(
-                f"WARNING: mask covers {slat_in_edit/slat_total*100:.1f}%% of SLAT voxels "
-                f"— possible mask inflation (expected <95%% for non-Global edits)")
+                f"WARNING: mask covers {slat_in_edit/slat_total*100:.1f}% of SLAT voxels "
+                f"— possible mask inflation (expected <95% for non-Global edits)")
 
         # Debug: save mask projections + SLAT overlay
         if self.debug:
