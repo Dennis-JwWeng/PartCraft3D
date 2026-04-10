@@ -46,7 +46,7 @@ from . import services_cfg as psvc
 
 from .specs import EditSpec, iter_flux_specs
 from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
-from .qc_io import is_edit_qc_failed
+from .qc_io import is_edit_qc_failed, is_gate_a_failed
 
 
 GPU_TYPES = frozenset({"modification", "scale", "material", "global"})
@@ -107,8 +107,8 @@ def run_for_object(
     pending: list[EditSpec] = []
     for spec in iter_flux_specs(ctx):
         all_specs.append(spec)
-        if is_edit_qc_failed(ctx, spec.edit_id):
-            log.debug("[s5] skip %s (qc_fail)", spec.edit_id)
+        if is_gate_a_failed(ctx, spec.edit_id):
+            log.debug("[s5] skip %s (gate_a_fail)", spec.edit_id)
             res.n_skip += 1
             continue
         before = ctx.edit_3d_npz(spec.edit_id, "before")
@@ -148,6 +148,7 @@ def run_for_object(
     promote_scale_to_global = bool(p25_cfg.get("promote_scale_to_global", False))
     scale_large = p25_cfg.get("scale_large_part_threshold")
     scale_large = float(scale_large) if scale_large is not None else None
+    repaint_mode = str(p25_cfg.get("repaint_mode", "interleaved"))
 
     t0 = time.time()
     for spec in pending:
@@ -197,6 +198,7 @@ def run_for_object(
             edit_results = refiner.edit(
                 ori_slat, mask, prompts,
                 img_cond=img_cond, seed=seed, combinations=None,
+                repaint_mode=repaint_mode,
             )
             if not edit_results:
                 raise RuntimeError("no edited SLATs")

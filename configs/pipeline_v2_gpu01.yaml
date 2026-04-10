@@ -8,7 +8,7 @@ data:
   output_dir: outputs/pipeline_v2_shard00
   mesh_root: data/partverse/mesh
   images_root: data/partverse/images
-  slat_dir: /mnt/zsn/data/partverse/slat
+  slat_dir: /mnt/zsn/data/partverse/inputs/slat
 pipeline:
   gpus:
   - 0
@@ -70,6 +70,7 @@ services:
     export_ply: false
     export_ply_for_deletion: true
     large_part_threshold: 0.35
+    repaint_mode: image
 step_params:
   s5:
     num_views: 40
