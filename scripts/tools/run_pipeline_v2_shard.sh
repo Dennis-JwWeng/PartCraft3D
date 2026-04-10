@@ -201,12 +201,21 @@ print(dump_shell_env(cfg, stage_name='$stage'))
     echo
     echo "▶ Stage ${STAGE_NAME} — ${STAGE_DESC}  (steps=${STAGE_STEPS[*]} servers=${STAGE_SERVERS} use_gpus=${STAGE_USE_GPUS})"
 
-    case "$STAGE_SERVERS" in
-        vlm)  start_vlm ;;
-        flux) start_flux ;;
-        none) ;;
-        *) echo "[scheduler] unknown servers=$STAGE_SERVERS"; return 1 ;;
-    esac
+    # Pre-check: count objects with pending work before starting servers
+    _SERVERS_STARTED=0
+    if [ "$STAGE_SERVERS" != "none" ]; then
+        _PENDING=$(LIMIT="${LIMIT:-}" "$PY_PIPE" -m partcraft.pipeline_v2.run             --config "$CFG" --shard "${TAG#shard}" --all             --stage "$stage" --count-pending 2>/dev/null || echo 1)
+        if [ "${_PENDING}" = "0" ]; then
+            echo "[scheduler] stage $stage: all objects already complete — skipping server startup"
+        else
+            echo "[scheduler] stage $stage: ${_PENDING} objects pending"
+            case "$STAGE_SERVERS" in
+                vlm)  start_vlm  && _SERVERS_STARTED=1 ;;
+                flux) start_flux && _SERVERS_STARTED=1 ;;
+                *) echo "[scheduler] unknown servers=$STAGE_SERVERS"; return 1 ;;
+            esac
+        fi
+    fi
 
     # OBJ_IDS env var: space-separated object IDs to process instead of --all
     if [ -n "${OBJ_IDS:-}" ]; then
@@ -225,10 +234,12 @@ print(dump_shell_env(cfg, stage_name='$stage'))
         2>&1 | tee "$log"
     local rc=${PIPESTATUS[0]}
 
-    case "$STAGE_SERVERS" in
-        vlm)  stop_vlm ;;
-        flux) stop_flux ;;
-    esac
+    if [ "$_SERVERS_STARTED" = "1" ]; then
+        case "$STAGE_SERVERS" in
+            vlm)  stop_vlm ;;
+            flux) stop_flux ;;
+        esac
+    fi
 
     if [ "$rc" != 0 ]; then
         echo "[scheduler] stage $stage exit=$rc — aborting"

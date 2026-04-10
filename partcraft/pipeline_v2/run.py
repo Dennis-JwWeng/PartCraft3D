@@ -341,6 +341,8 @@ def main():
                          "used by per-GPU workers in parallel mode.")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--count-pending", action="store_true",
+                    help="Print count of objects with pending work for the given stage/steps and exit")
 
     # Internal: child workers set these.
     ap.add_argument("--single-gpu", action="store_true",
@@ -372,6 +374,30 @@ def main():
 
     # Resolve steps + use_gpus from --stage or --steps
     run_stage = args.stage
+
+    if args.count_pending:
+        # Resolve steps for the given stage/steps flags (same logic as below)
+        _cp_steps: list[str] = []
+        if run_stage:
+            _cp_ph = sched.get_stage(cfg, run_stage)
+            _cp_steps = list(_cp_ph.steps)
+        elif args.steps:
+            _cp_steps = [s.strip() for s in args.steps.split(",") if s.strip()]
+        else:
+            _cp_steps = list(ALL_STEPS)
+        _done_statuses = {"ok", "skip"}
+        _pending = 0
+        for _c in ctxs:
+            _sf = _c.dir / "status.json"
+            if not _sf.exists():
+                _pending += 1
+                continue
+            _step_data = json.loads(_sf.read_text()).get("steps", {})
+            if any(_step_data.get(_step_to_status_key(_s), {}).get("status")
+                   not in _done_statuses for _s in _cp_steps):
+                _pending += 1
+        print(_pending)
+        return
 
     phase_use_gpus = False
     if run_stage:
