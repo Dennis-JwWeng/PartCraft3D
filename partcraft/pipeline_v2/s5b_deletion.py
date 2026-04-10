@@ -37,7 +37,7 @@ sys.path.insert(0, str(_ROOT / "scripts" / "tools"))
 from .paths import ObjectContext
 from .specs import EditSpec, iter_deletion_specs
 from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
-from .qc_io import is_edit_qc_failed
+from .qc_io import is_edit_qc_failed, is_gate_a_failed
 from . import services_cfg as psvc
 from .s5_trellis_3d import _ensure_refiner
 
@@ -87,8 +87,8 @@ def run_mesh_delete_for_object(
                         "(PLY pair will still be written)", ctx.obj_id, e)
 
     for spec in specs:
-        if is_edit_qc_failed(ctx, spec.edit_id):
-            log.info("[s5b] skip %s (qc_fail)", spec.edit_id)
+        if is_gate_a_failed(ctx, spec.edit_id):
+            log.info("[s5b] skip %s (gate_a_fail)", spec.edit_id)
             res.n_skip += 1
             continue
         pair_dir = ctx.edit_3d_dir(spec.edit_id)

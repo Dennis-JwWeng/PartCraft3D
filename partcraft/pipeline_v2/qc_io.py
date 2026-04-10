@@ -61,4 +61,18 @@ def is_edit_qc_failed(ctx: ObjectContext, edit_id: str) -> bool:
     e = load_qc(ctx).get("edits", {}).get(edit_id)
     return e is not None and e.get("final_pass", True) is False
 
-__all__ = ["load_qc", "save_qc", "update_edit_gate", "is_edit_qc_failed"]
+def is_gate_a_failed(ctx: ObjectContext, edit_id: str) -> bool:
+    """Block only on Gate A failures (upstream part-selection errors).
+
+    Gate C (2D image region check) is intentionally excluded: spatial
+    localisation is handled by the 3D voxel mask, so a globally-edited
+    2D reference image is still valid as appearance guidance.
+    Gate E is a post-s5 quality signal and never blocks s5 input.
+    """
+    if not ctx.qc_path.is_file(): return False
+    e = load_qc(ctx).get("edits", {}).get(edit_id)
+    if e is None: return False
+    gate_a = (e.get("gates") or {}).get("A")
+    return not _gp(gate_a)
+
+__all__ = ["load_qc", "save_qc", "update_edit_gate", "is_edit_qc_failed", "is_gate_a_failed"]
