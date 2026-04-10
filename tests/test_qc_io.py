@@ -63,4 +63,53 @@ class TestQcIo(unittest.TestCase):
                          vlm_result={"pass": True, "score": 0.9, "reason": ""})
         self.assertTrue(load_qc(ctx)["edits"]["del_000"]["final_pass"])
 
+
+class TestGateAFailed(unittest.TestCase):
+    """is_gate_a_failed only blocks on Gate A, never on Gate C."""
+
+    def setUp(self):
+        self._t = tempfile.TemporaryDirectory()
+        self.p = Path(self._t.name)
+
+    def tearDown(self):
+        self._t.cleanup()
+
+    def test_no_qc_file_returns_false(self):
+        from partcraft.pipeline_v2.qc_io import is_gate_a_failed
+        self.assertFalse(is_gate_a_failed(_ctx(self.p), "del_001"))
+
+    def test_gate_c_fail_does_not_block(self):
+        """Gate C failure must NOT cause is_gate_a_failed to return True."""
+        from partcraft.pipeline_v2.qc_io import update_edit_gate, is_gate_a_failed
+        ctx = _ctx(self.p)
+        update_edit_gate(ctx, "mod_001", "modification", "C",
+                         vlm_result={"pass": False, "reason": "wrong region"})
+        self.assertFalse(is_gate_a_failed(ctx, "mod_001"))
+
+    def test_gate_a_fail_blocks(self):
+        """Gate A failure must cause is_gate_a_failed to return True."""
+        from partcraft.pipeline_v2.qc_io import update_edit_gate, is_gate_a_failed
+        ctx = _ctx(self.p)
+        update_edit_gate(ctx, "mod_002", "modification", "A",
+                         vlm_result={"pass": False, "reason": "wrong part"})
+        self.assertTrue(is_gate_a_failed(ctx, "mod_002"))
+
+    def test_gate_a_pass_gate_c_fail_does_not_block(self):
+        """Gate A pass + Gate C fail => is_gate_a_failed False."""
+        from partcraft.pipeline_v2.qc_io import update_edit_gate, is_gate_a_failed
+        ctx = _ctx(self.p)
+        update_edit_gate(ctx, "mod_003", "modification", "A",
+                         vlm_result={"pass": True})
+        update_edit_gate(ctx, "mod_003", "modification", "C",
+                         vlm_result={"pass": False, "reason": "global edit"})
+        self.assertFalse(is_gate_a_failed(ctx, "mod_003"))
+
+    def test_unknown_edit_id_returns_false(self):
+        from partcraft.pipeline_v2.qc_io import update_edit_gate, is_gate_a_failed
+        ctx = _ctx(self.p)
+        update_edit_gate(ctx, "mod_004", "modification", "A",
+                         vlm_result={"pass": False})
+        self.assertFalse(is_gate_a_failed(ctx, "nonexistent_edit"))
+
+
 if __name__ == "__main__": unittest.main()
