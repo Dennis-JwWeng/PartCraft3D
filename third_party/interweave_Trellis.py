@@ -328,11 +328,26 @@ def get_s2_soft_mask(slat, mask, sigma=5.0, contact_mask=None):
     soft_mask = get_soft_weights(preserved_coords, ref_coords, sigma).unsqueeze(1)
     return soft_mask
 
+def _use_text_step(cnt: int, mode: str) -> bool:
+    """Return True if this forward-repaint step should use the text flow model.
+
+    mode choices:
+      'interleaved' - alternate text/image every step (original behaviour)
+      'text'        - always use the text model
+      'image'       - always use the image model
+    """
+    if mode == 'text':
+        return True
+    if mode == 'image':
+        return False
+    return cnt % 2 == 0  # 'interleaved'
+
 def interweave_Trellis_TI(args, trellis_text, trellis_img,
     slat, mask, 
     prompts, 
     img_new,
-    seed):
+    seed,
+    mode: str = 'interleaved'):
 
     device = slat.device
     torch.manual_seed(seed)
@@ -421,7 +436,7 @@ def interweave_Trellis_TI(args, trellis_text, trellis_img,
         for t_curr, t_prev in tqdm(t_pairs, desc="Sampling", disable=False):
             x_t = sample
             if t_curr > t_prev:
-                if cnt%2 == 0:
+                if _use_text_step(cnt, mode):
                     s1_text_sampler_params['cfg_strength'] = args['cfg_strength']
                     x_t_1 = RF_sample_once(text_s1_flow_model, x_t, t_curr, t_prev, inverse=False, cond=conds[args['s1_pos_cond']]['cond'], neg_cond=conds[args['s1_neg_cond']]['cond'], **s1_text_sampler_params)
                 else:
@@ -474,7 +489,7 @@ def interweave_Trellis_TI(args, trellis_text, trellis_img,
         x_t = sample
         if t_curr > t_prev:
             if args['edit_type'] in ("Addition", "Modification", "HybridDeletion", "TextureOnly"):
-                if cnt%2 == 0:
+                if _use_text_step(cnt, mode):
                     s2_text_sampler_params['cfg_strength'] = args['cfg_strength']
                     x_t_1 = RF_sample_once(text_s2_flow_model, x_t, t_curr, t_prev, inverse=False, cond=conds[args['s2_pos_cond']]['cond'], neg_cond=conds[args['s2_neg_cond']]['cond'], **s2_text_sampler_params)
                 else:
