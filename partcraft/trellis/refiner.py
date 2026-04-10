@@ -616,6 +616,10 @@ class TrellisRefiner:
         if slat_in_edit == 0 and edit_type != "Addition":
             logger.warning("WARNING: No SLAT voxels overlap with mask! "
                            "Coordinate space may be misaligned.")
+        if slat_total > 0 and slat_in_edit / slat_total > 0.95 and edit_type != "Global":
+            logger.warning(
+                f"WARNING: mask covers {slat_in_edit/slat_total*100:.1f}%% of SLAT voxels "
+                f"— possible mask inflation (expected <95%% for non-Global edits)")
 
         # Debug: save mask projections + SLAT overlay
         if self.debug:
@@ -1225,6 +1229,7 @@ class TrellisRefiner:
         img_new: Image.Image | None = None,
         seed: int = 1,
         combinations: list[dict] | None = None,
+        repaint_mode: str = 'interleaved',
     ) -> list[dict]:
         """Run TRELLIS Flow Inversion + Repaint.
 
@@ -1278,6 +1283,15 @@ class TrellisRefiner:
 
         # Setup image conditioning
         # Priority: img_cond (multi-view averaged) > img_new (single) > blank
+        # Guard: image-only mode requires actual conditioning.
+        # Fall back to interleaved if none is available so we don't
+        # feed a blank-white image through all repaint steps.
+        effective_mode = repaint_mode
+        if effective_mode == 'image' and img_cond is None and img_new is None:
+            logger.warning(
+                "repaint_mode='image' but no img_cond/img_new provided "
+                "— falling back to 'interleaved'")
+            effective_mode = 'interleaved'
         _patched = False
         if img_cond is not None:
             _orig_preprocess = self.trellis_img.preprocess_image
@@ -1310,7 +1324,8 @@ class TrellisRefiner:
 
                 result = interweave_Trellis_TI(
                     args, self.trellis_text, self.trellis_img,
-                    slat, mask, prompts, effective_img, seed=seed)
+                    slat, mask, prompts, effective_img, seed=seed,
+                    mode=effective_mode)
                 # Squeeze batch dim from interweave z_s tensors
                 # to match encode_ss() output shape [C, R, R, R]
                 z_s_b = result["z_s_before"]
