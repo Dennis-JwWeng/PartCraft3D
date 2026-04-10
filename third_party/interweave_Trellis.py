@@ -328,6 +328,7 @@ def get_s2_soft_mask(slat, mask, sigma=5.0, contact_mask=None):
     soft_mask = get_soft_weights(preserved_coords, ref_coords, sigma).unsqueeze(1)
     return soft_mask
 
+
 def _use_text_step(cnt: int, mode: str) -> bool:
     """Return True if this forward-repaint step should use the text flow model.
 
@@ -340,7 +341,11 @@ def _use_text_step(cnt: int, mode: str) -> bool:
         return True
     if mode == 'image':
         return False
-    return cnt % 2 == 0  # 'interleaved'
+    if mode == 'interleaved':
+        return cnt % 2 == 0
+    raise ValueError(
+        f"Unknown repaint mode {mode!r}; expected 'text', 'image', or 'interleaved'")
+
 
 def interweave_Trellis_TI(args, trellis_text, trellis_img,
     slat, mask, 
