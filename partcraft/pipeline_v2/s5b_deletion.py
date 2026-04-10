@@ -255,7 +255,7 @@ def run_reencode(
     log.info("[s6b] CUDA_VISIBLE_DEVICES=%s",
              os.environ.get("CUDA_VISIBLE_DEVICES"))
 
-    from migrate_slat_to_npz import load_ss_encoder  # type: ignore
+    from partcraft.io.npz_utils import load_ss_encoder
     ss_encoder = load_ss_encoder(Path(cfg.get("ckpt_root", "checkpoints")), "cuda")
 
     if work_dir is None:
