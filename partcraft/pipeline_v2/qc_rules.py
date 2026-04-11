@@ -1,6 +1,18 @@
 from __future__ import annotations
 from typing import Any
 
+import numpy as np
+
+from partcraft.render.overview import _PALETTE
+
+# ── overview.png layout constants (must match stitch_two_rows in overview.py) ─
+_N_VIEWS = 5        # columns
+_COL_SEP = 4        # px separator between columns
+_ROW_SEP = 6        # px separator between top/bottom rows
+
+# Palette pre-converted to BGR (overview.py stores RGB; OpenCV loads BGR)
+_PALETTE_BGR: list[list[int]] = [[c[2], c[1], c[0]] for c in _PALETTE]
+
 _PART_REQUIRED = frozenset({"deletion", "modification", "scale", "material"})
 _ADD_VERBS = ("add ", "insert ", "attach ", "put ")
 _REMOVE_ONLY = ("remove", "delete", "erase", "strip", "eliminate")
@@ -39,4 +51,39 @@ def check_rules(edit: dict[str, Any], parts_by_id: dict[int, Any]) -> dict[str, 
             fails["verb_conflict"] = True
     return fails
 
-__all__ = ["check_rules"]
+
+def count_part_pixels_in_overview(
+    overview_img: np.ndarray,
+    view_index: int,
+    selected_part_ids: list[int],
+    color_tol: int = 30,
+) -> int:
+    """Count palette-colored pixels for *selected_part_ids* in the bottom-row
+    cell of *view_index* inside an already-decoded overview BGR image.
+
+    The overview is a 5-column × 2-row grid produced by ``stitch_two_rows``:
+    - top row: original RGB photos
+    - bottom row: same views re-rendered with each part in its palette color
+
+    Returns the total matching pixel count across all selected parts.
+    Zero means none of the selected parts are visible from this viewpoint.
+    """
+    if overview_img is None or not (0 <= view_index < _N_VIEWS):
+        return -1   # sentinel: cannot check
+
+    H_total, W_total = overview_img.shape[:2]
+    W_img = (W_total - (_N_VIEWS - 1) * _COL_SEP) // _N_VIEWS
+    H_img = (H_total - _ROW_SEP) // 2
+    bot_y0 = H_img + _ROW_SEP
+    x0 = view_index * (W_img + _COL_SEP)
+    cell = overview_img[bot_y0: bot_y0 + H_img, x0: x0 + W_img]
+
+    total = 0
+    for pid in selected_part_ids:
+        color = np.array(_PALETTE_BGR[pid % len(_PALETTE_BGR)], dtype=int)
+        diff = np.linalg.norm(cell.astype(int) - color, axis=2)
+        total += int(np.sum(diff < color_tol))
+    return total
+
+
+__all__ = ["check_rules", "count_part_pixels_in_overview"]

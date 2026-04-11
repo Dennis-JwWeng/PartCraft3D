@@ -366,3 +366,39 @@ python scripts/tools/migrate_slat_to_npz.py \
 ## 2026-03-29 — 一键环境脚本初版
 
 `setup_deploy_env.sh` / `setup_pipeline_env.sh` / `setup_env_common.sh` 初版与 `--machine-env`、`--check`、`--reinstall` 等；后续在 2026-03-30 条目中合并增强（见上）。
+
+---
+
+## 2026-04-11 — Gate A 内联可见性检查，移除 Stage B 和 C_qc
+
+### 背景
+
+Stage B（s2_highlights）的职责是对每个 edit 用 Blender 渲染高亮图，用于：
+1. `zero_visible_pixels` 检查（判断选中 part 在该视角是否有像素）
+2. 作为 C_qc（sq2_qc_c）的 VLM 输入图像
+
+发现的两个问题：
+- Stage B 每个 edit 单独 spawn 一次 Blender 进程（35 个 edits = 35 次启动），代价极高
+- Stage C_qc 依赖 Stage B 的高亮图，但 Stage B 与 Stage C 并行执行，可能导致依赖不满足；且 C_qc 整体价值有限
+
+### 解决方案
+
+**关键洞察**：Phase A 在 `phase1/overview.png` 中保存了一张 5×2 网格图，底排就是同一次 Blender 渲染的 per-part 染色视图（每个 part 用 `_PALETTE[pid % 16]` 固定颜色）。这张图已经落盘，无需再次调用 Blender。
+
+**改动**：
+1. **`qc_rules.py`**：新增 `count_part_pixels_in_overview(overview_img, view_index, selected_part_ids)` 函数，从 overview.png 底排指定视角格子中数出选中 part 的调色板颜色像素数。
+2. **`sq1_qc_a.py`**：在 Gate A 规则检查中，解码 overview.png 一次，对每个 edit 调用上述函数；若像素数为 0，则写入 `zero_visible_pixels` 规则失败，不进入 VLM 队列也不进入后续 2D/3D 编辑。
+3. **所有 YAML configs**：从 `stages` 列表中移除 Stage B（`s2_highlights`）和 Stage C_qc（`sq2_qc_c`）。
+4. **`run_pipeline_v2_shard.sh`**：移除 Stage B 后台并行执行逻辑（`run_stage_bg` 函数及其调用），主循环回归简单串行。
+
+**效果**：
+- 不再需要 Blender 做 zero_visible_pixels 检查，毫秒级完成（纯图像像素统计）
+- 高亮图（highlights/）不再生成，节省磁盘和 Blender 时间
+- Gate C（2D region QC）整体移除，只保留 Gate A 和最终 Gate E
+- 管线阶段由 A→B→C→C_qc→D→D2→E→E_qc→F 简化为 **A→C→D→D2→E→E_qc→F**
+
+### 注意事项
+- `count_part_pixels_in_overview` 使用颜色容限 30（L2 距离），抗锯齿
+- 当 part_id ≥ 16 时调色板循环（`pid % 16`），极少数情况下可能误判；实际对象绝大多数 < 16 个 parts
+- `s2_highlights.py` 和 `sq2_qc_c.py` 文件保留（不删除），仅从 YAML 和调度器中移除
+

@@ -185,6 +185,7 @@ trap cleanup_all EXIT
 
 # ─── per-phase invocation ────────────────────────────────────────────
 
+
 run_pipeline_stage() {
     local stage="$1"
     local log="$LOG_DIR/stage_${stage}.log"
@@ -248,8 +249,11 @@ print(dump_shell_env(cfg, stage_name='$stage'))
 }
 
 # ═══ MAIN LOOP ═══════════════════════════════════════════════════════
-for stage in "${SELECTED_STAGES[@]}"; do
+_stage_idx=0
+while [ "$_stage_idx" -lt "${#SELECTED_STAGES[@]}" ]; do
+    stage="${SELECTED_STAGES[$_stage_idx]}"
     run_pipeline_stage "$stage"
+    _stage_idx=$(( _stage_idx + 1 ))
 done
 
 echo

@@ -1,13 +1,17 @@
 from __future__ import annotations
-import asyncio, base64, json, logging
+import asyncio, base64, cv2, json, logging
 from typing import Iterable
+
+import numpy as np
 from openai import AsyncOpenAI
+
 from .paths import ObjectContext
 from .specs import iter_all_specs
-from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
-from .qc_rules import check_rules
+from .status import update_step, STATUS_OK, STATUS_FAIL, STATUS_SKIP, step_done
+from .qc_rules import check_rules, count_part_pixels_in_overview
 from .qc_io import update_edit_gate
 from .s1_vlm_core import extract_json_object
+from .validators import _phase1_skipped
 
 LOG = logging.getLogger("pipeline_v2.sq1")
 _SYS = "You evaluate 3D part-editing instructions. Output only valid JSON."
@@ -41,6 +45,10 @@ async def _vlm_one(client, model, png, et, prompt, tpd, labels):
 async def _process_one(ctx, vlm_url, vlm_model, force):
     if not force and step_done(ctx, "sq1_qc_A"):
         return {"obj_id": ctx.obj_id, "skipped": True}
+    # s1 was skipped (too_many_parts) → nothing to QC; propagate skip
+    if _phase1_skipped(ctx):
+        update_step(ctx, "sq1_qc_A", status=STATUS_SKIP, reason="s1_skipped")
+        return {"obj_id": ctx.obj_id, "skipped": True}
     if not ctx.parsed_path.is_file():
         update_step(ctx, "sq1_qc_A", status=STATUS_FAIL, error="missing_parsed_json")
         return {"obj_id": ctx.obj_id, "error": "missing_parsed_json"}
@@ -54,11 +62,33 @@ async def _process_one(ctx, vlm_url, vlm_model, force):
                    if isinstance(p, dict) and "part_id" in p}
     edits = (raw.get("parsed") or {}).get("edits") or []
     ov = ctx.overview_path.read_bytes() if ctx.overview_path.is_file() else None
+
+    # Decode overview once for fast per-edit visibility checks (no Blender needed).
+    # The bottom row of overview.png already encodes per-part palette renders.
+    ov_img: np.ndarray | None = None
+    if ov is not None:
+        buf = np.frombuffer(ov, dtype=np.uint8)
+        decoded = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if decoded is not None:
+            ov_img = decoded
+
     client = AsyncOpenAI(base_url=vlm_url, api_key="EMPTY")
     n_pass = n_fail = 0; vlm_q = []
     for spec in iter_all_specs(ctx):
         e = edits[spec.edit_idx] if spec.edit_idx < len(edits) else {}
         fails = check_rules(e, parts_by_id)
+
+        # Visibility check: if selected parts have zero pixels in the chosen
+        # view of the overview bottom-row, the edit is geometrically invalid.
+        # This replaces the former s2_highlights Blender re-render.
+        if not fails and spec.selected_part_ids and ov_img is not None:
+            vi = int(e.get("view_index", 0))
+            n_px = count_part_pixels_in_overview(ov_img, vi, list(spec.selected_part_ids))
+            if n_px == 0:
+                fails["zero_visible_pixels"] = True
+                LOG.debug("[sq1] %s e%d: zero pixels at view %d → Gate A fail",
+                          ctx.obj_id, spec.edit_idx, vi)
+
         rr = {"pass": not fails, "checks": fails}
         if fails:
             update_edit_gate(ctx, spec.edit_id, spec.edit_type, "A", rule_result=rr)

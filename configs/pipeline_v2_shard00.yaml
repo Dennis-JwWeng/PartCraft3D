@@ -33,9 +33,7 @@ pipeline:
   flux_port_stride: 1
   stages:
   - {name: A,    desc: "phase1 VLM + QC-A",  servers: vlm,  steps: [s1, sq1]}
-  - {name: B,    desc: "highlights",          servers: none, steps: [s2]}
   - {name: C,    desc: "FLUX 2D",             servers: flux, steps: [s4]}
-  - {name: C_qc, desc: "QC-C 2D region",     servers: vlm,  steps: [sq2]}
   - {name: D,    desc: "TRELLIS 3D edit",     servers: none, steps: [s5],      use_gpus: true}
   - {name: D2,   desc: "deletion mesh",       servers: none, steps: [s5b]}
   - {name: E,    desc: "3D rerender",         servers: none, steps: [s6, s6b], use_gpus: true}

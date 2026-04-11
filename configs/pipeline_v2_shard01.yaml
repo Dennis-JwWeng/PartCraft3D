@@ -38,12 +38,6 @@ pipeline:
     servers: vlm
     steps:
     - s1
-  - name: B
-    desc: highlights
-    servers: none
-    steps:
-    - s2
-    optional: true
   - name: C
     desc: FLUX 2D
     servers: flux
