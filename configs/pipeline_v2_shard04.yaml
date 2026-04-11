@@ -1,0 +1,77 @@
+# Pipeline v2 — shard04 on aibox (4× A800-SXM4-80GB)
+# Machine env: configs/machine/aibox-rd3996bf91f9-68f4cd496c-nsm56.env
+#
+# Inputs:
+#   /mnt/cfs/vffey4/omni3d/partverse/mesh/04/<obj_id>.npz
+#   /mnt/cfs/vffey4/omni3d/partverse/images/04/<obj_id>.npz
+#   /mnt/cfs/vffey4/omni3d/partverse/slat/04/<obj_id>_{feats,coords}.pt
+#
+# Output root:
+#   /mnt/cfs/vffey4/omni3d/partverse/outputs/partverse/pipeline_v2_shard04/
+#
+# Resume status (2026-04-11):
+#   s1 (VLM)  : 915/1203 ok
+#   s4 (FLUX) : 1144/1203 ok
+#   s5 (TRELLIS 3D) : 229/1203 ok, 915 fail → resume from stage D
+#
+# ── Quick start (resume — skip completed A/C, retry D onwards) ─────
+#   STAGES=D,D2,E,F bash scripts/tools/run_pipeline_v2_shard.sh shard04 \
+#       configs/pipeline_v2_shard04.yaml
+#
+# ── Full run (all stages) ──────────────────────────────────────────
+#   bash scripts/tools/run_pipeline_v2_shard.sh shard04 \
+#       configs/pipeline_v2_shard04.yaml
+
+ckpt_root: /mnt/cfs/vffey4/omni3d/ckpt
+blender: /usr/local/bin/blender
+data:
+  output_dir: /mnt/cfs/vffey4/omni3d/partverse/outputs/partverse/pipeline_v2_shard04
+  mesh_root: /mnt/cfs/vffey4/omni3d/partverse/mesh
+  images_root: /mnt/cfs/vffey4/omni3d/partverse/images
+  slat_dir: /mnt/cfs/vffey4/omni3d/partverse/slat
+pipeline:
+  gpus:
+  - 0
+  - 1
+  - 2
+  - 3
+  prerender_workers: 8
+  n_vlm_servers: 4
+  vlm_port_base: 8002
+  vlm_port_stride: 10
+  flux_port_base: 8004
+  flux_port_stride: 1
+  stages:
+  - {name: A,    desc: "phase1 VLM + QC-A",  servers: vlm,  steps: [s1, sq1]}
+  - {name: B,    desc: "highlights",          servers: none, steps: [s2]}
+  - {name: C,    desc: "FLUX 2D",             servers: flux, steps: [s4]}
+  - {name: C_qc, desc: "QC-C 2D region",     servers: vlm,  steps: [sq2]}
+  - {name: D,    desc: "TRELLIS 3D edit",     servers: none, steps: [s5],      use_gpus: true}
+  - {name: D2,   desc: "deletion mesh",       servers: none, steps: [s5b]}
+  - {name: E,    desc: "3D rerender",         servers: none, steps: [s6, s6b], use_gpus: true}
+  - {name: E_qc, desc: "QC-E final quality",  servers: vlm,  steps: [sq3]}
+  - {name: F,    desc: "addition backfill",   servers: none, steps: [s7]}
+services:
+  vlm:
+    model: /mnt/cfs/vffey4/omni3d/ckpt/Qwen3.5-27B
+  image_edit:
+    enabled: true
+    trellis_text_ckpt: /mnt/cfs/vffey4/omni3d/ckpt/TRELLIS-text-xlarge
+    image_edit_backend: local_diffusers
+    workers_per_server: 2
+    export_ply: false
+    export_ply_for_deletion: true
+    large_part_threshold: 0.35
+    repaint_mode: image
+step_params:
+  s5:
+    num_views: 40
+qc:
+  vlm_score_threshold: 0.7
+  thresholds_by_type:
+    deletion:     {min_visual_quality: 3}
+    modification: {min_visual_quality: 3, require_preserve_other: true}
+    scale:        {min_visual_quality: 3, require_preserve_other: true}
+    material:     {min_visual_quality: 3}
+    global:       {min_visual_quality: 3}
+    addition:     {min_visual_quality: 3}
