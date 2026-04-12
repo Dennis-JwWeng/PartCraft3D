@@ -50,8 +50,8 @@ from . import services_cfg as psvc
 
 LOG = logging.getLogger("pipeline_v2")
 
-ALL_STEPS = ("s1", "s2", "sq1", "s4", "s5", "s5b", "sq2", "s6", "s6b", "s7", "sq3")
-GPU_STEPS = frozenset({"s5", "s6", "s6b"})
+ALL_STEPS = ("s1", "s2", "sq1", "s4", "s5", "s5b", "s6p", "sq2", "sq3", "s6", "s6b")
+GPU_STEPS = frozenset({"s5", "s6p", "s6", "s6b"})
 
 
 # ─────────────────── config + ctx resolution ─────────────────────────
@@ -200,7 +200,15 @@ def run_step(
         # by s6b later (Blender 40 views → DINOv2 → SLAT enc → SS enc).
         run_mesh_delete(ctxs, cfg=cfg, images_root=images_root,
                         mesh_root=mesh_root, shard=shard,
-                        force=args.force, use_refiner=False, logger=log)
+                        force=args.force, logger=log)
+
+    elif step == "s6p":
+        from .s6_preview import run as s6p_run
+        blender = resolve_blender_executable(cfg)
+        ckpt = psvc.image_edit_service(cfg).get(
+            "trellis_text_ckpt", "checkpoints/TRELLIS-text-xlarge")
+        s6p_run(ctxs, blender=blender, ckpt=ckpt,
+                force=args.force, logger=log)
 
     elif step == "s6":
         from .s6_render_3d import run as s6_run
@@ -216,8 +224,7 @@ def run_step(
                      force=args.force, logger=log)
 
     elif step == "s7":
-        from .s7_addition_backfill import run as s7_run
-        s7_run(ctxs, force=args.force, logger=log)
+        log.info("[s7] no-op: addition backfill is now inline in s5b")
 
     elif step == "sq1":
         from .sq1_qc_a import run as sq1_run
@@ -474,8 +481,8 @@ def main():
 
 _STATUS_KEYS = {
     "s1": "s1_phase1", "s2": "s2_highlights", "s4": "s4_flux_2d",
-    "s5": "s5_trellis", "s5b": "s5b_del_mesh", "s6": "s6_render_3d",
-    "s6b": "s6b_del_reencode", "s7": "s7_add_backfill",
+    "s5": "s5_trellis", "s5b": "s5b_del_mesh", "s6p": "s6p_preview",
+    "s6": "s6_render_3d", "s6b": "s6b_del_reencode",
     "sq1": "sq1_qc_A", "sq2": "sq2_qc_C", "sq3": "sq3_qc_E",
 }
 
