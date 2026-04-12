@@ -48,15 +48,6 @@ class PreviewResult:
     error: str | None = None
 
 
-def _lazy_helpers():
-    """Import TRELLIS-dependent helpers on first use (defers GPU init)."""
-    from render_phase1v2_3d_results import (  # type: ignore
-        render_one_view, load_slat,
-    )
-    from partcraft.render.overview import load_views_from_npz, run_blender
-    return render_one_view, load_slat, load_views_from_npz, run_blender
-
-
 def _build_pipeline(ckpt: str, logger: logging.Logger):
     """Load TRELLIS pipeline onto GPU."""
     from trellis.pipelines import TrellisTextTo3DPipeline  # type: ignore
@@ -86,8 +77,8 @@ def _render_ply_views(
 ) -> list[np.ndarray]:
     """Render a single PLY file at the given camera frames using Blender.
 
-    Uses a temporary directory with part_0.ply symlink to satisfy run_blender's
-    expected parts_dir layout (part_*.ply convention).
+    Uses a temporary directory with a copy of the PLY as part_0.ply to satisfy
+    run_blender's expected parts_dir layout (part_*.ply convention).
     """
     from partcraft.render.overview import run_blender as _run_blender
     with tempfile.TemporaryDirectory(prefix="pcv2_s6p_ply_") as tmp:
@@ -285,7 +276,8 @@ def run(
     # Filter out already-done objects
     pending = [c for c in ctx_list
                if force or not step_done(c, "s6p_preview")]
-    done = [c for c in ctx_list if c not in set(pending)]
+    pending_set = set(pending)
+    done = [c for c in ctx_list if c not in pending_set]
 
     pipeline = None
     if _has_trellis_edits(pending):
