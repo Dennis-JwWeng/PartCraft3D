@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil as _shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -47,6 +48,18 @@ class Render3DResult:
     n_fail: int = 0
     n_skip: int = 0
     error: str | None = None
+
+
+
+def _hardlink_or_copy(src: Path, dst: Path) -> None:
+    """Hard-link src -> dst; fall back to copy on cross-device."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.is_file():
+        dst.unlink()
+    try:
+        os.link(src, dst)
+    except OSError:
+        _shutil.copy2(src, dst)
 
 
 def _lazy_helpers():
@@ -132,6 +145,12 @@ def run_for_object(
             if png.is_file() and not force:
                 res.n_skip += 1
                 continue
+            if which == "after":
+                preview = edit_dir / f"preview_{spec.view_index}.png"
+                if preview.is_file():
+                    _hardlink_or_copy(preview, png)
+                    res.n_ok += 1
+                    continue
             try:
                 slat = load_slat(npz)
                 rgb = render_one_view(pipeline, slat, frame, resolution)
