@@ -423,6 +423,19 @@ def validate(parsed: dict, valid_pids: set[int], quota: dict | None = None) -> d
             kept += 1
             type_count[et] = type_count.get(et, 0) + 1
     out["n_kept_edits"] = kept
+    # R2 cross-edit check: no two edits with same (edit_type, selected_part_ids)
+    seen_signatures: set[tuple] = set()
+    for i, e in enumerate(edits):
+        et = e.get("edit_type")
+        pids = tuple(sorted(e.get("selected_part_ids", [])))
+        sig = (et, pids)
+        if sig in seen_signatures:
+            out["warnings"].append({
+                "edit_index": i,
+                "problems": [f"R2 violation: duplicate (edit_type={et}, selected_part_ids={list(pids)})"],
+            })
+        else:
+            seen_signatures.add(sig)
     out["type_counts"] = type_count
     out["expected_dist"] = quota or {}
     target = sum((quota or {}).values()) if quota else len(edits)

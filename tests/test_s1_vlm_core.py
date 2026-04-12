@@ -48,3 +48,71 @@ def test_prompt_has_r9_hard_rule():
     assert "A flattened disc" in USER_PROMPT_TEMPLATE, \
         "R9 must include the right example (shape change)"
 
+# ── Task 4: validate() R2 cross-edit check ───────────────────────────────────
+
+def _base_edit(edit_type, part_ids, extra_params=None):
+    """Minimal valid edit dict for validate() testing."""
+    e = {
+        "edit_type": edit_type,
+        "selected_part_ids": part_ids,
+        "prompt": "Change the widget.",
+        "view_index": 0,
+        "edit_params": extra_params or {},
+        "after_desc_full": "After full." if edit_type != "deletion" else None,
+        "after_desc_stage1": "After s1." if edit_type != "deletion" else None,
+        "after_desc_stage2": "After s2." if edit_type != "deletion" else None,
+    }
+    return e
+
+
+@pytest.mark.unit
+def test_validate_r2_flags_duplicate_edit_type_and_parts():
+    """Two modification edits on the same part_ids should produce an R2 warning."""
+    edits = [
+        _base_edit("modification", [0], {"new_part_desc": "A cube."}),
+        _base_edit("modification", [0], {"new_part_desc": "A sphere."}),
+    ]
+    parsed = {
+        "object": {"full_desc": "x", "full_desc_stage1": "x", "full_desc_stage2": "x", "parts": []},
+        "edits": edits,
+    }
+    result = validate(parsed, valid_pids={0})
+    warning_texts = [str(w) for w in result["warnings"]]
+    assert any("R2" in t for t in warning_texts), \
+        f"Expected R2 warning for duplicate (modification, [0]), got: {result['warnings']}"
+
+
+@pytest.mark.unit
+def test_validate_r2_no_false_positive_different_parts():
+    """Two modification edits on DIFFERENT parts should NOT trigger R2."""
+    edits = [
+        _base_edit("modification", [0], {"new_part_desc": "A cube."}),
+        _base_edit("modification", [1], {"new_part_desc": "A sphere."}),
+    ]
+    parsed = {
+        "object": {"full_desc": "x", "full_desc_stage1": "x", "full_desc_stage2": "x", "parts": []},
+        "edits": edits,
+    }
+    result = validate(parsed, valid_pids={0, 1})
+    warning_texts = [str(w) for w in result["warnings"]]
+    assert not any("R2" in t for t in warning_texts), \
+        f"Unexpected R2 warning for different parts: {result['warnings']}"
+
+
+@pytest.mark.unit
+def test_validate_r2_material_spam():
+    """Four material edits all with same parts (cloud pattern) should flag 3 R2 warnings."""
+    edits = [
+        _base_edit("material", [0, 1], {"target_material": "chrome"}),
+        _base_edit("material", [0, 1], {"target_material": "rubber"}),
+        _base_edit("material", [0, 1], {"target_material": "gold"}),
+        _base_edit("material", [0, 1], {"target_material": "stone"}),
+    ]
+    parsed = {
+        "object": {"full_desc": "x", "full_desc_stage1": "x", "full_desc_stage2": "x", "parts": []},
+        "edits": edits,
+    }
+    result = validate(parsed, valid_pids={0, 1})
+    r2_warnings = [w for w in result["warnings"] if any("R2" in str(p) for p in w.get("problems", []))]
+    assert len(r2_warnings) == 3, \
+        f"Expected 3 R2 warnings for 4 identical material edits, got {len(r2_warnings)}: {r2_warnings}"
