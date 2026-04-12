@@ -198,10 +198,10 @@ VALIDATORS: dict[str, Callable[[ObjectContext], StepCheck]] = {
     "s4":  check_s4,
     "s5":  check_s5,
     "s5b": check_s5b,
-    "s6p": check_s6p,   # kept but neutralized (no-op)
+    "s6p": check_s6p,
     "s6":  check_s6,
     "s6b": check_s6b,
-    "s7":  check_s7,    # kept but neutralized (no-op)
+    "s7":  check_s7,    # no-op: s7 backfill moved to s5b
     "sq1": check_sq1,
     "sq2": check_sq2,
     "sq3": check_sq3,
