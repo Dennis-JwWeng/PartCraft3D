@@ -362,16 +362,16 @@ def quota_for(n_parts: int) -> dict:
     """Per-edit-type quotas based on number of (valid) parts. Deletion is the
     cheapest + most useful task, so it gets the largest share. Scale is capped
     at 1 per object to avoid redundancy; prefer shrinking large parts."""
-    if n_parts <= 2:  return {"deletion":1,  "modification":1,  "scale":1, "material":1, "global":1}
-    if n_parts == 3:  return {"deletion":3,  "modification":3,  "scale":1, "material":1, "global":1}
-    if n_parts == 4:  return {"deletion":4,  "modification":4,  "scale":1, "material":2, "global":1}
-    if n_parts == 5:  return {"deletion":5,  "modification":5,  "scale":1, "material":2, "global":1}
-    if n_parts == 6:  return {"deletion":6,  "modification":6,  "scale":1, "material":2, "global":1}
-    if n_parts <= 8:  return {"deletion":8,  "modification":8,  "scale":1, "material":3, "global":1}
-    if n_parts <= 10: return {"deletion":10, "modification":10, "scale":1, "material":4, "global":1}
-    if n_parts <= 12: return {"deletion":12, "modification":12, "scale":1, "material":4, "global":2}
-    if n_parts <= 14: return {"deletion":14, "modification":14, "scale":1, "material":5, "global":2}
-    return                   {"deletion":16, "modification":16, "scale":1, "material":5, "global":2}
+    if n_parts <= 2:  return {"deletion":1,  "modification":1,  "scale":1, "material":1, "global":3}
+    if n_parts == 3:  return {"deletion":3,  "modification":3,  "scale":1, "material":1, "global":3}
+    if n_parts == 4:  return {"deletion":4,  "modification":4,  "scale":1, "material":2, "global":3}
+    if n_parts == 5:  return {"deletion":5,  "modification":5,  "scale":1, "material":2, "global":3}
+    if n_parts == 6:  return {"deletion":6,  "modification":6,  "scale":1, "material":2, "global":3}
+    if n_parts <= 8:  return {"deletion":8,  "modification":8,  "scale":1, "material":3, "global":3}
+    if n_parts <= 10: return {"deletion":10, "modification":10, "scale":1, "material":4, "global":3}
+    if n_parts <= 12: return {"deletion":12, "modification":12, "scale":1, "material":4, "global":4}
+    if n_parts <= 14: return {"deletion":14, "modification":14, "scale":1, "material":5, "global":4}
+    return                   {"deletion":16, "modification":16, "scale":1, "material":5, "global":4}
 
 
 def validate(parsed: dict, valid_pids: set[int], quota: dict | None = None) -> dict:
