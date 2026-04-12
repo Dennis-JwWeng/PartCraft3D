@@ -64,9 +64,15 @@ def _previews_exist(edit_dir: Path, n: int = 5) -> bool:
 
 
 def _save_previews(edit_dir: Path, imgs: list[np.ndarray]) -> None:
-    """Save list of RGB images as preview_{0..}.png."""
+    """Save list of BGR images as preview_{0..}.png.
+
+    Uses cv2.imwrite (not PIL) to preserve BGR channel order correctly.
+    run_blender() returns BGR; PIL.Image.fromarray() would treat it as RGB
+    and silently swap R/B channels in the saved file.
+    """
+    import cv2 as _cv2
     for i, img in enumerate(imgs):
-        Image.fromarray(img).save(str(edit_dir / f"preview_{i}.png"))
+        _cv2.imwrite(str(edit_dir / f"preview_{i}.png"), img)
 
 
 def _render_ply_views(
@@ -74,25 +80,28 @@ def _render_ply_views(
     frames: list[dict],
     blender: str,
     resolution: int,
+    samples: int = 8,
 ) -> list[np.ndarray]:
     """Render a single PLY file at the given camera frames using Blender.
 
     Uses a temporary directory with a copy of the PLY as part_0.ply to satisfy
     run_blender's expected parts_dir layout (part_*.ply convention).
+
+    ``samples`` controls Cycles sample count.  Default is 8 (GPU, no denoising)
+    which is ~4x faster than the dataset-prerender quality (32 + denoising) and
+    sufficient for VLM quality judgement in sq3.
     """
     from partcraft.render.overview import run_blender as _run_blender
     with tempfile.TemporaryDirectory(prefix="pcv2_s6p_ply_") as tmp:
         tmp_path = Path(tmp)
         # run_blender expects part_*.ply files in parts_dir
         shutil.copy2(ply_path, tmp_path / "part_0.ply")
-        # use_vertex_colors=True: detects vertex color attribute name
-        # dynamically (Blender 4.x compatible) and renders with Principled
-        # BSDF + 3-point lighting, matching the dataset prerender quality.
         imgs = _run_blender(
             tmp_path, blender, resolution,
             [[128, 128, 128]],   # palette unused in vertex-color mode
             frames,
             use_vertex_colors=True,
+            samples=samples,
         )
     return imgs
 
@@ -176,7 +185,7 @@ def run_for_object(
             res.n_fail += 1
             continue
         try:
-            imgs = _render_ply_views(a_ply, frames, blender, resolution)
+            imgs = _render_ply_views(a_ply, frames, blender, resolution, samples=8)
             _save_previews(edit_dir, imgs)
             res.n_ok += 1
         except Exception as e:
@@ -203,7 +212,7 @@ def run_for_object(
             res.n_fail += 1
             continue
         try:
-            imgs = _render_ply_views(before_ply, frames, blender, resolution)
+            imgs = _render_ply_views(before_ply, frames, blender, resolution, samples=8)
             _save_previews(add_dir, imgs)
             res.n_ok += 1
         except Exception as e:

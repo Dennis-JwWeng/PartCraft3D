@@ -109,12 +109,17 @@ def run_blender(
     frames: list[dict],
     *,
     use_vertex_colors: bool = False,
+    samples: int | None = None,
 ) -> list[np.ndarray]:
     """Render parts from the supplied camera frames. Returns list of BGR images.
 
     When ``use_vertex_colors=True`` the Blender script reads the 'Col' face-corner
     color attribute (set by PLY import) instead of painting a solid palette color.
     The color_attributes must NOT be stripped in that mode.
+
+    ``samples`` overrides the Cycles sample count (default: 32 in vertex-color
+    mode, 4 in solid-palette mode).  Pass a lower value (e.g. 8) for fast
+    preview renders where denoising is not needed.
     """
     with tempfile.TemporaryDirectory() as out:
         cmd = [
@@ -127,6 +132,8 @@ def run_blender(
         ]
         if use_vertex_colors:
             cmd.append("--use_vertex_colors")
+        if samples is not None:
+            cmd.extend(["--samples", str(samples)])
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if r.returncode != 0:
             print("[blender stdout]\n" + r.stdout[-3000:])

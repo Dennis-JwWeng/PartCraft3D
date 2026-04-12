@@ -34,11 +34,13 @@ import bpy
 from mathutils import Matrix
 
 
-def init_render(resolution=512, *, use_vertex_colors=False):
+def init_render(resolution=512, *, use_vertex_colors=False, samples=None):
     """Configure Cycles render settings.
 
     Solid-palette mode: CPU, 4 samples, no denoising (fast).
     Vertex-color mode:  GPU if available, 32 samples, denoising on (quality).
+      Pass ``samples`` to override the per-mode default (e.g. 8 for preview).
+      When samples < 32, denoising is disabled to avoid the extra pass overhead.
     """
     sc = bpy.context.scene
     sc.render.engine = 'CYCLES'
@@ -49,8 +51,9 @@ def init_render(resolution=512, *, use_vertex_colors=False):
     sc.render.film_transparent = True
 
     if use_vertex_colors:
-        sc.cycles.samples = 32
-        sc.cycles.use_denoising = True
+        n_samples = samples if samples is not None else 32
+        sc.cycles.samples = n_samples
+        sc.cycles.use_denoising = (n_samples >= 32)
         sc.cycles.device = 'GPU'
         try:
             prefs = bpy.context.preferences.addons['cycles'].preferences
@@ -61,7 +64,7 @@ def init_render(resolution=512, *, use_vertex_colors=False):
         except Exception:
             sc.cycles.device = 'CPU'
     else:
-        sc.cycles.samples = 4
+        sc.cycles.samples = samples if samples is not None else 4
         sc.cycles.use_denoising = False
         sc.cycles.device = 'CPU'
 
@@ -187,7 +190,7 @@ def init_camera():
 
 def main(args):
     os.makedirs(args.output_folder, exist_ok=True)
-    init_render(resolution=args.resolution, use_vertex_colors=args.use_vertex_colors)
+    init_render(resolution=args.resolution, use_vertex_colors=args.use_vertex_colors, samples=args.samples)
     init_scene()
 
     if args.use_vertex_colors:
@@ -264,4 +267,6 @@ if __name__ == '__main__':
     p.add_argument('--resolution', type=int, default=512)
     p.add_argument('--use_vertex_colors', action='store_true',
                    help='Use PLY vertex colors with PBR shading instead of solid palette')
+    p.add_argument('--samples', type=int, default=None,
+                   help='Override Cycles sample count (default: 32 vertex-color, 4 solid)')
     main(p.parse_args(argv))
