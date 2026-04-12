@@ -31,13 +31,13 @@ pipeline:
   flux_port_base: 8004
   flux_port_stride: 1
   stages:
-  - {name: A,    desc: "phase1 VLM + QC-A",  servers: vlm,  steps: [s1, sq1]}
-  - {name: C,    desc: "FLUX 2D",             servers: flux, steps: [s4]}
-  - {name: D,    desc: "TRELLIS 3D edit",     servers: none, steps: [s5],      use_gpus: true}
-  - {name: D2,   desc: "deletion mesh",       servers: none, steps: [s5b]}
-  - {name: E,    desc: "3D rerender",         servers: none, steps: [s6, s6b], use_gpus: true}
-  - {name: E_qc, desc: "QC-E final quality",  servers: vlm,  steps: [sq3]}
-  - {name: F,    desc: "addition backfill",   servers: none, steps: [s7]}
+  - {name: A,     desc: "phase1 VLM + QC-A",      servers: vlm,  steps: [s1, sq1]}
+  - {name: C,     desc: "FLUX 2D",                 servers: flux, steps: [s4]}
+  - {name: D,     desc: "TRELLIS 3D edit",          servers: none, steps: [s5],      use_gpus: true}
+  - {name: D2,    desc: "deletion PLY + add meta",  servers: none, steps: [s5b]}
+  - {name: E_pre, desc: "5-view preview render",    servers: none, steps: [s6p],     use_gpus: true}
+  - {name: E_qc,  desc: "QC-E final (all types)",   servers: vlm,  steps: [sq3]}
+  - {name: E,     desc: "3D render + del encode",   servers: none, steps: [s6, s6b], use_gpus: true}
 services:
   vlm:
     model: /mnt/zsn/ckpts/Qwen3.5-27B
