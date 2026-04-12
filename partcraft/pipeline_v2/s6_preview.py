@@ -85,10 +85,14 @@ def _render_ply_views(
         tmp_path = Path(tmp)
         # run_blender expects part_*.ply files in parts_dir
         shutil.copy2(ply_path, tmp_path / "part_0.ply")
+        # use_vertex_colors=True: detects vertex color attribute name
+        # dynamically (Blender 4.x compatible) and renders with Principled
+        # BSDF + 3-point lighting, matching the dataset prerender quality.
         imgs = _run_blender(
             tmp_path, blender, resolution,
-            [[180, 180, 180]],  # single grey part palette
+            [[128, 128, 128]],   # palette unused in vertex-color mode
             frames,
+            use_vertex_colors=True,
         )
     return imgs
 

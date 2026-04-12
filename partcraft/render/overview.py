@@ -107,8 +107,15 @@ def run_blender(
     resolution: int,
     pid_palette: list[list[int]],
     frames: list[dict],
+    *,
+    use_vertex_colors: bool = False,
 ) -> list[np.ndarray]:
-    """Render parts from the supplied camera frames. Returns list of BGR images."""
+    """Render parts from the supplied camera frames. Returns list of BGR images.
+
+    When ``use_vertex_colors=True`` the Blender script reads the 'Col' face-corner
+    color attribute (set by PLY import) instead of painting a solid palette color.
+    The color_attributes must NOT be stripped in that mode.
+    """
     with tempfile.TemporaryDirectory() as out:
         cmd = [
             blender, "-b", "-P", str(_BLENDER_SCRIPT), "--",
@@ -118,6 +125,8 @@ def run_blender(
             "--frames", json.dumps(frames),
             "--resolution", str(resolution),
         ]
+        if use_vertex_colors:
+            cmd.append("--use_vertex_colors")
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if r.returncode != 0:
             print("[blender stdout]\n" + r.stdout[-3000:])
