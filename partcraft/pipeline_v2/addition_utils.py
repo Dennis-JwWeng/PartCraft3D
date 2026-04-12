@@ -21,6 +21,8 @@ def invert_delete_prompt(prompt: str) -> str:
     if not prompt:
         return prompt
     p = prompt.strip()
+    if not p:
+        return ""
     low = p.lower()
     result = None
     for old, new in _INVERT_VERBS:
@@ -32,7 +34,7 @@ def invert_delete_prompt(prompt: str) -> str:
             result = p[:idx + 1] + new + p[idx + 1 + len(old):]
             break
     if result is None:
-        result = "Add back " + p[0].lower() + p[1:]
+        result = "Add back " + p
     # Replace first 'from' with 'to': "Add X from Y" -> "Add X to Y"
     result = result.replace(" from ", " to ", 1)
     return result

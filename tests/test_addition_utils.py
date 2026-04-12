@@ -43,11 +43,13 @@ class TestInvertDeletePrompt:
         assert " to " in result
 
     def test_fallback_no_known_verb(self):
-        result = invert_delete_prompt("Cut off the fin")
-        assert result.startswith("Add back")
+        assert invert_delete_prompt("Cut off the fin") == "Add back Cut off the fin"
 
     def test_empty_string(self):
         assert invert_delete_prompt("") == ""
+
+    def test_whitespace_only(self):
+        assert invert_delete_prompt("   ") == ""
 
     def test_no_from_clause(self):
         assert invert_delete_prompt("Remove the rear spoiler") == "Add the rear spoiler"
