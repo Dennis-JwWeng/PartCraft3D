@@ -157,7 +157,9 @@ you reason before you write the prompt):
                       mod 4. (For global, pick the best overall view.)
   edit_params         deletion: {{}}
                       modification: {{"new_part_desc": "..."}}
-                      scale:        {{"factor": float in [0.3, 2.5]}}
+                      scale:        {{"factor": float in [0.3, 0.85]}}
+                                    Shrink only. Prefer large/dominant parts (main body, primary limbs).
+                                    Do NOT enlarge small decorative parts.
                       material:     {{"target_material": "..."}}
                       global:       {{"target_style": "..."}}
   after_desc_full / after_desc_stage1 / after_desc_stage2
