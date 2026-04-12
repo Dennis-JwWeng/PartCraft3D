@@ -54,6 +54,102 @@ bash scripts/tools/setup_pipeline_env.sh --check
 
 （`--check` 模式下同样支持 `--machine-env <path>`，与其他 setup 脚本一致。）
 
+## 3.5. 确认数据可用性
+
+pipeline 运行前须确认以下三类数据在新机器上可访问（路径与 YAML 中 `data.*` 对应）：
+
+```
+<mesh_root>/<shard>/<obj_id>.npz          # 网格 NPZ
+<images_root>/<shard>/<obj_id>.npz        # 多视角渲染图 NPZ
+<slat_dir>/<shard>/<obj_id>_feats.pt      # SLAT 特征
+<slat_dir>/<shard>/<obj_id>_coords.pt
+```
+
+- **NFS / 共享存储**（如 `/mnt/zsn`）：挂载后直接可用，无需额外操作。
+- **需要拷贝**：用 `rsync -avz` 同步对应 shard 的 `inputs/` 和 `slat/` 目录。
+- 快速验证（以 shard02 为例）：
+
+  ```bash
+  ls <mesh_root>/02/ | wc -l      # 应与预期对象数一致
+  ls <slat_dir>/02/ | wc -l
+  ```
+
+## 3.6. 适配新机器的 pipeline YAML
+
+若新机器的数据路径与现有 YAML 中的 `data.*` 不同，需创建机器专用配置，
+**不要直接修改共享的 `configs/pipeline_v2_shardXX.yaml`**：
+
+```bash
+cp configs/pipeline_v2_shard02.yaml configs/pipeline_v2_shard02_<newmachine>.yaml
+```
+
+编辑以下字段（其他保持不变）：
+
+| 字段 | 说明 |
+|------|------|
+| `data.output_dir` | 输出根目录（新机器上的绝对路径） |
+| `data.mesh_root` | 网格 NPZ 根目录 |
+| `data.images_root` | 渲染图 NPZ 根目录 |
+| `data.slat_dir` | SLAT 特征根目录 |
+| `ckpt_root` | checkpoints 根目录 |
+| `blender` | Blender 可执行文件路径 |
+| `services.vlm.model` | VLM 模型路径（须与 machine env 的 `VLM_CKPT` 保持一致） |
+
+## 3.7. 冒烟验证：先跑 10 个对象全流程
+
+**在提交大规模批跑前，必须先用 `LIMIT=10` 跑通全流程**，验证数据、模型、服务、输出路径均正常：
+
+```bash
+# 在 tmux 会话内（仓库根目录）
+LIMIT=10 bash scripts/tools/run_pipeline_v2_shard.sh shard02_test10 \
+    configs/pipeline_v2_shard02_<newmachine>.yaml
+```
+
+预期行为：脚本依次启动 VLM → 跑 Stage A → 停 VLM → 启动 FLUX → 跑 Stage C → … → 全部 stages done。
+检查产物：
+
+```bash
+# 10 个对象应各有 phase1/parsed.json、edits_2d/ 等
+ls <output_dir>/objects/<shard>/ | head -15
+```
+
+也可只验证某单个阶段：
+
+```bash
+LIMIT=10 STAGES=A bash scripts/tools/run_pipeline_v2_shard.sh shard02_smoke \
+    configs/pipeline_v2_shard02_<newmachine>.yaml
+```
+
+冒烟通过后再去掉 `LIMIT=10` 提交全量批跑。
+
+## 3.8. 清除错误的运行结果（重跑前重置）
+
+若发现已跑批次的结果有误（如配置错误、VLM 输出不对），需在重跑前清除 phase1 及下游产物：
+
+```python
+# 清除指定 shard 下所有对象的 phase1 及依赖步骤
+import json, os, shutil, glob
+
+SHARD_OBJ_DIR = "<output_dir>/objects/<shard>/"
+DOWNSTREAM_KEYS = {"s1_phase1", "s4_flux_2d", "s5_trellis", "s5b_del_mesh"}
+
+for status_path in glob.glob(SHARD_OBJ_DIR + "*/status.json"):
+    obj_dir = os.path.dirname(status_path)
+    for sub in ["phase1", "edits_2d"]:
+        d = os.path.join(obj_dir, sub)
+        if os.path.isdir(d):
+            shutil.rmtree(d)
+    with open(status_path) as f:
+        s = json.load(f)
+    for k in list(s.get("steps", {}).keys()):
+        if k in DOWNSTREAM_KEYS:
+            del s["steps"][k]
+    with open(status_path, "w") as f:
+        json.dump(s, f, indent=2)
+```
+
+清除后再按步骤 3.7 先做 `LIMIT=10` 冒烟，确认正常再全量重跑。
+
 ## 4. 运行 shard 管线（默认阶段与 `STAGES` 覆盖）
 
 在仓库根目录：
