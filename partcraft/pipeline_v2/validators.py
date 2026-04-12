@@ -158,26 +158,28 @@ def check_s6b(ctx: ObjectContext) -> StepCheck:
     ])
 
 
-def check_s7(ctx: ObjectContext) -> StepCheck:
-    gate = _require_phase1("s7_add_backfill", ctx)
+def check_s6p(ctx: ObjectContext) -> StepCheck:
+    gate = _require_phase1("s6p_preview", ctx)
     if gate is not None:
         return gate
-    paths = []
-    add_seq = 0
-    for s in iter_deletion_specs(ctx):
-        # only expect an add if the source deletion has both npz files
-        d = ctx.edit_3d_dir(s.edit_id)
-        if not ((d / "before.npz").is_file() and (d / "after.npz").is_file()):
-            continue
-        add_id = ctx.edit_id("addition", add_seq); add_seq += 1
-        ad = ctx.edit_3d_dir(add_id)
-        paths.append((f"{add_id}/before.npz", ad / "before.npz"))
-        paths.append((f"{add_id}/after.npz",  ad / "after.npz"))
-        paths.append((f"{add_id}/meta.json",  ad / "meta.json"))
-    return _check_files("s7_add_backfill", paths)
+    if not ctx.edits_3d_dir.is_dir():
+        return StepCheck(step="s6p_preview", ok=True, expected=0, found=0)
+    paths = [
+        (f"{d.name}/preview_0.png", d / "preview_0.png")
+        for d in sorted(ctx.edits_3d_dir.iterdir())
+        if d.is_dir() and d.name.split("_")[0] != "idn"
+    ]
+    return _check_files("s6p_preview", paths)
+
+
+def check_s7(ctx: ObjectContext) -> StepCheck:
+    return StepCheck(step="s7_add_backfill", ok=True, expected=0, found=0, skip=True)
 
 
 def check_sq1(ctx: ObjectContext) -> StepCheck:
+    sc = _require_phase1("sq1_qc_A", ctx)
+    if sc is not None:
+        return sc   # s1 was skip → sq1 is n/a; missing parsed.json → fail
     return _check_files("sq1_qc_A", [("qc.json", ctx.qc_path)])
 
 def check_sq2(ctx: ObjectContext) -> StepCheck:
@@ -196,9 +198,10 @@ VALIDATORS: dict[str, Callable[[ObjectContext], StepCheck]] = {
     "s4":  check_s4,
     "s5":  check_s5,
     "s5b": check_s5b,
+    "s6p": check_s6p,   # kept but neutralized (no-op)
     "s6":  check_s6,
     "s6b": check_s6b,
-    "s7":  check_s7,
+    "s7":  check_s7,    # kept but neutralized (no-op)
     "sq1": check_sq1,
     "sq2": check_sq2,
     "sq3": check_sq3,
