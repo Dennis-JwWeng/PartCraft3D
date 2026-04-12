@@ -148,8 +148,12 @@ def run_for_object(
             if which == "after":
                 preview = edit_dir / f"preview_{spec.view_index}.png"
                 if preview.is_file():
-                    _hardlink_or_copy(preview, png)
-                    res.n_ok += 1
+                    try:
+                        _hardlink_or_copy(preview, png)
+                        res.n_ok += 1
+                    except Exception as e:
+                        log.warning("[s6] %s/after preview link: %s", edit_id, e)
+                        res.n_fail += 1
                     continue
             try:
                 slat = load_slat(npz)
