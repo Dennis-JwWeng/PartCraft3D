@@ -165,19 +165,16 @@ def run_for_object(
 
 
 def run(
-    ctxs: Iterable[ObjectContext],
+    ctxs,
     *,
     force: bool = False,
-    logger: logging.Logger | None = None,
-) -> list[AdditionBackfillResult]:
-    log = logger or logging.getLogger("pipeline_v2.s7")
-    out: list[AdditionBackfillResult] = []
-    for ctx in list(ctxs):
-        if not force and step_done(ctx, "s7_add_backfill"):
-            out.append(AdditionBackfillResult(ctx.obj_id))
-            continue
-        out.append(run_for_object(ctx, force=force, logger=log))
-    return out
+    logger=None,
+):
+    """No-op: addition backfill is now inline in s5b (invert_delete_prompt)."""
+    import logging as _l
+    log = logger or _l.getLogger("pipeline_v2.s7")
+    log.info("[s7] no-op: addition backfill moved to s5b")
+    return []
 
 
 __all__ = [
