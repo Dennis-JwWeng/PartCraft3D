@@ -74,6 +74,8 @@ def _backfill_add(ctx, del_spec, add_seq, *, force=False, logger=None):
             "view_index": del_spec.view_index,
             "prompt": invert_delete_prompt(del_spec.prompt),
             "target_part_desc": del_spec.target_part_desc,
+            "object_desc": del_spec.object_desc,
+            "part_labels": list(del_spec.part_labels),
             "rationale": f"inverse of {del_spec.edit_id}",
         }, ensure_ascii=False, indent=2))
         return True
@@ -116,6 +118,8 @@ def run_mesh_delete_for_object(
         pair_dir = ctx.edit_3d_dir(spec.edit_id)
         a_ply = pair_dir / "after.ply"
         if a_ply.is_file() and not force:
+            # PLY already exists — still backfill add meta if missing
+            _backfill_add(ctx, spec, add_seq, force=False, logger=log)
             res.n_skip += 1
             add_seq += 1
             continue

@@ -136,9 +136,24 @@ def rebuild_manifest(root: PipelineRoot) -> Path:
                     "steps": s.get("steps") or {},
                     "updated": s.get("updated"),
                 }, ensure_ascii=False))
-    tmp = root.manifest_path.with_suffix(".jsonl.tmp")
-    tmp.write_text("\n".join(lines) + ("\n" if lines else ""))
-    os.replace(tmp, root.manifest_path)
+    # Use a per-process tmp name to avoid races when multiple GPU workers
+    # call rebuild_manifest concurrently (fixed name causes FileNotFoundError
+    # when os.replace removes the tmp before another worker can rename it).
+    import tempfile
+    fd, tmp_str = tempfile.mkstemp(
+        suffix=".jsonl.tmp", dir=str(root.manifest_path.parent)
+    )
+    tmp = Path(tmp_str)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(lines) + ("\n" if lines else ""))
+        os.replace(tmp, root.manifest_path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return root.manifest_path
 
 

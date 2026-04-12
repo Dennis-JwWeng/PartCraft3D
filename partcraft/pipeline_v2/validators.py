@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Callable
 
 from .paths import ObjectContext
+from .qc_io import is_edit_qc_failed, is_gate_a_failed
 from .specs import iter_all_specs, iter_deletion_specs, iter_flux_specs
 from .status import (
     STATUS_OK, STATUS_FAIL, STATUS_SKIP, load_status, save_status,
@@ -111,6 +112,7 @@ def check_s4(ctx: ObjectContext) -> StepCheck:
     return _check_files("s4_flux_2d", [
         (f"{s.edit_id}_edited.png", ctx.edit_2d_output(s.edit_id))
         for s in iter_flux_specs(ctx)
+        if not is_edit_qc_failed(ctx, s.edit_id)
     ])
 
 
@@ -120,6 +122,8 @@ def check_s5(ctx: ObjectContext) -> StepCheck:
         return gate
     paths = []
     for s in iter_flux_specs(ctx):
+        if is_gate_a_failed(ctx, s.edit_id):
+            continue
         paths.append((f"{s.edit_id}/before.npz", ctx.edit_3d_npz(s.edit_id, "before")))
         paths.append((f"{s.edit_id}/after.npz",  ctx.edit_3d_npz(s.edit_id, "after")))
     return _check_files("s5_trellis", paths)
@@ -143,6 +147,8 @@ def check_s6(ctx: ObjectContext) -> StepCheck:
         return gate
     paths = []
     for s in iter_flux_specs(ctx):
+        if is_gate_a_failed(ctx, s.edit_id):
+            continue
         paths.append((f"{s.edit_id}/before.png", ctx.edit_3d_png(s.edit_id, "before")))
         paths.append((f"{s.edit_id}/after.png",  ctx.edit_3d_png(s.edit_id, "after")))
     return _check_files("s6_render_3d", paths)
@@ -165,9 +171,10 @@ def check_s6p(ctx: ObjectContext) -> StepCheck:
     if not ctx.edits_3d_dir.is_dir():
         return StepCheck(step="s6p_preview", ok=True, expected=0, found=0)
     paths = [
-        (f"{d.name}/preview_0.png", d / "preview_0.png")
+        (f"{d.name}/preview_{i}.png", d / f"preview_{i}.png")
         for d in sorted(ctx.edits_3d_dir.iterdir())
         if d.is_dir() and d.name.split("_")[0] != "idn"
+        for i in range(5)
     ]
     return _check_files("s6p_preview", paths)
 
@@ -189,7 +196,23 @@ def check_sq2(ctx: ObjectContext) -> StepCheck:
     return _check_files("sq2_qc_C", [("qc.json", ctx.qc_path)])
 
 def check_sq3(ctx: ObjectContext) -> StepCheck:
-    return _check_files("sq3_qc_E", [("qc.json", ctx.qc_path)])
+    sc = _check_files("sq3_qc_E", [("qc.json", ctx.qc_path)])
+    if not sc.ok:
+        return sc
+    # Extra: verify at least one edit actually has gate E filled in.
+    try:
+        edits = json.loads(ctx.qc_path.read_text()).get("edits") or {}
+        has_gate_e = any(
+            (e.get("gates") or {}).get("E") is not None
+            for e in edits.values()
+        )
+        if edits and not has_gate_e:
+            return StepCheck(step="sq3_qc_E", ok=False,
+                             expected=len(edits), found=0,
+                             missing=["gate_E_not_written"])
+    except Exception:
+        pass
+    return sc
 
 
 VALIDATORS: dict[str, Callable[[ObjectContext], StepCheck]] = {
@@ -235,3 +258,4 @@ def apply_check(ctx: ObjectContext, step_short: str) -> StepCheck:
 
 
 __all__ = ["StepCheck", "VALIDATORS", "apply_check"]
+
