@@ -5,15 +5,16 @@ the same per-object loop and ``edits_3d/<edit_id>/`` output dir:
 
 * :func:`run_mesh_delete` (s5b) — CPU only. For every deletion spec
   assemble the GT meshes minus the removed parts → ``before.ply`` /
-  ``after.ply``. Also writes a quick mask-based ``before.npz`` /
-  ``after.npz`` so the dataset can already use the pair while we wait
-  for the proper Phase 5 re-encode.
+  ``after.ply``. Also writes ``add_*/meta.json`` for the inverse
+  addition backfill (NPZ/PNG links are deferred to s6b).
 
 * :func:`run_reencode` (s6b) — GPU. For every deletion edit whose
   ``after.ply`` exists, render 40 views via Blender → DINOv2 voxel
   features → SLAT encoder → SS encoder → overwrite ``after.npz`` with
   the proper full re-encode (matches the legacy
-  ``migrate_slat_to_npz.py`` Phase 5).
+  ``migrate_slat_to_npz.py`` Phase 5). Also writes ``before.npz`` from
+  original SLAT .pt files and hardlinks NPZ/PNG to the paired
+  ``add_*`` directory.
 
 The two phases write distinct status entries (``s5b_del_mesh`` and
 ``s6b_del_reencode``) so the orchestrator can resume / retry them
@@ -21,6 +22,7 @@ independently.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -39,7 +41,7 @@ from .specs import EditSpec, iter_deletion_specs
 from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
 from .qc_io import is_edit_qc_failed, is_gate_a_failed
 from . import services_cfg as psvc
-from .s5_trellis_3d import _ensure_refiner
+from .addition_utils import invert_delete_prompt
 
 
 # ─────────────────── s5b: mesh-direct delete (CPU) ────────────────────
@@ -52,10 +54,36 @@ class DelMeshResult:
     n_skip: int = 0
 
 
+def _backfill_add(ctx, del_spec, add_seq, *, force=False, logger=None):
+    """Create add_*/meta.json. NPZ/PNG links deferred to s6b."""
+    import logging as _l
+    log = logger or _l.getLogger("pipeline_v2.s5b")
+    add_id = ctx.edit_id("addition", add_seq)
+    add_dir = ctx.edit_3d_dir(add_id)
+    meta_path = add_dir / "meta.json"
+    if meta_path.is_file() and not force:
+        return False
+    try:
+        add_dir.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps({
+            "edit_id": add_id, "edit_type": "addition",
+            "obj_id": ctx.obj_id, "shard": ctx.shard,
+            "source_del_id": del_spec.edit_id,
+            "selected_part_ids": list(del_spec.selected_part_ids),
+            "view_index": del_spec.view_index,
+            "prompt": invert_delete_prompt(del_spec.prompt),
+            "target_part_desc": del_spec.target_part_desc,
+            "rationale": f"inverse of {del_spec.edit_id}",
+        }, ensure_ascii=False, indent=2))
+        return True
+    except Exception as e:
+        log.warning("[s5b] add backfill seq=%d: %s", add_seq, e)
+        return False
+
+
 def run_mesh_delete_for_object(
     ctx: ObjectContext,
     *,
-    refiner,        # may be None — only needed for the mask-based npz
     dataset,
     force: bool = False,
     logger: logging.Logger | None = None,
@@ -77,44 +105,30 @@ def run_mesh_delete_for_object(
         update_step(ctx, "s5b_del_mesh", status=STATUS_FAIL, error=str(e))
         res.n_fail = len(specs); return res
 
-    # SLAT once for the cheap mask-based after.npz (overwritten in s6b).
-    ori_slat = None
-    if refiner is not None:
-        try:
-            ori_slat = refiner.encode_object(None, ctx.obj_id)
-        except Exception as e:
-            log.warning("[s5b] %s SLAT preload failed: %s "
-                        "(PLY pair will still be written)", ctx.obj_id, e)
-
+    add_seq = 0
     for spec in specs:
         if is_gate_a_failed(ctx, spec.edit_id):
             log.info("[s5b] skip %s (gate_a_fail)", spec.edit_id)
             res.n_skip += 1
+            add_seq += 1
             continue
         pair_dir = ctx.edit_3d_dir(spec.edit_id)
         a_ply = pair_dir / "after.ply"
         if a_ply.is_file() and not force:
             res.n_skip += 1
+            add_seq += 1
             continue
         try:
             pair_dir.mkdir(parents=True, exist_ok=True)
             TrellisRefiner.direct_delete_mesh(
                 obj_record, spec.selected_part_ids, pair_dir, export_ply=True,
             )
-            # Rough SLAT pair (s6b will overwrite after.npz).
-            if refiner is not None and ori_slat is not None:
-                try:
-                    mask, _ = refiner.build_part_mask(
-                        ctx.obj_id, obj_record, spec.selected_part_ids,
-                        ori_slat, "Deletion",
-                    )
-                    refiner.export_deletion_pair(ori_slat, mask, pair_dir)
-                except Exception as e:
-                    log.warning("[s5b] %s mask npz failed: %s", spec.edit_id, e)
+            _backfill_add(ctx, spec, add_seq, force=force, logger=log)
             res.n_ok += 1
         except Exception as e:
             log.error("[s5b] %s failed: %s", spec.edit_id, e)
             res.n_fail += 1
+        add_seq += 1
 
     obj_record.close()
     update_step(
@@ -133,25 +147,13 @@ def run_mesh_delete(
     mesh_root: Path,
     shard: str = "01",
     force: bool = False,
-    use_refiner: bool = True,
     logger: logging.Logger | None = None,
 ) -> list[DelMeshResult]:
-    """Sequential per-object loop. ``use_refiner=False`` skips the
-    rough mask-based npz (PLY-only mode for pure CPU machines)."""
+    """Sequential per-object loop."""
     log = logger or logging.getLogger("pipeline_v2.s5b")
 
     from partcraft.io.hy3d_loader import HY3DPartDataset
     dataset = HY3DPartDataset(str(images_root), str(mesh_root), [shard])
-
-    refiner = None
-    if use_refiner:
-        p25 = psvc.trellis_image_edit_flat(cfg)
-        data_cfg = cfg.get("data") or {}
-        refiner = _ensure_refiner(
-            p25, cfg.get("ckpt_root"),
-            data_cfg.get("slat_dir"), data_cfg.get("img_enc_dir"),
-            False, log,
-        )
 
     out: list[DelMeshResult] = []
     for ctx in list(ctxs):
@@ -159,7 +161,7 @@ def run_mesh_delete(
             out.append(DelMeshResult(ctx.obj_id))
             continue
         out.append(run_mesh_delete_for_object(
-            ctx, refiner=refiner, dataset=dataset, force=force, logger=log,
+            ctx, dataset=dataset, force=force, logger=log,
         ))
     return out
 
@@ -174,11 +176,59 @@ class DelReencodeResult:
     n_skip: int = 0
 
 
+def _hardlink(src: Path, dst: Path) -> None:
+    """Hard-link src -> dst; fall back to shutil.copy2 on cross-device."""
+    import shutil
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        return
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _write_before_npz(ctx, slat_dir: Path, before_npz: Path) -> None:
+    """Load original SLAT .pt files and save as before.npz."""
+    import torch
+    import numpy as np
+    coords = torch.load(
+        slat_dir / ctx.shard / f"{ctx.obj_id}_coords.pt", map_location="cpu"
+    ).numpy()
+    feats = torch.load(
+        slat_dir / ctx.shard / f"{ctx.obj_id}_feats.pt", map_location="cpu"
+    ).numpy()
+    np.savez(str(before_npz), slat_coords=coords, slat_feats=feats)
+
+
+def _link_add_pair(
+    ctx, spec, add_seq: int, pair_dir: Path, *, logger=None
+) -> None:
+    """Hardlink del/{after,before}.{npz,png} -> add/{before,after}.{npz,png}."""
+    import logging as _l
+    log = logger or _l.getLogger("pipeline_v2.s6b")
+    add_id = ctx.edit_id("addition", add_seq)
+    add_dir = ctx.edit_3d_dir(add_id)
+    if not (add_dir / "meta.json").is_file():
+        return
+    # NPZ: del after -> add before, del before -> add after
+    for del_name, add_name in [("after.npz", "before.npz"), ("before.npz", "after.npz")]:
+        src = pair_dir / del_name
+        if src.is_file():
+            _hardlink(src, add_dir / add_name)
+    # PNG: del after -> add before, del before -> add after
+    for del_name, add_name in [("after.png", "before.png"), ("before.png", "after.png")]:
+        src = pair_dir / del_name
+        if src.is_file():
+            _hardlink(src, add_dir / add_name)
+
+
 def run_reencode_for_object(
     ctx: ObjectContext,
     *,
     ss_encoder,
     blender_path: str,
+    slat_dir: Path,
     work_dir: Path,
     num_views: int = 40,
     force: bool = False,
@@ -198,12 +248,14 @@ def run_reencode_for_object(
 
     work_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
+    add_seq = 0
     for spec in specs:
         pair_dir = ctx.edit_3d_dir(spec.edit_id)
         a_ply = pair_dir / "after.ply"
         a_npz = pair_dir / "after.npz"
         if not a_ply.is_file():
             res.n_fail += 1
+            add_seq += 1
             continue
         # Skip if a_npz already has the full DINOv2-encoded payload.
         # Heuristic: full reencode produces a `dino_voxel_mean` field; the
@@ -215,6 +267,7 @@ def run_reencode_for_object(
                 if "ss" in d.files and d["slat_feats"].shape[0] > 0 and \
                         step_done(ctx, "s6b_del_reencode"):
                     res.n_skip += 1
+                    add_seq += 1
                     continue
             except Exception:
                 pass
@@ -225,10 +278,15 @@ def run_reencode_for_object(
                 num_views=num_views, blender_path=blender_path,
             )
             np.savez(a_npz, **payload)
+            before_npz = pair_dir / "before.npz"
+            if not before_npz.is_file() or force:
+                _write_before_npz(ctx, slat_dir, before_npz)
+            _link_add_pair(ctx, spec, add_seq, pair_dir, logger=log)
             res.n_ok += 1
         except Exception as e:
             log.warning("[s6b] %s: %s", spec.edit_id, e)
             res.n_fail += 1
+        add_seq += 1
 
     update_step(
         ctx, "s6b_del_reencode",
@@ -258,6 +316,9 @@ def run_reencode(
     from partcraft.io.npz_utils import load_ss_encoder
     ss_encoder = load_ss_encoder(Path(cfg.get("ckpt_root", "checkpoints")), "cuda")
 
+    data_cfg = cfg.get("data") or {}
+    slat_dir = Path(data_cfg.get("slat_dir", ""))
+
     if work_dir is None:
         work_dir = Path(tempfile.mkdtemp(prefix="pcv2_s6b_"))
     log.info("[s6b] work_dir=%s", work_dir)
@@ -269,7 +330,8 @@ def run_reencode(
             continue
         out.append(run_reencode_for_object(
             ctx, ss_encoder=ss_encoder, blender_path=blender_path,
-            work_dir=work_dir, num_views=num_views, force=force, logger=log,
+            slat_dir=slat_dir, work_dir=work_dir,
+            num_views=num_views, force=force, logger=log,
         ))
     return out
 
