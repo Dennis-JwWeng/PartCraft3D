@@ -26,3 +26,25 @@ def test_prompt_scale_factor_range_shrink_only():
         "prompt should say 'Shrink only' for scale edits"
     assert "2.5" not in USER_PROMPT_TEMPLATE, \
         "old factor upper bound 2.5 must be removed"
+
+# ── Task 3: modification shape-only constraint in prompt ──────────────────────
+
+@pytest.mark.unit
+def test_prompt_has_modification_shape_only_section():
+    assert "MODIFICATION EDITS" in USER_PROMPT_TEMPLATE, \
+        "prompt must have MODIFICATION EDITS section header"
+    assert "STRICTLY FORBIDDEN" in USER_PROMPT_TEMPLATE, \
+        "prompt must forbid color-only modifications"
+    assert "curved saber blade" in USER_PROMPT_TEMPLATE, \
+        "prompt should include saber blade shape example"
+
+
+@pytest.mark.unit
+def test_prompt_has_r9_hard_rule():
+    assert "R9." in USER_PROMPT_TEMPLATE, \
+        "prompt must have Hard Rule R9 for modification shape constraint"
+    assert "A blue sphere" in USER_PROMPT_TEMPLATE, \
+        "R9 must include the wrong example (color-only)"
+    assert "A flattened disc" in USER_PROMPT_TEMPLATE, \
+        "R9 must include the right example (shape change)"
+

@@ -155,6 +155,19 @@ you reason before you write the prompt):
                       visible. If the edit uses anatomical left/right this
                       MUST equal frontal_view_index OR (frontal_view_index+2)
                       mod 4. (For global, pick the best overall view.)
+
+# MODIFICATION EDITS — SHAPE, FORM AND FUNCTION ONLY
+  A modification replaces the geometry, silhouette, or functional role of a part.
+  Think creatively: what shape or form would be surprising yet meaningful?
+  Examples:
+    • straight sword blade  →  curved saber blade
+    • cylindrical barrel    →  hexagonal prism barrel
+    • spherical head        →  cubic head
+    • upright rabbit ears   →  floppy drooping ears
+  STRICTLY FORBIDDEN in modification: changing only color, surface finish, or
+  material. Those belong exclusively to "material" or "global" edit types.
+  The new_part_desc MUST describe a geometry or silhouette change.
+
   edit_params         deletion: {{}}
                       modification: {{"new_part_desc": "..."}}
                       scale:        {{"factor": float in [0.3, 0.85]}}
@@ -188,6 +201,12 @@ R7. If canonical_front is null, NO directional words anywhere; use group
 R8. If an edit uses anatomical left/right, view_index ∈ {{F, (F+2) mod 4}}
     where F = frontal_view_index, and the rationale must cite the mirror
     reasoning explicitly.
+
+R9. modification edit_params.new_part_desc MUST describe a shape, silhouette, or
+    functional change — NOT a color or material change.
+    Wrong: "A blue sphere"         (color only → use material instead)
+    Right: "A flattened disc"      (shape change)
+    Right: "A curved saber blade"  (functional + shape change)
 
 # OUTPUT FORMAT
 
