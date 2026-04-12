@@ -22,6 +22,7 @@ independently.
 """
 from __future__ import annotations
 
+import errno as _errno
 import json
 import logging
 import os
@@ -177,15 +178,21 @@ class DelReencodeResult:
 
 
 def _hardlink(src: Path, dst: Path) -> None:
-    """Hard-link src -> dst; fall back to shutil.copy2 on cross-device."""
+    """Hard-link src -> dst; fall back to shutil.copy2 on cross-device.
+
+    Unlinks existing dst so re-runs always reflect the current src.
+    """
     import shutil
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists():
-        return
+        dst.unlink()
     try:
         os.link(src, dst)
-    except OSError:
-        shutil.copy2(src, dst)
+    except OSError as exc:
+        if exc.errno == _errno.EXDEV:
+            shutil.copy2(src, dst)
+        else:
+            raise
 
 
 def _write_before_npz(ctx, slat_dir: Path, before_npz: Path) -> None:
@@ -250,6 +257,11 @@ def run_reencode_for_object(
     t0 = time.time()
     add_seq = 0
     for spec in specs:
+        if is_gate_a_failed(ctx, spec.edit_id):
+            log.info("[s6b] skip %s (gate_a_fail)", spec.edit_id)
+            res.n_skip += 1
+            add_seq += 1
+            continue
         pair_dir = ctx.edit_3d_dir(spec.edit_id)
         a_ply = pair_dir / "after.ply"
         a_npz = pair_dir / "after.npz"
