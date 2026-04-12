@@ -116,3 +116,49 @@ def test_validate_r2_material_spam():
     r2_warnings = [w for w in result["warnings"] if any("R2" in str(p) for p in w.get("problems", []))]
     assert len(r2_warnings) == 3, \
         f"Expected 3 R2 warnings for 4 identical material edits, got {len(r2_warnings)}: {r2_warnings}"
+
+
+# ── R2 fix: global exemption + invalid-edit skip ─────────────────────────────
+
+@pytest.mark.unit
+def test_validate_r2_global_edits_exempt():
+    """Two global edits should NOT trigger R2 (globals are exempt)."""
+    edits = [
+        {
+            "edit_type": "global", "selected_part_ids": [],
+            "prompt": "Make it futuristic.", "view_index": 0,
+            "edit_params": {"target_style": "futuristic"},
+            "after_desc_full": "After.", "after_desc_stage1": "After.", "after_desc_stage2": "After.",
+        },
+        {
+            "edit_type": "global", "selected_part_ids": [],
+            "prompt": "Make it retro.", "view_index": 0,
+            "edit_params": {"target_style": "retro"},
+            "after_desc_full": "After.", "after_desc_stage1": "After.", "after_desc_stage2": "After.",
+        },
+    ]
+    parsed = {
+        "object": {"full_desc": "x", "full_desc_stage1": "x", "full_desc_stage2": "x", "parts": []},
+        "edits": edits,
+    }
+    result = validate(parsed, valid_pids=set())
+    r2_warnings = [w for w in result["warnings"] if any("R2" in str(p) for p in w.get("problems", []))]
+    assert len(r2_warnings) == 0, f"Global edits should be R2-exempt, got: {r2_warnings}"
+
+
+@pytest.mark.unit
+def test_validate_r2_skips_already_invalid_edits():
+    """Two edits with invalid edit_type should not trigger R2 (already invalid)."""
+    bad_edit = {
+        "edit_type": "INVALID_TYPE", "selected_part_ids": [0],
+        "prompt": "Change the widget.", "view_index": 0,
+        "edit_params": {}, "after_desc_full": None,
+        "after_desc_stage1": None, "after_desc_stage2": None,
+    }
+    parsed = {
+        "object": {"full_desc": "x", "full_desc_stage1": "x", "full_desc_stage2": "x", "parts": []},
+        "edits": [bad_edit, dict(bad_edit)],
+    }
+    result = validate(parsed, valid_pids={0})
+    r2_warnings = [w for w in result["warnings"] if any("R2" in str(p) for p in w.get("problems", []))]
+    assert len(r2_warnings) == 0, f"Invalid edits should be R2-exempt, got: {r2_warnings}"

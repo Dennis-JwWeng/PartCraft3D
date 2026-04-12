@@ -393,6 +393,7 @@ def validate(parsed: dict, valid_pids: set[int], quota: dict | None = None) -> d
         return out
     type_count: dict[str, int] = {}
     kept = 0
+    _invalid_indices: set[int] = set()
     for i, e in enumerate(edits):
         problems = []
         et = e.get("edit_type")
@@ -419,14 +420,21 @@ def validate(parsed: dict, valid_pids: set[int], quota: dict | None = None) -> d
             problems.append(f"invalid view_index={vi}")
         if problems:
             out["warnings"].append({"edit_index": i, "problems": problems})
+            _invalid_indices.add(i)
         else:
             kept += 1
             type_count[et] = type_count.get(et, 0) + 1
     out["n_kept_edits"] = kept
-    # R2 cross-edit check: no two edits with same (edit_type, selected_part_ids)
+    # R2 cross-edit check: no two valid edits with same (edit_type, selected_part_ids).
+    # Global edits are exempt: they always have selected_part_ids=[] and differ only by
+    # target_style; multiple globals are allowed by quota for large objects.
     seen_signatures: set[tuple] = set()
     for i, e in enumerate(edits):
         et = e.get("edit_type")
+        if et == "global":
+            continue
+        if i in _invalid_indices:
+            continue
         pids = tuple(sorted(e.get("selected_part_ids", [])))
         sig = (et, pids)
         if sig in seen_signatures:
