@@ -49,7 +49,7 @@ def _b64(path, max_w=None):
             h = int(img.height * max_w / img.width)
             img = img.resize((max_w, h), Image.LANCZOS)
         buf = io.BytesIO()
-        img.save(buf, "JPEG", quality=82)
+        img.save(buf, "JPEG", quality=92)
         data = base64.b64encode(buf.getvalue()).decode()
         w = img.width
         return f'<img src="data:image/jpeg;base64,{data}" style="width:{w}px;max-width:100%;border-radius:3px">'
@@ -57,7 +57,7 @@ def _b64(path, max_w=None):
         return f'<span style="color:red;font-size:10px">ERR:{e}</span>'
 
 
-def _strip_row(paths, thumb_h=160):
+def _strip_row(paths, thumb_h=240):
     """Render a horizontal strip of images, each resized to thumb_h tall."""
     from PIL import Image
     import numpy as np
@@ -73,14 +73,14 @@ def _strip_row(paths, thumb_h=160):
         nw = int(w * thumb_h / h)
         imgs.append(cv2.resize(img, (nw, thumb_h)))
     strip = np.hstack(imgs)
-    ok, buf = cv2.imencode(".jpg", strip, [cv2.IMWRITE_JPEG_QUALITY, 82])
+    ok, buf = cv2.imencode(".jpg", strip, [cv2.IMWRITE_JPEG_QUALITY, 92])
     if not ok:
         return None
     data = base64.b64encode(buf).decode()
     return f'<img src="data:image/jpeg;base64,{data}" style="max-width:100%;border-radius:3px">'
 
 
-def _before_strip(ctx_image_npz, view_indices, thumb_h=160):
+def _before_strip(ctx_image_npz, view_indices, thumb_h=240):
     """Load before-state views from images.npz and return a horizontal strip <img>."""
     if not ctx_image_npz or not Path(ctx_image_npz).is_file():
         return None
@@ -94,7 +94,7 @@ def _before_strip(ctx_image_npz, view_indices, thumb_h=160):
             nw = int(w * thumb_h / h)
             resized.append(cv2.resize(img, (nw, thumb_h)))
         strip = np.hstack(resized)
-        ok, buf = cv2.imencode(".jpg", strip, [cv2.IMWRITE_JPEG_QUALITY, 82])
+        ok, buf = cv2.imencode(".jpg", strip, [cv2.IMWRITE_JPEG_QUALITY, 92])
         if not ok:
             return None
         data = base64.b64encode(buf).decode()
@@ -280,7 +280,7 @@ def render_object(obj_dir: Path, status: dict, qc: dict, image_npz: Path | None)
                   "s5b_del_mesh", "s6p_preview", "sq3_qc_E"]
     )
 
-    overview_html = _b64(obj_dir / "phase1" / "overview.png", max_w=900) \
+    overview_html = _b64(obj_dir / "phase1" / "overview.png", max_w=1200) \
                     or "<em style='color:#aaa'>overview.png missing</em>"
 
     qc_edits    = qc.get("edits", {})

@@ -442,8 +442,27 @@ def main(arg):
         # delete_custom_normals()
     print('[INFO] Scene initialized.')
     
-    # normalize scene
-    scale, offset = normalize_scene()
+    # normalize scene — optionally use pre-computed scale/offset from original render
+    if arg.normalize_scale is not None and arg.normalize_offset is not None:
+        # Apply the same normalization as the reference (e.g. original full-mesh prerender)
+        # so that partial meshes (e.g. after deletion) appear at the correct scale.
+        scene_root_objects = [obj for obj in bpy.context.scene.objects.values() if not obj.parent]
+        if len(scene_root_objects) > 1:
+            scene = bpy.data.objects.new("ParentEmpty", None)
+            bpy.context.scene.collection.objects.link(scene)
+            for obj in scene_root_objects:
+                obj.parent = scene
+        else:
+            scene = scene_root_objects[0]
+        scale = arg.normalize_scale
+        offset = Vector(arg.normalize_offset)
+        scene.scale = scene.scale * scale
+        bpy.context.view_layer.update()
+        scene.matrix_world.translation += offset
+        bpy.ops.object.select_all(action="DESELECT")
+        print(f'[INFO] Scene normalized with pre-computed scale={scale:.6f} offset={list(offset)}.')
+    else:
+        scale, offset = normalize_scene()
     print('[INFO] Scene normalized.')
     
     # Initialize camera and lighting
@@ -556,6 +575,10 @@ if __name__ == '__main__':
     parser.add_argument('--save_mist', action='store_true', help='Save the mist distance maps.')
     parser.add_argument('--split_normal', action='store_true', help='Split the normals of the mesh.')
     parser.add_argument('--save_mesh', action='store_true', help='Save the mesh as a .ply file.')
+    parser.add_argument('--normalize_scale', type=float, default=None,
+                        help='Pre-computed normalization scale (from original GLB prerender). Skips recomputing from mesh bbox.')
+    parser.add_argument('--normalize_offset', type=float, nargs=3, default=None,
+                        help='Pre-computed normalization offset x y z (from original GLB prerender).')
     argv = sys.argv[sys.argv.index("--") + 1:]
     args = parser.parse_args(argv)
 

@@ -139,12 +139,32 @@ def _extract_yaw_pitch_views(image_npz: Path) -> list[dict]:
         if r < 1e-6:
             continue
         views.append({
-            "yaw":    math.atan2(cx, cy),
+            "yaw":    math.atan2(cy, cx),   # atan2(y, x): encode_asset x=r·cos(yaw)·cos(p), y=r·sin(yaw)·cos(p)
             "pitch":  math.asin(max(-1.0, min(1.0, cz / r))),
             "radius": r,
             "fov":    frame.get("camera_angle_x", math.radians(40)),
         })
     return views
+
+
+def _read_normalization(image_npz: Path) -> tuple[float, list[float]] | tuple[None, None]:
+    """Read prerender normalization scale+offset from image_npz transforms.json.
+
+    The encode_asset render script saves scale/offset from normalize_scene() into
+    transforms.json so we can replay the *same* normalization on partial meshes
+    (e.g. after deletion) and keep the object at the identical apparent size.
+    Returns (scale, [ox, oy, oz]) or (None, None) if not stored.
+    """
+    try:
+        npz = np.load(str(image_npz), allow_pickle=True)
+        meta = json.loads(bytes(npz["transforms.json"]))
+        scale = meta.get("scale")
+        offset = meta.get("offset")   # [x, y, z]
+        if scale is not None and offset is not None and len(offset) == 3:
+            return float(scale), [float(v) for v in offset]
+    except Exception:
+        pass
+    return None, None
 
 
 def _render_glb_views(
@@ -156,8 +176,10 @@ def _render_glb_views(
 ) -> list[np.ndarray]:
     """Render GLB at VIEW_INDICES cameras using encode_asset Cycles renderer.
 
+    Uses the *same* normalization (scale + offset) that was applied when the
+    original object was pre-rendered, so deleted-part renders appear at the
+    correct apparent size instead of being zoomed-in to the remaining bbox.
     Returns list of BGR numpy arrays (cv2 convention) composited onto white.
-    Alpha-composites RGBA output onto white background (matches overview.py).
     """
     import subprocess
     import cv2 as _cv2
@@ -168,16 +190,22 @@ def _render_glb_views(
             f"Expected {len(VIEW_INDICES)} camera views, got {len(views)}"
         )
 
+    norm_scale, norm_offset = _read_normalization(image_npz)
+
     with tempfile.TemporaryDirectory(prefix="pcv2_s6p_glb_") as tmp:
         tmp_path = Path(tmp)
+        cmd = [
+            blender, "-b", "-P", encode_script, "--",
+            "--object",        str(glb_path),
+            "--output_folder", str(tmp_path),
+            "--views",         json.dumps(views),
+            "--resolution",    str(resolution),
+        ]
+        if norm_scale is not None and norm_offset is not None:
+            cmd += ["--normalize_scale", str(norm_scale),
+                    "--normalize_offset", str(norm_offset[0]), str(norm_offset[1]), str(norm_offset[2])]
         result = subprocess.run(
-            [
-                blender, "-b", "-P", encode_script, "--",
-                "--object",        str(glb_path),
-                "--output_folder", str(tmp_path),
-                "--views",         json.dumps(views),
-                "--resolution",    str(resolution),
-            ],
+            cmd,
             capture_output=True, text=True, timeout=600,
         )
         if result.returncode != 0:
@@ -207,13 +235,18 @@ def _render_slat_views(
     frames: list[dict],
     resolution: int,
 ) -> list[np.ndarray]:
-    """Render 5 views from a SLAT npz using TRELLIS pipeline."""
+    """Render 5 views from a SLAT npz using TRELLIS pipeline.
+
+    render_one_view() returns RGB; convert to BGR so _save_previews()
+    (which calls cv2.imwrite) writes the correct channel order.
+    """
+    import cv2 as _cv2
     from render_phase1v2_3d_results import render_one_view as _render_one_view, load_slat as _load_slat  # type: ignore
     slat = _load_slat(npz_path)
     imgs = []
     for frame in frames:
         img = _render_one_view(pipeline, slat, frame, resolution)
-        imgs.append(img)
+        imgs.append(_cv2.cvtColor(img, _cv2.COLOR_RGB2BGR))
     return imgs
 
 
@@ -255,7 +288,7 @@ def run_for_object(
         return res
 
     from partcraft.render.overview import load_views_from_npz
-    _, frames = load_views_from_npz(ctx.image_npz, VIEW_INDICES)
+    orig_imgs, frames = load_views_from_npz(ctx.image_npz, VIEW_INDICES)  # orig_imgs: BGR, reused for add previews
 
     if not ctx.edits_3d_dir.is_dir():
         update_step(ctx, "s6p_preview", status=STATUS_OK, n=0,
@@ -309,22 +342,18 @@ def run_for_object(
             log.warning("[s6p] add %s: no source_del_id in meta", add_id)
             res.n_fail += 1
             continue
-        before_ply = ctx.edit_3d_dir(source_del_id) / "before.ply"
-        before_glb = ctx.edit_3d_dir(source_del_id) / "before_new.glb"
-        if not before_ply.is_file() and not before_glb.is_file():
-            log.warning("[s6p] add %s: both before.ply and before_new.glb missing", add_id)
+        # add preview = "before-add" state = del's already-rendered preview images.
+        # The del edit already rendered its after mesh (object with part missing) as
+        # preview_*.png; we copy those directly — no Blender call needed.
+        del_dir = ctx.edit_3d_dir(source_del_id)
+        del_previews = sorted(del_dir.glob("preview_*.png"))
+        if not del_previews:
+            log.warning("[s6p] add %s: del %s has no preview_*.png yet", add_id, source_del_id)
             res.n_fail += 1
             continue
         try:
-            if before_glb.is_file():
-                imgs = _render_glb_views(
-                    before_glb, ctx.image_npz, _encode_asset_script(),
-                    blender, resolution,
-                )
-            else:
-                log.debug("[s6p] add %s: no before_new.glb, PLY fallback", add_id)
-                imgs = _render_ply_views(before_ply, frames, blender, resolution, samples=32)
-            _save_previews(add_dir, imgs)
+            for src in del_previews:
+                shutil.copy2(src, add_dir / src.name)
             res.n_ok += 1
         except Exception as e:
             log.warning("[s6p] add %s: %s", add_id, e)
