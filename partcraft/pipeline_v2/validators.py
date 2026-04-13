@@ -23,7 +23,7 @@ from .qc_io import is_edit_qc_failed, is_gate_a_failed
 from .specs import iter_all_specs, iter_deletion_specs, iter_flux_specs
 from .status import (
     STATUS_OK, STATUS_FAIL, STATUS_SKIP, load_status, save_status,
-    step_done, _status_lock,
+    _status_lock,
 )
 
 
