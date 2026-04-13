@@ -103,11 +103,15 @@ P4. MIRROR RULE (only valid when canonical_front and frontal_view_index are set)
        "frontal_view_index=1; target visible in view 1 on the image-RIGHT
         half → mirror → object's anatomical LEFT ear."
 
-P5. SYMMETRY → GROUP EDITS. For every pair/group of symmetric parts (both
-    eyes, both ears, all four wheels, the pair of arms), prefer a SINGLE
-    group edit whose selected_part_ids contains every member of the group
-    ("Remove BOTH ears", "Make ALL FOUR wheels larger"). Group edits avoid
-    the left/right problem entirely. Mix group and single-part edits.
+P5. PEER GROUPS → GROUP EDITS. The part menu marks ``peer_group=[i,j,...]``
+    for parts that are semantically equivalent (same structural tier, similar
+    size). When editing ANY part that belongs to a peer_group, you MUST
+    produce a single group edit whose selected_part_ids includes EVERY member
+    of that peer_group — never edit just one member in isolation.
+    Example: if parts 2 and 3 share peer_group=[2,3], the edit must have
+    selected_part_ids=[2,3], never [2] or [3] alone.
+    Parts marked [STRUCTURAL BODY] must never appear in deletion or
+    scale edits (R3 reinforcement). Mix group and single-part edits.
 
 P6. NO PALETTE COLORS. The palette names (red, orange, yellow, lime, green,
     teal, cyan, blue, navy, purple, magenta, pink, brown, tan, black, gray)
@@ -256,19 +260,111 @@ R9. modification edit_params.new_part_desc MUST describe a shape, silhouette, or
 ONE JSON object. Begin with '{{', end with '}}'. No prose, no markdown."""
 
 
-def build_part_menu(mesh_npz: Path, img_npz: Path) -> tuple[list[int], str]:
-    """Return (part_ids, menu text). cluster_size from split_mesh.json."""
+def _load_anno_peer_groups(
+    anno_obj_dir: "Path | None",
+    pids: "list[int]",
+    weight_ratio_thr: float = 0.75,
+) -> "tuple[dict[int,list[int]], set[int], dict[int,int]]":
+    """Load _info.json and compute peer groups and structural parts.
+
+    Returns:
+        peer_groups: {pid: [peer_pid, ...]} — empty list if no peers.
+        structural_pids: set of pids that are structural body (level=0, high weight).
+        pid_levels: {pid: level_value}
+    """
+    if anno_obj_dir is None or not anno_obj_dir.is_dir():
+        return {pid: [] for pid in pids}, set(), {}
+    obj_id = anno_obj_dir.name
+    info_path = anno_obj_dir / f"{obj_id}_info.json"
+    if not info_path.is_file():
+        return {pid: [] for pid in pids}, set(), {}
+    try:
+        info = json.loads(info_path.read_text())
+    except Exception:
+        return {pid: [] for pid in pids}, set(), {}
+
+    levels_list = info.get("ordered_part_level", [])
+    weights_list = info.get("weights", [])
+
+    pid_levels: dict[int, int] = {}
+    pid_weights: dict[int, float] = {}
+    for pid in pids:
+        if pid < len(levels_list):
+            pid_levels[pid] = levels_list[pid]
+        if pid < len(weights_list):
+            pid_weights[pid] = float(weights_list[pid])
+
+    # Group pids by level
+    from collections import defaultdict
+    by_level: dict[int, list[int]] = defaultdict(list)
+    for pid, lv in pid_levels.items():
+        by_level[lv].append(pid)
+
+    # Peer groups: same level + weight ratio >= threshold
+    peer_groups: dict[int, list[int]] = {pid: [] for pid in pids}
+    for lv, group in by_level.items():
+        if len(group) < 2:
+            continue
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                pi, pj = group[i], group[j]
+                wi = pid_weights.get(pi, 0.0)
+                wj = pid_weights.get(pj, 0.0)
+                if wi > 0 and wj > 0 and min(wi, wj) / max(wi, wj) >= weight_ratio_thr:
+                    if pj not in peer_groups[pi]:
+                        peer_groups[pi].append(pj)
+                    if pi not in peer_groups[pj]:
+                        peer_groups[pj].append(pi)
+
+    # Structural pids: level == 0 AND weight > 2× median weight
+    structural_pids: set[int] = set()
+    if pid_weights:
+        import statistics
+        med = statistics.median(pid_weights.values())
+        for pid, lv in pid_levels.items():
+            if lv == 0 and pid_weights.get(pid, 0) > 2.0 * med:
+                structural_pids.add(pid)
+
+    return peer_groups, structural_pids, pid_levels
+
+
+def build_part_menu(
+    mesh_npz: Path,
+    img_npz: Path,
+    anno_obj_dir: "Path | None" = None,
+) -> tuple[list[int], str]:
+    """Return (part_ids, menu text). cluster_size from split_mesh.json.
+
+    If *anno_obj_dir* is given and contains ``{obj_id}_info.json``, the menu
+    is enriched with ``level=`` and ``peer_group=[...]`` annotations so the
+    VLM can identify semantically equivalent parts without geometric reasoning.
+    """
     z = np.load(img_npz, allow_pickle=True)
     sm = json.loads(bytes(z["split_mesh.json"]).decode())
     clusters = sm.get("valid_clusters", {})
     z2 = np.load(mesh_npz, allow_pickle=True)
     pids = sorted(int(k.replace("part_", "").replace(".ply", ""))
                   for k in z2.files if k.startswith("part_"))
+
+    peer_groups, structural_pids, pid_levels = _load_anno_peer_groups(anno_obj_dir, pids)
+
     lines = []
     for pid in pids:
         cs = clusters.get(f"part_{pid}", {}).get("cluster_size", "?")
         color = _PALETTE_NAMES[pid % len(_PALETTE_NAMES)]
-        lines.append(f"  part_{pid:<3d} {color:<8s}  cluster_size={cs}")
+        base = f"  part_{pid:<3d} {color:<8s}  cluster_size={cs}"
+        if pid in pid_levels:
+            lv = pid_levels[pid]
+            if pid in structural_pids:
+                base += f"  level={lv}  [STRUCTURAL BODY — do not delete]"
+            else:
+                peers = peer_groups.get(pid, [])
+                if peers:
+                    all_members = sorted([pid] + peers)
+                    base += f"  level={lv}  peer_group={all_members}"
+                else:
+                    base += f"  level={lv}"
+        lines.append(base)
     return pids, "\n".join(lines)
 
 

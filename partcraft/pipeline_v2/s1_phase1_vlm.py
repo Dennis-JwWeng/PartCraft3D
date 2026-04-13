@@ -70,7 +70,8 @@ def prerender(ctx: ObjectContext, blender: str) -> tuple[bytes, str, list[int], 
     """
     if ctx.mesh_npz is None or ctx.image_npz is None:
         raise ValueError(f"{ctx} missing mesh_npz/image_npz")
-    pids, menu = build_part_menu(ctx.mesh_npz, ctx.image_npz)
+    _anno = ctx.root.anno_object_dir(ctx.obj_id)
+    pids, menu = build_part_menu(ctx.mesh_npz, ctx.image_npz, anno_obj_dir=_anno)
     if len(pids) > MAX_PARTS:
         return None
     quota = quota_for(len(pids))
@@ -320,7 +321,7 @@ def _prerender_worker(args: tuple) -> tuple | None:
     object exceeds ``MAX_PARTS``. Side effect: writes
     ``overview_path`` if it doesn't already exist.
     """
-    mesh_npz, image_npz, blender, overview_path = args
+    mesh_npz, image_npz, blender, overview_path, anno_obj_dir_str = args
     from pathlib import Path as _P
     from partcraft.pipeline_v2.s1_vlm_core import (  # noqa: E402
         build_part_menu as _bpm,
@@ -330,7 +331,8 @@ def _prerender_worker(args: tuple) -> tuple | None:
         MAX_PARTS as _MAX,
     )
     mesh_p = _P(mesh_npz); img_p = _P(image_npz); ov_p = _P(overview_path)
-    pids, menu = _bpm(mesh_p, img_p)
+    _anno_p = _P(anno_obj_dir_str) if anno_obj_dir_str else None
+    pids, menu = _bpm(mesh_p, img_p, anno_obj_dir=_anno_p)
     if len(pids) > _MAX:
         return None
     quota = _qf(len(pids))
@@ -423,10 +425,12 @@ async def run_many_streaming(
 
     async def render_one(ctx: ObjectContext):
         try:
+            _anno_dir = ctx.root.anno_object_dir(ctx.obj_id)
             pre = await loop.run_in_executor(
                 pool, _prerender_worker,
                 (str(ctx.mesh_npz), str(ctx.image_npz),
-                 blender, str(ctx.overview_path)),
+                 blender, str(ctx.overview_path),
+                 str(_anno_dir) if _anno_dir else ""),
             )
         except Exception as e:
             log.warning("prerender %s: %s", ctx.obj_id[:12], e)
