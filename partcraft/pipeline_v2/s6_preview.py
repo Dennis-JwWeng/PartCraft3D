@@ -29,6 +29,16 @@ import numpy as np
 from PIL import Image
 
 _ROOT = Path(__file__).resolve().parents[2]
+
+
+def _encode_asset_script() -> str:
+    """Return absolute path to encode_asset/blender_script/render.py."""
+    p = _ROOT / "third_party" / "encode_asset" / "blender_script" / "render.py"
+    if not p.is_file():
+        raise FileNotFoundError(f"encode_asset render script not found: {p}")
+    return str(p)
+
+
 sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT / "scripts" / "standalone"))
 sys.path.insert(0, str(_ROOT / "third_party"))
@@ -105,6 +115,90 @@ def _render_ply_views(
             samples=samples,
         )
     return imgs
+
+
+def _extract_yaw_pitch_views(image_npz: Path) -> list[dict]:
+    """Extract yaw/pitch/radius/fov camera params for VIEW_INDICES from image NPZ.
+
+    The NPZ contains 'transforms.json' with camera frames. We extract the
+    matching VIEW_INDICES frames and convert transform_matrix to yaw/pitch/radius/fov
+    for use with encode_asset/blender_script/render.py.
+    """
+    import math
+    npz = np.load(str(image_npz), allow_pickle=True)
+    frames = json.loads(bytes(npz["transforms.json"]))["frames"]
+    views = []
+    for vi in VIEW_INDICES:
+        if vi >= len(frames):
+            continue
+        frame = frames[vi]
+        m = frame["transform_matrix"]
+        # Camera position from c2w matrix (last column, first 3 rows)
+        cx, cy, cz = m[0][3], m[1][3], m[2][3]
+        r = math.sqrt(cx ** 2 + cy ** 2 + cz ** 2)
+        if r < 1e-6:
+            continue
+        views.append({
+            "yaw":    math.atan2(cx, cy),
+            "pitch":  math.asin(max(-1.0, min(1.0, cz / r))),
+            "radius": r,
+            "fov":    frame.get("camera_angle_x", math.radians(40)),
+        })
+    return views
+
+
+def _render_glb_views(
+    glb_path: Path,
+    image_npz: Path,
+    encode_script: str,
+    blender: str,
+    resolution: int,
+) -> list[np.ndarray]:
+    """Render GLB at VIEW_INDICES cameras using encode_asset Cycles renderer.
+
+    Returns list of BGR numpy arrays (cv2 convention) composited onto white.
+    Alpha-composites RGBA output onto white background (matches overview.py).
+    """
+    import subprocess
+    import cv2 as _cv2
+
+    views = _extract_yaw_pitch_views(image_npz)
+    if len(views) != len(VIEW_INDICES):
+        raise RuntimeError(
+            f"Expected {len(VIEW_INDICES)} camera views, got {len(views)}"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="pcv2_s6p_glb_") as tmp:
+        tmp_path = Path(tmp)
+        result = subprocess.run(
+            [
+                blender, "-b", "-P", encode_script, "--",
+                "--object",        str(glb_path),
+                "--output_folder", str(tmp_path),
+                "--views",         json.dumps(views),
+                "--resolution",    str(resolution),
+            ],
+            capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"encode_asset Blender failed:\n{result.stderr[-400:]}"
+            )
+
+        imgs = []
+        for i in range(len(VIEW_INDICES)):
+            png = tmp_path / f"{i:03d}.png"
+            if not png.is_file():
+                raise RuntimeError(f"Missing render output: {png}")
+            arr = np.array(Image.open(str(png)).convert("RGBA"), dtype=np.float32) / 255.0
+            r_ch, g_ch, b_ch, a = arr[..., 0], arr[..., 1], arr[..., 2], arr[..., 3]
+            rgb = np.stack([
+                (r_ch * a + (1 - a)) * 255,
+                (g_ch * a + (1 - a)) * 255,
+                (b_ch * a + (1 - a)) * 255,
+            ], axis=-1).clip(0, 255).astype(np.uint8)
+            imgs.append(_cv2.cvtColor(rgb, _cv2.COLOR_RGB2BGR))
+        return imgs
 
 
 def _render_slat_views(
@@ -186,7 +280,15 @@ def run_for_object(
             res.n_fail += 1
             continue
         try:
-            imgs = _render_ply_views(a_ply, frames, blender, resolution, samples=32)
+            after_glb = edit_dir / "after_new.glb"
+            if after_glb.is_file():
+                imgs = _render_glb_views(
+                    after_glb, ctx.image_npz, _encode_asset_script(),
+                    blender, resolution,
+                )
+            else:
+                log.debug("[s6p] del %s: no after_new.glb, PLY fallback", spec.edit_id)
+                imgs = _render_ply_views(a_ply, frames, blender, resolution, samples=32)
             _save_previews(edit_dir, imgs)
             res.n_ok += 1
         except Exception as e:
@@ -213,7 +315,15 @@ def run_for_object(
             res.n_fail += 1
             continue
         try:
-            imgs = _render_ply_views(before_ply, frames, blender, resolution, samples=32)
+            before_glb = ctx.edit_3d_dir(source_del_id) / "before_new.glb"
+            if before_glb.is_file():
+                imgs = _render_glb_views(
+                    before_glb, ctx.image_npz, _encode_asset_script(),
+                    blender, resolution,
+                )
+            else:
+                log.debug("[s6p] add %s: no before_new.glb, PLY fallback", add_id)
+                imgs = _render_ply_views(before_ply, frames, blender, resolution, samples=32)
             _save_previews(add_dir, imgs)
             res.n_ok += 1
         except Exception as e:
