@@ -42,7 +42,7 @@ pipeline:
     use_gpus: true
     parallel_group: "D+D2"
   - name: D2
-    desc: deletion PLY + add meta
+    desc: deletion GLB masking + add meta
     servers: none
     steps:
     - s5b

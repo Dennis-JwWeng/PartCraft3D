@@ -136,9 +136,10 @@ def check_s5b(ctx: ObjectContext) -> StepCheck:
         return gate
     paths = []
     for s in iter_deletion_specs(ctx):
+        if is_gate_a_failed(ctx, s.edit_id):
+            continue
         d = ctx.edit_3d_dir(s.edit_id)
-        paths.append((f"{s.edit_id}/before.ply", d / "before.ply"))
-        paths.append((f"{s.edit_id}/after.ply",  d / "after.ply"))
+        paths.append((f"{s.edit_id}/after_new.glb", d / "after_new.glb"))
     return _check_files("s5b_del_mesh", paths)
 
 

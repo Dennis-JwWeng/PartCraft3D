@@ -1,20 +1,21 @@
-"""Step s5b / s6b — Deletion mesh-direct delete + PLY → SLAT/SS re-encode.
+"""Step s5b / s6b — Deletion GLB masking + SLAT/SS re-encode.
 
 Two halves of the deletion path, kept in one module because they share
 the same per-object loop and ``edits_3d/<edit_id>/`` output dir:
 
-* :func:`run_mesh_delete` (s5b) — CPU only. For every deletion spec
-  assemble the GT meshes minus the removed parts → ``before.ply`` /
-  ``after.ply``. Also writes ``add_*/meta.json`` for the inverse
-  addition backfill (NPZ/PNG links are deferred to s6b).
+* :func:`run_mesh_delete` (s5b) — CPU only. For every deletion spec,
+  builds ``after_new.glb`` by KD-tree face-centroid matching from the
+  normalized source GLB (UV-textured, high quality). Also writes
+  ``add_*/meta.json`` for the inverse addition backfill.
+  Requires ``normalized_glb_dir`` and ``anno_dir`` in pipeline config.
+  Legacy PLY path (``TrellisRefiner.direct_delete_mesh``) is retained
+  as fallback when those dirs are not configured.
 
-* :func:`run_reencode` (s6b) — GPU. For every deletion edit whose
-  ``after.ply`` exists, render 40 views via Blender → DINOv2 voxel
-  features → SLAT encoder → SS encoder → overwrite ``after.npz`` with
-  the proper full re-encode (matches the legacy
-  ``migrate_slat_to_npz.py`` Phase 5). Also writes ``before.npz`` from
-  original SLAT .pt files and hardlinks NPZ/PNG to the paired
-  ``add_*`` directory.
+* :func:`run_reencode` (s6b) — GPU. Runs after VLM filtering. For
+  every surviving deletion edit, re-encodes ``after.ply`` (or GLB)
+  via Blender 40-view render → DINOv2 → SLAT encoder → SS encoder →
+  ``after.npz``. Also writes ``before.npz`` and hardlinks NPZ/PNG to
+  the paired ``add_*`` directory.
 
 The two phases write distinct status entries (``s5b_del_mesh`` and
 ``s6b_del_reencode``) so the orchestrator can resume / retry them
@@ -185,13 +186,12 @@ def _build_deletion_glb(
 def run_mesh_delete_for_object(
     ctx: ObjectContext,
     *,
-    dataset,
+    dataset=None,          # only used in legacy PLY path (normalized_glb_dir not set)
     normalized_glb_dir: "Path | None" = None,
     anno_dir: "Path | None" = None,
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> DelMeshResult:
-    from partcraft.trellis.refiner import TrellisRefiner
     log = logger or logging.getLogger("pipeline_v2.s5b")
     res = DelMeshResult(obj_id=ctx.obj_id)
 
@@ -201,12 +201,25 @@ def run_mesh_delete_for_object(
                     reason="no_deletions")
         return res
 
-    try:
-        obj_record = dataset.load_object(ctx.shard, ctx.obj_id)
-    except Exception as e:
-        log.error("[s5b] %s load failed: %s", ctx.obj_id, e)
-        update_step(ctx, "s5b_del_mesh", status=STATUS_FAIL, error=str(e))
-        res.n_fail = len(specs); return res
+    use_glb = bool(normalized_glb_dir and anno_dir)
+
+    # Legacy PLY path: load heavy dataset only when GLB dirs are not configured.
+    obj_record = None
+    if not use_glb:
+        from partcraft.trellis.refiner import TrellisRefiner
+        if dataset is None:
+            log.error("[s5b] %s: dataset required for PLY path but not provided", ctx.obj_id)
+            update_step(ctx, "s5b_del_mesh", status=STATUS_FAIL,
+                        error="dataset_required_for_ply_path")
+            res.n_fail = len(specs)
+            return res
+        try:
+            obj_record = dataset.load_object(ctx.shard, ctx.obj_id)
+        except Exception as e:
+            log.error("[s5b] %s load failed: %s", ctx.obj_id, e)
+            update_step(ctx, "s5b_del_mesh", status=STATUS_FAIL, error=str(e))
+            res.n_fail = len(specs)
+            return res
 
     add_seq = 0
     for spec in specs:
@@ -216,38 +229,49 @@ def run_mesh_delete_for_object(
             add_seq += 1
             continue
         pair_dir = ctx.edit_3d_dir(spec.edit_id)
-        a_ply = pair_dir / "after.ply"
-        if a_ply.is_file() and not force:
-            # PLY already exists — still backfill add meta if missing
-            if normalized_glb_dir and anno_dir:
-                _build_deletion_glb(
-                    ctx.obj_id, list(spec.selected_part_ids),
-                    pair_dir, normalized_glb_dir, anno_dir,
-                    force=False, logger=log,
-                )
-            _backfill_add(ctx, spec, add_seq, force=False, logger=log)
-            res.n_skip += 1
-            add_seq += 1
-            continue
-        try:
+
+        if use_glb:
+            # ── GLB path (primary) ─────────────────────────────────────
+            after_glb = pair_dir / "after_new.glb"
+            if after_glb.is_file() and not force:
+                _backfill_add(ctx, spec, add_seq, force=False, logger=log)
+                res.n_skip += 1
+                add_seq += 1
+                continue
             pair_dir.mkdir(parents=True, exist_ok=True)
-            TrellisRefiner.direct_delete_mesh(
-                obj_record, spec.selected_part_ids, pair_dir, export_ply=True,
+            ok = _build_deletion_glb(
+                ctx.obj_id, list(spec.selected_part_ids),
+                pair_dir, normalized_glb_dir, anno_dir,
+                force=force, logger=log,
             )
-            if normalized_glb_dir and anno_dir:
-                _build_deletion_glb(
-                    ctx.obj_id, list(spec.selected_part_ids),
-                    pair_dir, normalized_glb_dir, anno_dir,
-                    force=force, logger=log,
+            if ok:
+                _backfill_add(ctx, spec, add_seq, force=force, logger=log)
+                res.n_ok += 1
+            else:
+                res.n_fail += 1
+        else:
+            # ── Legacy PLY path (fallback when GLB dirs not configured) ─
+            a_ply = pair_dir / "after.ply"
+            if a_ply.is_file() and not force:
+                _backfill_add(ctx, spec, add_seq, force=False, logger=log)
+                res.n_skip += 1
+                add_seq += 1
+                continue
+            try:
+                pair_dir.mkdir(parents=True, exist_ok=True)
+                TrellisRefiner.direct_delete_mesh(
+                    obj_record, spec.selected_part_ids, pair_dir, export_ply=True,
                 )
-            _backfill_add(ctx, spec, add_seq, force=force, logger=log)
-            res.n_ok += 1
-        except Exception as e:
-            log.error("[s5b] %s failed: %s", spec.edit_id, e)
-            res.n_fail += 1
+                _backfill_add(ctx, spec, add_seq, force=force, logger=log)
+                res.n_ok += 1
+            except Exception as e:
+                log.error("[s5b] %s failed: %s", spec.edit_id, e)
+                res.n_fail += 1
+
         add_seq += 1
 
-    obj_record.close()
+    if obj_record is not None:
+        obj_record.close()
     update_step(
         ctx, "s5b_del_mesh",
         status=STATUS_OK if res.n_fail == 0 else STATUS_FAIL,
@@ -256,29 +280,57 @@ def run_mesh_delete_for_object(
     return res
 
 
+def _needs_glb_backfill(ctx: ObjectContext) -> bool:
+    """Return True if any deletion edit is missing after_new.glb."""
+    from .specs import iter_deletion_specs as _iter_del
+    from .qc_io import is_gate_a_failed as _gate_a_fail
+    for spec in _iter_del(ctx):
+        if _gate_a_fail(ctx, spec.edit_id):
+            continue
+        if not (ctx.edit_3d_dir(spec.edit_id) / "after_new.glb").is_file():
+            return True
+    return False
+
+
 def run_mesh_delete(
     ctxs: Iterable[ObjectContext],
     *,
     cfg: dict,
-    images_root: Path,
-    mesh_root: Path,
+    images_root: "Path | None" = None,
+    mesh_root: "Path | None" = None,
     shard: str = "01",
     normalized_glb_dir: "Path | None" = None,
     anno_dir: "Path | None" = None,
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> list[DelMeshResult]:
-    """Sequential per-object loop."""
+    """Sequential per-object loop.
+
+    When ``normalized_glb_dir`` and ``anno_dir`` are set (GLB path), the
+    heavy ``HY3DPartDataset`` is not loaded.  Already-done objects that are
+    still missing ``after_new.glb`` are automatically re-processed (backfill).
+    """
     log = logger or logging.getLogger("pipeline_v2.s5b")
 
-    from partcraft.io.hy3d_loader import HY3DPartDataset
-    dataset = HY3DPartDataset(str(images_root), str(mesh_root), [shard])
+    use_glb = bool(normalized_glb_dir and anno_dir)
+
+    # Only load the dataset when the legacy PLY path is needed.
+    dataset = None
+    if not use_glb:
+        from partcraft.io.hy3d_loader import HY3DPartDataset
+        if images_root is None or mesh_root is None:
+            raise ValueError("images_root and mesh_root are required for the PLY path")
+        dataset = HY3DPartDataset(str(images_root), str(mesh_root), [shard])
 
     out: list[DelMeshResult] = []
     for ctx in list(ctxs):
         if not force and step_done(ctx, "s5b_del_mesh"):
-            out.append(DelMeshResult(ctx.obj_id))
-            continue
+            # For GLB path: still run if any edit is missing its GLB (backfill).
+            if use_glb and _needs_glb_backfill(ctx):
+                pass  # fall through to run_mesh_delete_for_object
+            else:
+                out.append(DelMeshResult(ctx.obj_id))
+                continue
         out.append(run_mesh_delete_for_object(
             ctx, dataset=dataset,
             normalized_glb_dir=normalized_glb_dir,

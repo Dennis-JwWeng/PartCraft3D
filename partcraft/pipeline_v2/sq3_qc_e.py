@@ -234,8 +234,15 @@ async def _judge_one_async(
     ctx: ObjectContext,
     target_part_desc: str = "",
     edit_params: dict | None = None,
+    swap_collage: bool = False,
 ) -> tuple[bool, int, int]:
-    """Async VLM judge for one edit. Returns (ok, n_pass_delta, n_fail_delta)."""
+    """Async VLM judge for one edit. Returns (ok, n_pass_delta, n_fail_delta).
+
+    ``swap_collage=True`` is used for addition edits: the preview stores the
+    before-addition state (object without part), while image_npz before_imgs
+    represents the after-addition target (original complete object), so we
+    swap to build the collage in the correct before→after direction.
+    """
     if is_edit_qc_failed(ctx, edit_id):
         return False, 0, 0
 
@@ -246,7 +253,13 @@ async def _judge_one_async(
                                      "reason": "missing_previews"})
         return False, 0, 1
 
-    coll = _make_collage(before_imgs, after_imgs)
+    # For addition edits the preview is the before-addition state (object minus
+    # part) and image_npz frames are the after-addition target (original with
+    # part). Swap so the collage shows the correct before→after direction.
+    if swap_collage:
+        coll = _make_collage(after_imgs, before_imgs)
+    else:
+        coll = _make_collage(before_imgs, after_imgs)
     if coll is None:
         update_edit_gate(ctx, edit_id, edit_type, "E",
                          vlm_result={"pass": False, "score": 0.0,
@@ -317,7 +330,9 @@ async def _process_one(
         n_pass += dp
         n_fail += df
 
-    # addition edits
+    # addition edits — swap_collage=True because add_dir/preview_*.png stores
+    # the before-addition state (object minus part), while before_imgs from
+    # image_npz represents the after-addition target (original complete object).
     for add_id, meta in _iter_add_edits(ctx):
         if is_edit_qc_failed(ctx, add_id):
             n_skip += 1
@@ -332,6 +347,7 @@ async def _process_one(
             before_imgs, edit_dir, thr, ctx,
             target_part_desc=meta.get("target_part_desc", ""),
             edit_params=meta.get("edit_params", {}),
+            swap_collage=True,
         )
         n_pass += dp
         n_fail += df
