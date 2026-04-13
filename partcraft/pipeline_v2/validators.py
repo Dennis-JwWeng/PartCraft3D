@@ -23,6 +23,7 @@ from .qc_io import is_edit_qc_failed, is_gate_a_failed
 from .specs import iter_all_specs, iter_deletion_specs, iter_flux_specs
 from .status import (
     STATUS_OK, STATUS_FAIL, STATUS_SKIP, load_status, save_status,
+    step_done, _status_lock,
 )
 
 
@@ -241,19 +242,20 @@ def apply_check(ctx: ObjectContext, step_short: str) -> StepCheck:
     ``ok``. Either way, a ``validation`` field is attached.
     """
     fn = VALIDATORS[step_short]
-    rep = fn(ctx)
-    s = load_status(ctx)
-    steps = s.setdefault("steps", {})
-    entry = steps.get(rep.step) or {"status": "?"}
-    entry["validation"] = rep.to_dict()
-    if rep.skip:
-        entry["status"] = STATUS_SKIP
-    elif not rep.ok:
-        entry["status"] = STATUS_FAIL
-    elif entry.get("status") not in (STATUS_OK, STATUS_FAIL):
-        entry["status"] = STATUS_OK
-    steps[rep.step] = entry
-    save_status(ctx, s)
+    rep = fn(ctx)                     # read-only — outside the lock
+    with _status_lock(ctx):
+        s = load_status(ctx)
+        steps = s.setdefault("steps", {})
+        entry = steps.get(rep.step) or {"status": "?"}
+        entry["validation"] = rep.to_dict()
+        if rep.skip:
+            entry["status"] = STATUS_SKIP
+        elif not rep.ok:
+            entry["status"] = STATUS_FAIL
+        elif entry.get("status") not in (STATUS_OK, STATUS_FAIL):
+            entry["status"] = STATUS_OK
+        steps[rep.step] = entry
+        save_status(ctx, s)
     return rep
 
 
