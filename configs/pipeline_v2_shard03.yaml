@@ -1,38 +1,3 @@
-# Pipeline v2 — shard03 on node37 (8x A800 80GB PCIe)
-# Machine env: configs/machine/node37.env
-#
-# Inputs:
-#   data/partverse/mesh/03/<obj_id>.npz      (GT mesh + parts)
-#   data/partverse/images/03/<obj_id>.npz    (multi-view photos)
-#   data/partverse/slat/03/<obj_id>_{feats,coords}.pt  (SLAT; 27/1203 missing)
-#
-# Output root:
-#   outputs/partverse/pipeline_v2_shard03/
-#       _global/manifest.jsonl
-#       objects/03/<obj_id>/
-#           meta.json  status.json
-#           phase1/{overview.png, parsed.json}
-#           edits_2d/{edit_id}_{input,edited}.png
-#           edits_3d/<edit_id>/{before,after}.{npz,ply,png}
-#
-# ── Quick start (recommended) ──────────────────────────────────────
-#   bash scripts/tools/run_v2_shard03.sh
-#
-# ── Manual phase-by-phase ──────────────────────────────────────────
-# Phase A — VLM (s1): start 4 VLM servers (GPUs 3/4/6/7), then:
-#   for gpu port in 3 8002 4 8012 6 8022 7 8032; do ... done  (see run_v2_shard03.sh)
-#   ATTN_BACKEND=xformers python -m partcraft.pipeline_v2.run \
-#       --config configs/pipeline_v2_shard03.yaml --shard 03 --all --phase A
-#
-# Phase C — FLUX 2D (s4): kill VLMs, start 4 FLUX servers, then:
-#   ATTN_BACKEND=xformers python -m partcraft.pipeline_v2.run \
-#       --config configs/pipeline_v2_shard03.yaml --shard 03 --all --phase C
-#
-# Phases D→F — 3D (s5,s5b,s6,s6b,s7): kill FLUX, then:
-#   ATTN_BACKEND=xformers python -m partcraft.pipeline_v2.run \
-#       --config configs/pipeline_v2_shard03.yaml --shard 03 --all \
-#       --steps s5,s5b,s6,s6b,s7 --gpus 3,4,6,7
-
 ckpt_root: /Node11_nvme/wjw/3D_Editing/PartCraft3D/checkpoints
 blender: /Node11_nvme/artgen/lac/.tools/blender-4.2.0-linux-x64/blender
 data:
@@ -40,6 +5,8 @@ data:
   mesh_root: /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/mesh
   images_root: /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/images
   slat_dir: /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/slat
+  normalized_glb_dir: /mnt/zsn/data/partverse/source/normalized_glbs
+  anno_dir: /mnt/zsn/data/partverse/source/anno_infos/anno_infos
 pipeline:
   gpus:
   - 3

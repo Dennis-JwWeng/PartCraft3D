@@ -46,13 +46,19 @@ class DatasetRoots:
 
     images_root: Path
     mesh_root: Path
+    normalized_glb_dir: Path | None = None
+    anno_dir: Path | None = None
 
     @classmethod
     def from_pipeline_cfg(cls, cfg: dict) -> "DatasetRoots":
         data = cfg.get("data") or {}
+        raw_glb = data.get("normalized_glb_dir")
+        raw_anno = data.get("anno_dir")
         return cls(
             images_root=Path(data.get("images_root", DEFAULT_IMAGES_ROOT)),
             mesh_root=Path(data.get("mesh_root", DEFAULT_MESH_ROOT)),
+            normalized_glb_dir=Path(raw_glb) if raw_glb else None,
+            anno_dir=Path(raw_anno) if raw_anno else None,
         )
 
     def input_npz_paths(self, shard: str | int, obj_id: str) -> tuple[Path, Path]:
@@ -62,6 +68,18 @@ class DatasetRoots:
             self.mesh_root / s / f"{obj_id}.npz",
             self.images_root / s / f"{obj_id}.npz",
         )
+
+    def normalized_glb_path(self, obj_id: str) -> Path | None:
+        """Return path to {obj_id}.glb in normalized_glb_dir, or None if not configured."""
+        if self.normalized_glb_dir is None:
+            return None
+        return self.normalized_glb_dir / f"{obj_id}.glb"
+
+    def anno_object_dir(self, obj_id: str) -> Path | None:
+        """Return per-object annotation dir (<anno_dir>/{obj_id}/), or None if not configured."""
+        if self.anno_dir is None:
+            return None
+        return self.anno_dir / obj_id
 
 
 
