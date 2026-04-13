@@ -124,10 +124,21 @@ def _build_deletion_glb(
     try:
         norm_scene = trimesh.load(str(norm_path), force='scene')
         meshes = list(norm_scene.geometry.values())
-        norm_mesh = meshes[0] if len(meshes) == 1 else trimesh.util.concatenate(meshes)
-        seg_mesh   = trimesh.load(str(seg_path), force='mesh')
-        f2l        = {int(k): int(v)
-                      for k, v in json.load(open(f2l_path)).items()}
+        if len(meshes) == 1:
+            norm_mesh = meshes[0]
+            _visual = norm_mesh.visual
+        else:
+            norm_mesh = trimesh.util.concatenate(meshes)
+            _visual = None  # visual is unreliable after concatenation
+        seg_mesh = trimesh.load(str(seg_path), force='mesh')
+        if len(seg_mesh.faces) == 0 or len(norm_mesh.faces) == 0:
+            log.warning(
+                "[s5b] _build_deletion_glb %s: empty mesh (seg=%d faces, norm=%d faces)",
+                obj_id, len(seg_mesh.faces), len(norm_mesh.faces),
+            )
+            return False
+        with open(f2l_path) as _f:
+            f2l = {int(k): int(v) for k, v in json.load(_f).items()}
 
         seg_centroids  = seg_mesh.vertices[seg_mesh.faces].mean(axis=1)
         norm_centroids = norm_mesh.vertices[norm_mesh.faces].mean(axis=1)
@@ -136,10 +147,22 @@ def _build_deletion_glb(
         face_labels = np.array([f2l.get(int(i), -1) for i in nn_idxs])
         mask_keep   = ~np.isin(face_labels, selected_part_ids)
 
+        if (~mask_keep).sum() == 0:
+            log.warning(
+                "[s5b] _build_deletion_glb %s: no faces deleted for part_ids=%s",
+                obj_id, selected_part_ids,
+            )
+        if mask_keep.sum() == 0:
+            log.warning(
+                "[s5b] _build_deletion_glb %s: all faces deleted, skipping export",
+                obj_id,
+            )
+            return False
+
         masked = trimesh.Trimesh(
             vertices=norm_mesh.vertices,
             faces=norm_mesh.faces[mask_keep],
-            visual=norm_mesh.visual,
+            visual=_visual,
             process=False,
         )
         masked.remove_unreferenced_vertices()
