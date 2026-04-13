@@ -140,13 +140,18 @@ edits: EXACTLY {n_total} entries with these per-type counts
 
 Each edit MUST list these fields IN THIS ORDER (the rationale comes FIRST so
 you reason before you write the prompt):
-  rationale           ONE sentence. If the edit uses anatomical left/right,
-                      this sentence MUST cite the mirror rule and reference
-                      frontal_view_index. Example:
-                      "frontal_view_index=1; in view 1 the target ear is on
-                       the image-RIGHT half → mirror → object's anatomical
-                       LEFT ear (part_id 5)."
-                      For edits without left/right, a single short reason.
+  rationale           ONE sentence.
+                      • If the edit uses anatomical left/right: MUST include
+                        the literal value "frontal_view_index=N" and the
+                        mirror calculation, e.g.:
+                        "frontal_view_index=1; in view 1 the target ear is on
+                         the image-RIGHT half → mirror → object's anatomical
+                         LEFT ear (part_id 5)."
+                      • For global edits: MUST name the source style category
+                        (Rendering / Historical / Genre), e.g.:
+                        "Choosing 'ukiyo-e woodblock print' from the
+                         Historical category."
+                      • For all other edits: a single short reason.
   edit_type           one of: deletion, modification, scale, material, global
   selected_part_ids   list of int part_ids; empty ONLY for global
   prompt              imperative starting with Remove/Delete/Add/Change/
@@ -230,10 +235,14 @@ you reason before you write the prompt):
 
   DIVERSITY RULE: For this object's {n_global} global edits, each target_style
   MUST come from a DIFFERENT category above. Near-synonyms count as the same choice.
+  The rationale for every global edit MUST name the source category, e.g.:
+  "Choosing 'ukiyo-e woodblock print' from the Historical category."
 
 # HARD RULES (violations drop that edit)
 
-R1. selected_part_ids ⊆ part menu ids; never target cluster_size<30 (noise);
+R1. selected_part_ids ⊆ part menu ids; never target parts with cluster_size<30
+    UNLESS the part has a peer_group or [STRUCTURAL BODY] annotation (those are
+    valid semantic parts regardless of cluster_size);
     never target parts you cannot see in the bottom row.
 R2. Each edit is distinct: no two with same edit_type AND same
     selected_part_ids.
@@ -248,12 +257,6 @@ R7. If canonical_front is null, NO directional words anywhere; use group
 R8. If an edit uses anatomical left/right, view_index ∈ {{F, (F+2) mod 4}}
     where F = frontal_view_index, and the rationale must cite the mirror
     reasoning explicitly.
-
-R9. modification edit_params.new_part_desc MUST describe a shape, silhouette, or
-    functional change — NOT a color or material change.
-    Wrong: "A blue sphere"         (color only → use material instead)
-    Right: "A flattened disc"      (shape change)
-    Right: "A curved saber blade"  (functional + shape change)
 
 # OUTPUT FORMAT
 
