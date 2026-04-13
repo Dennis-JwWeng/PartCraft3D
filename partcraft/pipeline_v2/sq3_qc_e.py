@@ -8,15 +8,25 @@ For every non-identity edit that has survived gate A, we:
 
 Coverage now includes *addition* edits (discovered via edits_3d/add_*/meta.json).
 Step key: sq3_qc_E.
+
+Concurrency model (mirrors sq1/sq2):
+  - ``run()`` is async; callers must ``asyncio.run(run(...))``.
+  - ``vlm_urls`` (list) are distributed round-robin across objects.
+  - Up to ``concurrency`` objects are judged simultaneously via
+    ``asyncio.Semaphore``; edits within each object are sequential
+    (safe for qc.json file updates, which are synchronous).
 """
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 import logging
+from typing import Iterable
 
 import cv2
 import numpy as np
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from .paths import ObjectContext
 from .specs import iter_all_specs, VIEW_INDICES
@@ -25,24 +35,35 @@ from .qc_io import update_edit_gate, is_edit_qc_failed
 
 
 _DEFS = {
-    "deletion":     {"min_visual_quality": 3, "require_preserve_other": False},
+    "deletion":     {"min_visual_quality": 3, "require_preserve_other": True},
     "modification": {"min_visual_quality": 3, "require_preserve_other": True},
     "scale":        {"min_visual_quality": 3, "require_preserve_other": True},
-    "material":     {"min_visual_quality": 3, "require_preserve_other": False},
-    "global":       {"min_visual_quality": 3, "require_preserve_other": False},
-    "addition":     {"min_visual_quality": 3, "require_preserve_other": False},
+    "material":     {"min_visual_quality": 3, "require_preserve_other": True},
+    "global":       {"min_visual_quality": 3, "require_preserve_other": True},
+    "addition":     {"min_visual_quality": 3, "require_preserve_other": True},
 }
+
+LOG = logging.getLogger("pipeline_v2.sq3")
 
 
 def _passes(j, et, thr):
     t = {**_DEFS.get(et, {}), **(thr.get(et) or {})}
-    if not j.get("edit_executed", False): return False
+    if not j.get("edit_executed", False):
+        return False
     vq = j.get("visual_quality", 0)
-    try: vq = int(vq)
-    except (TypeError, ValueError): vq = 0
-    if vq < t.get("min_visual_quality", 3): return False
-    if et == "deletion" and not j.get("correct_region", False): return False
-    if t.get("require_preserve_other") and not j.get("preserve_other", False): return False
+    try:
+        vq = int(vq)
+    except (TypeError, ValueError):
+        vq = 0
+    if vq < t.get("min_visual_quality", 3):
+        return False
+    # correct_region is required for ALL edit types.
+    # For global edits the prompt redefines it as "style applied consistently
+    # across the whole object"; for all others it means the right part changed.
+    if not j.get("correct_region", False):
+        return False
+    if t.get("require_preserve_other") and not j.get("preserve_other", False):
+        return False
     return True
 
 
@@ -53,13 +74,13 @@ def _load_before_imgs(ctx: ObjectContext) -> list[np.ndarray] | None:
     try:
         from partcraft.render.overview import load_views_from_npz
         imgs, _ = load_views_from_npz(ctx.image_npz, VIEW_INDICES)
-        return imgs  # list of BGR np.ndarray
+        return imgs
     except Exception:
         return None
 
 
 def _load_after_previews(edit_dir) -> list[np.ndarray] | None:
-    """Load preview_0.png … preview_4.png from edit_dir. Returns None on any missing."""
+    """Load preview_0.png … preview_4.png. Returns None on any missing."""
     imgs = []
     for i in range(5):
         p = edit_dir / f"preview_{i}.png"
@@ -74,14 +95,15 @@ def _load_after_previews(edit_dir) -> list[np.ndarray] | None:
 
 def _make_collage(before_imgs: list[np.ndarray], after_imgs: list[np.ndarray]) -> bytes | None:
     """Build a 2-row × 5-col PNG collage (top = before, bottom = after)."""
-    h = 256  # per-image height
+    h = 256
+
     def _r(x):
         s = h / x.shape[0]
         return cv2.resize(x, (int(x.shape[1] * s), h))
+
     try:
         row_b = np.hstack([_r(img) for img in before_imgs])
         row_a = np.hstack([_r(img) for img in after_imgs])
-        # Pad to same width
         wb, wa = row_b.shape[1], row_a.shape[1]
         w = max(wb, wa)
         if wb < w:
@@ -112,8 +134,94 @@ def _iter_add_edits(ctx: ObjectContext):
             yield add_dir.name, meta
 
 
-def _judge_one(
-    client,
+async def _call_vlm_judge_async(
+    client: AsyncOpenAI,
+    model: str,
+    img_bytes: bytes,
+    edit_prompt: str,
+    edit_type: str,
+    object_desc: str,
+    part_label: str,
+    target_part_desc: str = "",
+    edit_params: dict | None = None,
+    max_retries: int = 4,
+    max_tokens: int = 1024,
+) -> dict | None:
+    """Async version of call_vlm_judge (partcraft.cleaning.vlm_filter)."""
+    from partcraft.cleaning.vlm_filter import build_judge_prompt, _extract_json_from_vlm  # type: ignore
+
+    b64 = base64.b64encode(img_bytes).decode("utf-8")
+    base_text = build_judge_prompt(
+        edit_prompt, edit_type, object_desc, part_label,
+        target_part_desc=target_part_desc,
+        edit_params=edit_params or {},
+    )
+    strict_suffix = (
+        "\n\nIf you already wrote analysis above, IGNORE it for the parser: "
+        "output ONE new line that is ONLY the JSON object, starting with { "
+        "and ending with }."
+    )
+
+    for attempt in range(max_retries + 1):
+        text = base_text + (strict_suffix if attempt > 0 else "")
+        sys_msg = (
+            "You output only valid JSON for machine parsing. "
+            "Never write explanations, headings, or markdown."
+        )
+        if attempt > 0:
+            sys_msg += " Your reply must be a single JSON object; no chain-of-thought."
+        try:
+            create_kw: dict = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": sys_msg},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url",
+                             "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                            {"type": "text", "text": text},
+                        ],
+                    },
+                ],
+                "temperature": 0.1,
+                "max_tokens": max_tokens,
+                "timeout": 120,
+                "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+            }
+            try:
+                resp = await client.chat.completions.create(**create_kw)
+            except TypeError:
+                create_kw.pop("extra_body", None)
+                resp = await client.chat.completions.create(**create_kw)
+
+            content = resp.choices[0].message.content
+            if not content:
+                LOG.warning("[sq3] VLM empty response (attempt %d/%d)",
+                            attempt + 1, max_retries + 1)
+                if attempt < max_retries:
+                    await asyncio.sleep(2 * (attempt + 1))
+                continue
+
+            result = _extract_json_from_vlm(content)
+            if result is not None:
+                return result
+
+            LOG.warning("[sq3] VLM JSON parse failed (attempt %d/%d): %s",
+                        attempt + 1, max_retries + 1, content[:200])
+
+        except Exception as e:
+            LOG.warning("[sq3] VLM call error (attempt %d/%d): %s",
+                        attempt + 1, max_retries + 1, e)
+
+        if attempt < max_retries:
+            await asyncio.sleep(2 * (attempt + 1))
+
+    return None
+
+
+async def _judge_one_async(
+    client: AsyncOpenAI,
     vlm_model: str,
     edit_id: str,
     edit_type: str,
@@ -124,13 +232,12 @@ def _judge_one(
     edit_dir,
     thr: dict,
     ctx: ObjectContext,
-    log: logging.Logger,
+    target_part_desc: str = "",
+    edit_params: dict | None = None,
 ) -> tuple[bool, int, int]:
-    """Run VLM judge for one edit. Returns (ok, n_pass_delta, n_fail_delta)."""
-    from partcraft.cleaning.vlm_filter import call_vlm_judge
-
+    """Async VLM judge for one edit. Returns (ok, n_pass_delta, n_fail_delta)."""
     if is_edit_qc_failed(ctx, edit_id):
-        return False, 0, 0  # skip
+        return False, 0, 0
 
     after_imgs = _load_after_previews(edit_dir)
     if after_imgs is None:
@@ -146,9 +253,13 @@ def _judge_one(
                                      "reason": "collage_failed"})
         return False, 0, 1
 
-    j = call_vlm_judge(client, vlm_model, coll,
-                       edit_prompt=prompt, edit_type=edit_type,
-                       object_desc=obj_desc, part_label=part_label)
+    j = await _call_vlm_judge_async(
+        client, vlm_model, coll,
+        edit_prompt=prompt, edit_type=edit_type,
+        object_desc=obj_desc, part_label=part_label,
+        target_part_desc=target_part_desc,
+        edit_params=edit_params,
+    )
     if j is None:
         update_edit_gate(ctx, edit_id, edit_type, "E",
                          vlm_result={"pass": False, "score": 0.0,
@@ -163,66 +274,104 @@ def _judge_one(
     return ok, (1 if ok else 0), (0 if ok else 1)
 
 
-def run(ctxs, *, vlm_url, vlm_model, cfg, force=False, logger=None):
-    log = logger or logging.getLogger("pipeline_v2.sq3")
-    thr = (cfg.get("qc") or {}).get("thresholds_by_type") or _DEFS
-    client = OpenAI(base_url=vlm_url, api_key="EMPTY")
-    out = []
+async def _process_one(
+    ctx: ObjectContext,
+    vlm_url: str,
+    vlm_model: str,
+    thr: dict,
+    force: bool,
+    log: logging.Logger,
+) -> dict:
+    """Judge all edits for one object using the given VLM URL."""
+    if not force and step_done(ctx, "sq3_qc_E"):
+        return {"obj_id": ctx.obj_id, "skipped": True}
 
-    for ctx in ctxs:
-        if not force and step_done(ctx, "sq3_qc_E"):
-            out.append({"obj_id": ctx.obj_id, "skipped": True})
-            continue
+    n_pass = n_fail = n_skip = 0
 
-        n_pass = n_fail = n_skip = 0
-
-        before_imgs = _load_before_imgs(ctx)
-        if before_imgs is None:
-            log.warning("[sq3] %s: cannot load before images from image_npz", ctx.obj_id)
-            update_step(ctx, "sq3_qc_E", status=STATUS_OK,
-                        n_pass=0, n_fail=0, n_skip=0,
-                        reason="missing_image_npz")
-            out.append({"obj_id": ctx.obj_id, "n_pass": 0, "n_fail": 0})
-            continue
-
-        # --- spec-based edits (del, mod, scl, mat, glb) ---
-        for spec in iter_all_specs(ctx):
-            if is_edit_qc_failed(ctx, spec.edit_id):
-                n_skip += 1
-                continue
-            edit_dir = ctx.edit_3d_dir(spec.edit_id)
-            _, dp, df = _judge_one(
-                client, vlm_model,
-                spec.edit_id, spec.edit_type,
-                spec.prompt, spec.object_desc,
-                ", ".join(spec.part_labels),
-                before_imgs, edit_dir, thr, ctx, log,
-            )
-            n_pass += dp
-            n_fail += df
-
-        # --- addition edits (from edits_3d/add_*/meta.json) ---
-        for add_id, meta in _iter_add_edits(ctx):
-            if is_edit_qc_failed(ctx, add_id):
-                n_skip += 1
-                continue
-            edit_dir = ctx.edit_3d_dir(add_id)
-            _, dp, df = _judge_one(
-                client, vlm_model,
-                add_id, "addition",
-                meta.get("prompt", ""),
-                meta.get("object_desc", ""),
-                ", ".join(meta.get("part_labels", [])),
-                before_imgs, edit_dir, thr, ctx, log,
-            )
-            n_pass += dp
-            n_fail += df
-
+    before_imgs = _load_before_imgs(ctx)
+    if before_imgs is None:
+        log.warning("[sq3] %s: cannot load before images from image_npz", ctx.obj_id)
         update_step(ctx, "sq3_qc_E", status=STATUS_OK,
-                    n_pass=n_pass, n_fail=n_fail, n_skip=n_skip)
-        out.append({"obj_id": ctx.obj_id, "n_pass": n_pass, "n_fail": n_fail})
+                    n_pass=0, n_fail=0, n_skip=0,
+                    reason="missing_image_npz")
+        return {"obj_id": ctx.obj_id, "n_pass": 0, "n_fail": 0}
 
-    return out
+    client = AsyncOpenAI(base_url=vlm_url, api_key="EMPTY")
+
+    # spec-based edits (del, mod, scl, mat, glb) — sequential to avoid
+    # concurrent qc.json writes from the same object
+    for spec in iter_all_specs(ctx):
+        if is_edit_qc_failed(ctx, spec.edit_id):
+            n_skip += 1
+            continue
+        edit_dir = ctx.edit_3d_dir(spec.edit_id)
+        _, dp, df = await _judge_one_async(
+            client, vlm_model,
+            spec.edit_id, spec.edit_type,
+            spec.prompt, spec.object_desc,
+            ", ".join(spec.part_labels),
+            before_imgs, edit_dir, thr, ctx,
+            target_part_desc=spec.target_part_desc,
+            edit_params=spec.edit_params,
+        )
+        n_pass += dp
+        n_fail += df
+
+    # addition edits
+    for add_id, meta in _iter_add_edits(ctx):
+        if is_edit_qc_failed(ctx, add_id):
+            n_skip += 1
+            continue
+        edit_dir = ctx.edit_3d_dir(add_id)
+        _, dp, df = await _judge_one_async(
+            client, vlm_model,
+            add_id, "addition",
+            meta.get("prompt", ""),
+            meta.get("object_desc", ""),
+            ", ".join(meta.get("part_labels", [])),
+            before_imgs, edit_dir, thr, ctx,
+            target_part_desc=meta.get("target_part_desc", ""),
+            edit_params=meta.get("edit_params", {}),
+        )
+        n_pass += dp
+        n_fail += df
+
+    update_step(ctx, "sq3_qc_E", status=STATUS_OK,
+                n_pass=n_pass, n_fail=n_fail, n_skip=n_skip)
+    log.info("[sq3] %s done: pass=%d fail=%d skip=%d",
+             ctx.obj_id, n_pass, n_fail, n_skip)
+    return {"obj_id": ctx.obj_id, "n_pass": n_pass, "n_fail": n_fail}
+
+
+async def run(
+    ctxs: Iterable[ObjectContext],
+    *,
+    vlm_urls: list[str],
+    vlm_model: str,
+    cfg: dict,
+    force: bool = False,
+    concurrency: int = 8,
+    logger: logging.Logger | None = None,
+) -> list[dict]:
+    """Async entry point — distribute objects across vlm_urls round-robin.
+
+    Args:
+        vlm_urls:    List of VLM base URLs (one per GPU server).
+        concurrency: Max number of objects judged simultaneously.
+    """
+    if not vlm_urls:
+        raise ValueError("vlm_urls must not be empty")
+    log = logger or LOG
+    thr = (cfg.get("qc") or {}).get("thresholds_by_type") or _DEFS
+    ctxs = list(ctxs)
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _run_one(i: int, ctx: ObjectContext) -> dict:
+        url = vlm_urls[i % len(vlm_urls)]
+        async with sem:
+            return await _process_one(ctx, url, vlm_model, thr, force, log)
+
+    return await asyncio.gather(*[_run_one(i, c) for i, c in enumerate(ctxs)])
 
 
 __all__ = ["run"]

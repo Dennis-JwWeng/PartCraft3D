@@ -154,50 +154,278 @@ def compose_comparison(before_imgs: list[np.ndarray],
 
 
 # ---------------------------------------------------------------------------
-# VLM judge prompt
+# VLM judge prompt — type-specific
 # ---------------------------------------------------------------------------
 
-def build_judge_prompt(edit_prompt: str, edit_type: str,
-                       object_desc: str, part_label: str) -> str:
-    """Build the VLM judge prompt.
+_JUDGE_SCHEMA = """\
+Your entire reply MUST be one JSON object only: no prose, no markdown fences, \
+no text before or after. First character must be "{{" and last must be "}}".
 
-    Asks the VLM to:
-      1. Evaluate edit quality (5 criteria)
-      2. Rate the edit_prompt quality and provide an improved version
+Schema (fill ALL fields):
+{{"edit_executed":<bool>,"correct_region":<bool>,"preserve_other":<bool>,\
+"visual_quality":<1-5>,"artifact_free":<bool>,"reason":"<one sentence>",\
+"prompt_quality":<1-5>,"improved_prompt":"<imperative>",\
+"improved_after_desc":"<concise>"}}
+
+## Part 2 — Prompt quality
+- prompt_quality: How well does the edit prompt describe the actual visual \
+change? (1=wrong/missing, 2=vague, 3=roughly correct, 4=accurate, 5=precise)
+- improved_prompt: Rewrite the prompt to precisely describe what you observe. \
+Imperative form (e.g. "Remove the ...", "Change ... to ..."). Always fill.
+- improved_after_desc: Concise description of the AFTER object. Always fill."""
+
+
+def _header(object_desc: str, edit_type: str, part_label: str,
+            edit_prompt: str) -> str:
+    prompt_line = (f'- Edit prompt: "{edit_prompt}"' if edit_prompt.strip()
+                   else "- Edit prompt: (none — infer from images)")
+    return (
+        "You are a quality judge for 3D object editing.\n\n"
+        "The image shows two rows of multi-view renders of a 3D object:\n"
+        "- TOP row: BEFORE the edit\n"
+        "- BOTTOM row: AFTER the edit\n\n"
+        "Edit information:\n"
+        f"- Object: {object_desc}\n"
+        f"- Edit type: {edit_type}\n"
+        f"- Target part: {part_label}\n"
+        f"{prompt_line}\n"
+    )
+
+
+def _build_deletion_prompt(object_desc, part_label, edit_prompt,
+                            target_part_desc) -> str:
+    tpd = f'- Target part description: "{target_part_desc}"' if target_part_desc else ""
+    return (
+        _header(object_desc, "deletion", part_label, edit_prompt)
+        + (f"{tpd}\n" if tpd else "")
+        + """
+## Part 1 — Deletion quality (WHAT TO CHECK)
+A deletion edit removes one or more parts from the object. Judge strictly:
+
+- edit_executed: Is the target part GONE from the AFTER model? (true/false)
+- correct_region: Was the CORRECT part removed — matching "{part_label}" \
+and the edit prompt? (true/false). False if a wrong/different part was removed.
+- preserve_other: Are ALL remaining parts intact, with no floating fragments, \
+gaps, or broken surfaces left behind where the part was? (true/false)
+- visual_quality: Overall quality of the AFTER model (1=terrible, 2=poor, \
+3=acceptable, 4=good, 5=excellent). Penalise holes, seam artefacts, \
+distorted remaining parts.
+- artifact_free: No floating blobs, stray geometry, or jagged seams at the \
+removal site? (true/false)
+- reason: One sentence on the quality of the deletion.
+
+""".replace("{part_label}", part_label)
+        + _JUDGE_SCHEMA
+    )
+
+
+def _build_modification_prompt(object_desc, part_label, edit_prompt,
+                                target_part_desc, new_part_desc) -> str:
+    tpd = f'- Target part (before): "{target_part_desc}"' if target_part_desc else ""
+    npd = f'- Expected shape after: "{new_part_desc}"' if new_part_desc else ""
+    extras = "\n".join(x for x in [tpd, npd] if x)
+    return (
+        _header(object_desc, "modification", part_label, edit_prompt)
+        + (f"{extras}\n" if extras else "")
+        + """
+## Part 1 — Modification quality (WHAT TO CHECK)
+A modification edit changes the SHAPE, SILHOUETTE, or FUNCTIONAL ROLE of a \
+part — NOT its colour or material. Judge strictly:
+
+- edit_executed: Is the target part's SHAPE or FORM visibly different in AFTER? \
+(true/false). Return false if only colour/material changed, or no change visible.
+- correct_region: Was the shape change applied to the correct part \
+("{part_label}"), not some other part? (true/false)
+- preserve_other: Are all OTHER parts unchanged in shape and position? \
+(true/false). Minor texture differences are acceptable; geometry must be intact.
+- visual_quality: Quality of the modified AFTER model (1–5). Penalise \
+implausible geometry, broken meshes, or shape changes that ignore the prompt.
+- artifact_free: No floating blobs, intersecting geometry, or broken normals? \
+(true/false)
+- reason: One sentence on whether the shape change is correct and clean.
+
+""".replace("{part_label}", part_label)
+        + _JUDGE_SCHEMA
+    )
+
+
+def _build_scale_prompt(object_desc, part_label, edit_prompt,
+                         target_part_desc, factor) -> str:
+    tpd = f'- Target part description: "{target_part_desc}"' if target_part_desc else ""
+    fac = f"- Scale factor (shrink): {factor}" if factor else ""
+    extras = "\n".join(x for x in [tpd, fac] if x)
+    return (
+        _header(object_desc, "scale", part_label, edit_prompt)
+        + (f"{extras}\n" if extras else "")
+        + """
+## Part 1 — Scale quality (WHAT TO CHECK)
+A scale edit SHRINKS the target part. Judge strictly:
+
+- edit_executed: Is the target part SMALLER in AFTER than in BEFORE? \
+(true/false). Return false if size is unchanged or part grew.
+- correct_region: Was the CORRECT part ("{part_label}") scaled, not a \
+neighbouring part? (true/false)
+- preserve_other: Are all OTHER parts at their original size and position? \
+(true/false)
+- visual_quality: Quality of the scaled AFTER model (1–5). Penalise \
+disproportionate scaling, floating connectors, or visible seams.
+- artifact_free: No floating or disconnected geometry after scaling? (true/false)
+- reason: One sentence on the scale change quality.
+
+""".replace("{part_label}", part_label)
+        + _JUDGE_SCHEMA
+    )
+
+
+def _build_material_prompt(object_desc, part_label, edit_prompt,
+                            target_part_desc, target_material) -> str:
+    tpd = f'- Target part description: "{target_part_desc}"' if target_part_desc else ""
+    mat = f'- Expected material/finish: "{target_material}"' if target_material else ""
+    extras = "\n".join(x for x in [tpd, mat] if x)
+    return (
+        _header(object_desc, "material", part_label, edit_prompt)
+        + (f"{extras}\n" if extras else "")
+        + """
+## Part 1 — Material quality (WHAT TO CHECK)
+A material edit changes the SURFACE MATERIAL or FINISH of a part (e.g. wood, \
+steel, glass) while leaving the GEOMETRY unchanged. Judge strictly:
+
+- edit_executed: Is the surface material/texture of the target part visibly \
+different in AFTER? (true/false)
+- correct_region: Did the material change on the CORRECT part ("{part_label}") \
+only, with no spillover to adjacent parts? (true/false)
+- preserve_other: Is the geometry of ALL parts (including the target) intact — \
+no shape changes, no new holes? (true/false)
+- visual_quality: Quality of the material change (1–5). Does it look like the \
+expected material? Is the shading/texture plausible?
+- artifact_free: No UV seams, tiling artefacts, or broken surfaces? (true/false)
+- reason: One sentence on the material change quality.
+
+""".replace("{part_label}", part_label)
+        + _JUDGE_SCHEMA
+    )
+
+
+def _build_global_prompt(object_desc, part_label, edit_prompt,
+                          target_style) -> str:
+    sty = f'- Expected style: "{target_style}"' if target_style else ""
+    return (
+        _header(object_desc, "global", "entire object", edit_prompt)
+        + (f"{sty}\n" if sty else "")
+        + """
+## Part 1 — Global style quality (WHAT TO CHECK)
+A global edit changes the ENTIRE OBJECT's artistic or rendering aesthetic \
+(e.g. cel-shading, Art Deco, origami geometry) — NOT a material or colour \
+change to individual parts. Judge strictly:
+
+- edit_executed: Is the overall rendering/art style of the object visibly \
+changed in AFTER? (true/false). Return false if the object looks identical.
+- correct_region: Is the style applied CONSISTENTLY across the ENTIRE object \
+with no partial areas left in the original style? (true/false). Return false \
+if only some parts changed style.
+- preserve_other: Is the object's underlying GEOMETRY and STRUCTURE still \
+recognisable — correct number of parts, overall form preserved? (true/false). \
+Return false if geometry was destroyed or heavily distorted.
+- visual_quality: How well does the style transfer look? (1–5). Penalise \
+inconsistent style application, artefacts, or style that does not match the \
+target description.
+- artifact_free: No floating geometry, broken normals, or severe rendering \
+artefacts? (true/false)
+- reason: One sentence on the global style transfer quality.
+
+"""
+        + _JUDGE_SCHEMA
+    )
+
+
+def _build_addition_prompt(object_desc, part_label, edit_prompt,
+                            target_part_desc) -> str:
+    tpd = f'- New element description: "{target_part_desc}"' if target_part_desc else ""
+    return (
+        _header(object_desc, "addition", part_label, edit_prompt)
+        + (f"{tpd}\n" if tpd else "")
+        + """
+## Part 1 — Addition quality (WHAT TO CHECK)
+An addition edit ADDS a new element to the object. Judge strictly:
+
+- edit_executed: Is there a NEW element in AFTER that was NOT present in \
+BEFORE? (true/false)
+- correct_region: Is the new element placed in a REASONABLE position — \
+attached or adjacent to the correct existing part, not floating arbitrarily? \
+(true/false)
+- preserve_other: Are all ORIGINAL parts still present and intact? (true/false)
+- visual_quality: Quality of the addition (1–5). Does it blend naturally with \
+the original object's style and scale?
+- artifact_free: No interpenetrating geometry, floating blobs, or broken \
+surfaces at the attachment point? (true/false)
+- reason: One sentence on the addition quality.
+
+"""
+        + _JUDGE_SCHEMA
+    )
+
+
+def build_judge_prompt(
+    edit_prompt: str,
+    edit_type: str,
+    object_desc: str,
+    part_label: str,
+    target_part_desc: str = "",
+    edit_params: dict | None = None,
+    expected_after_desc: str = "",
+) -> str:
+    """Build a type-specific VLM judge prompt.
+
+    Args:
+        edit_prompt:       The original phase-1 prompt string.
+        edit_type:         One of deletion/modification/scale/material/global/addition.
+        object_desc:       Full object description.
+        part_label:        Comma-joined label(s) of the target part(s).
+        target_part_desc:  Phase-1 visual description of the target part (before).
+        edit_params:       edit_params dict from EditSpec (target_style, target_material,
+                           new_part_desc, factor …).
+        expected_after_desc: Phase-1 after_desc_full (unused in prompt body but kept
+                             for future use / logging).
     """
-    prompt_section = f'- Edit prompt: "{edit_prompt}"' if edit_prompt.strip() else \
-        "- Edit prompt: (none provided — you MUST infer what happened from the images)"
-    return f"""You are a quality judge for 3D object editing.
+    ep = edit_params or {}
+    et = edit_type.lower()
+    if et == "deletion":
+        return _build_deletion_prompt(object_desc, part_label, edit_prompt,
+                                      target_part_desc)
+    if et == "modification":
+        return _build_modification_prompt(object_desc, part_label, edit_prompt,
+                                          target_part_desc,
+                                          ep.get("new_part_desc", ""))
+    if et == "scale":
+        return _build_scale_prompt(object_desc, part_label, edit_prompt,
+                                   target_part_desc, ep.get("factor"))
+    if et == "material":
+        return _build_material_prompt(object_desc, part_label, edit_prompt,
+                                      target_part_desc,
+                                      ep.get("target_material", ""))
+    if et == "global":
+        return _build_global_prompt(object_desc, part_label, edit_prompt,
+                                    ep.get("target_style", ""))
+    if et == "addition":
+        return _build_addition_prompt(object_desc, part_label, edit_prompt,
+                                      target_part_desc)
+    # fallback — generic (unknown edit type)
+    prompt_line = (f'- Edit prompt: "{edit_prompt}"' if edit_prompt.strip()
+                   else "- Edit prompt: (none — infer from images)")
+    return (
+        _header(object_desc, edit_type, part_label, edit_prompt)
+        + """
+## Part 1 — Edit quality
+- edit_executed: Did the described edit visibly happen? (true/false)
+- correct_region: Was the change applied to the correct part? (true/false)
+- preserve_other: Are all other parts preserved and intact? (true/false)
+- visual_quality: Overall quality of the AFTER model (1–5)
+- artifact_free: No floating blobs, broken surfaces? (true/false)
+- reason: One sentence on quality.
 
-The image shows two rows of multi-view renders of a 3D object:
-- Top row: BEFORE editing
-- Bottom row: AFTER editing
-
-Edit information:
-- Object: {object_desc}
-- Edit type: {edit_type}
-- Target part: {part_label}
-{prompt_section}
-
-Your entire reply MUST be one JSON object only: no prose, no markdown fences, no text before or after. First character must be "{{" and the last must be "}}".
-
-Example shape:
-{{"edit_executed":true,"correct_region":true,"preserve_other":true,"visual_quality":4,"artifact_free":true,"reason":"brief explanation","prompt_quality":3,"improved_prompt":"Remove the red wheel from the car","improved_after_desc":"A blue car without its front wheel"}}
-
-## Part 1: Edit quality (judge the 3D edit result)
-- edit_executed: Did the described edit visibly happen? (true/false). If no prompt was provided, judge whether ANY meaningful edit is visible.
-- correct_region: Was the change applied to the correct part ({part_label})? (true/false)
-- preserve_other: Are all other parts of the object preserved and intact? (true/false)
-- visual_quality: Overall visual quality of the AFTER model (1=terrible, 2=poor, 3=acceptable, 4=good, 5=excellent)
-- artifact_free: Is the AFTER model free of obvious artifacts like floating blobs, broken surfaces, or missing geometry? (true/false)
-- reason: One sentence explaining your quality assessment
-
-## Part 2: Prompt quality (judge and improve the edit prompt)
-- prompt_quality: How well does the edit prompt describe the actual visual change? (1=completely wrong or missing, 2=vague/misleading, 3=roughly correct, 4=accurate, 5=precise and natural)
-- improved_prompt: Write a better edit prompt that precisely describes the visual change you observe. Use natural English, imperative form (e.g. "Remove the ...", "Change the ... to ..."). Always fill this even if the original is good.
-- improved_after_desc: Write a concise description of the AFTER object as seen in the images. Always fill this.
-
-Be strict but fair. Minor imperfections are acceptable (quality=3-4). Only fail edit_executed if there is NO visible change."""
+"""
+        + _JUDGE_SCHEMA
+    )
 
 
 # ---------------------------------------------------------------------------
