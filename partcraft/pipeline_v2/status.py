@@ -57,15 +57,26 @@ def _now() -> str:
 def _status_lock(ctx: ObjectContext):
     """Per-object exclusive lock for status.json read-modify-write operations.
 
-    Uses fcntl.LOCK_EX on a companion .lock file. The kernel releases the
-    lock automatically if the holder process exits or crashes — no cleanup
-    needed. Safe for concurrent OS processes on the same NFS mount.
+    Uses fcntl.lockf (POSIX record lock, F_SETLKW) on a companion .lock file.
+    POSIX record locks are NFS-safe via the NLM protocol. The kernel releases
+    the lock automatically if the holder process exits or crashes.
     """
+    import threading
+
     lock_path = ctx.dir / "status.json.lock"
     ctx.dir.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "a") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        yield
+    key = str(lock_path.resolve())
+    if not hasattr(_status_lock, "_thread_mutexes"):
+        _status_lock._thread_mutexes = {}
+        _status_lock._thread_mutexes_guard = threading.Lock()
+    with _status_lock._thread_mutexes_guard:
+        if key not in _status_lock._thread_mutexes:
+            _status_lock._thread_mutexes[key] = threading.Lock()
+        thread_mtx = _status_lock._thread_mutexes[key]
+    with thread_mtx:
+        with open(lock_path, "a") as lf:
+            fcntl.lockf(lf, fcntl.LOCK_EX)
+            yield
 
 
 def load_status(ctx: ObjectContext) -> dict[str, Any]:
