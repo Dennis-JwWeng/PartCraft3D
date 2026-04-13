@@ -56,7 +56,7 @@ def count_part_pixels_in_overview(
     overview_img: np.ndarray,
     view_index: int,
     selected_part_ids: list[int],
-    color_tol: int = 30,
+    color_tol: int = 60,
 ) -> int:
     """Count palette-colored pixels for *selected_part_ids* in the bottom-row
     cell of *view_index* inside an already-decoded overview BGR image.
@@ -67,6 +67,12 @@ def count_part_pixels_in_overview(
 
     Returns the total matching pixel count across all selected parts.
     Zero means none of the selected parts are visible from this viewpoint.
+
+    ``color_tol`` is the L2-distance threshold for palette-color matching.
+    Blender Cycles rendering with 3-point lighting shifts pure palette emission
+    colors by up to ~60 L2 units, so the default is 60. The minimum distance
+    between any two palette colors is 80, so tol=60 cannot confuse adjacent
+    palette entries.
     """
     if overview_img is None or not (0 <= view_index < _N_VIEWS):
         return -1   # sentinel: cannot check
