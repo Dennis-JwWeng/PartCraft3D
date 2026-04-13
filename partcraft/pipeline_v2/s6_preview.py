@@ -275,12 +275,12 @@ def run_for_object(
             res.n_skip += 1
             continue
         a_ply = edit_dir / "after.ply"
-        if not a_ply.is_file():
-            log.warning("[s6p] del %s: after.ply missing", spec.edit_id)
+        after_glb = edit_dir / "after_new.glb"
+        if not a_ply.is_file() and not after_glb.is_file():
+            log.warning("[s6p] del %s: both after.ply and after_new.glb missing", spec.edit_id)
             res.n_fail += 1
             continue
         try:
-            after_glb = edit_dir / "after_new.glb"
             if after_glb.is_file():
                 imgs = _render_glb_views(
                     after_glb, ctx.image_npz, _encode_asset_script(),
@@ -310,12 +310,12 @@ def run_for_object(
             res.n_fail += 1
             continue
         before_ply = ctx.edit_3d_dir(source_del_id) / "before.ply"
-        if not before_ply.is_file():
-            log.warning("[s6p] add %s: source before.ply missing", add_id)
+        before_glb = ctx.edit_3d_dir(source_del_id) / "before_new.glb"
+        if not before_ply.is_file() and not before_glb.is_file():
+            log.warning("[s6p] add %s: both before.ply and before_new.glb missing", add_id)
             res.n_fail += 1
             continue
         try:
-            before_glb = ctx.edit_3d_dir(source_del_id) / "before_new.glb"
             if before_glb.is_file():
                 imgs = _render_glb_views(
                     before_glb, ctx.image_npz, _encode_asset_script(),
