@@ -32,9 +32,11 @@ It is never updated incrementally — always rebuilt with
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -49,6 +51,21 @@ STATUS_PENDING = "pending"
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+@contextmanager
+def _status_lock(ctx: ObjectContext):
+    """Per-object exclusive lock for status.json read-modify-write operations.
+
+    Uses fcntl.LOCK_EX on a companion .lock file. The kernel releases the
+    lock automatically if the holder process exits or crashes — no cleanup
+    needed. Safe for concurrent OS processes on the same NFS mount.
+    """
+    lock_path = ctx.dir / "status.json.lock"
+    ctx.dir.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        yield
 
 
 def load_status(ctx: ObjectContext) -> dict[str, Any]:
@@ -91,12 +108,13 @@ def update_step(
     status: str = STATUS_OK,
     **fields: Any,
 ) -> dict[str, Any]:
-    """Read-modify-write a single step entry."""
-    s = load_status(ctx)
-    s.setdefault("steps", {})[step] = {
-        "status": status, "ts": _now(), **fields,
-    }
-    save_status(ctx, s)
+    """Read-modify-write a single step entry (process-safe via flock)."""
+    with _status_lock(ctx):
+        s = load_status(ctx)
+        s.setdefault("steps", {})[step] = {
+            "status": status, "ts": _now(), **fields,
+        }
+        save_status(ctx, s)
     return s
 
 
