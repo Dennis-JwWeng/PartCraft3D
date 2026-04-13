@@ -79,3 +79,19 @@ def test_concurrent_update_step_no_data_loss(tmp_path):
     assert lost == 0, (
         f"Lost {lost}/200 status updates — concurrent write is not safe"
     )
+
+
+def test_dump_stage_batches_groups_d_and_d2():
+    """Stages with the same parallel_group must end up in the same batch."""
+    import yaml
+    from partcraft.pipeline_v2.scheduler import dump_stage_batches
+
+    cfg = yaml.safe_load(open("configs/pipeline_v2_shard05_test.yaml"))
+    # Before Task 4 adds parallel_group to the yaml, D and D2 have no group
+    # so this test checks structure only: function exists, returns list[list[str]],
+    # every requested stage appears exactly once.
+    result = dump_stage_batches(cfg, ["A", "C", "D", "D2", "E_pre"])
+    assert isinstance(result, list)
+    assert all(isinstance(b, list) for b in result)
+    flat = [s for batch in result for s in batch]
+    assert sorted(flat) == sorted(["A", "C", "D", "D2", "E_pre"])

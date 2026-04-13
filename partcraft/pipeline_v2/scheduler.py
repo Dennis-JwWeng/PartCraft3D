@@ -26,6 +26,7 @@ class Phase:
     steps: list[str] = field(default_factory=list)
     use_gpus: bool = False
     optional: bool = False
+    parallel_group: str = ""       # non-empty → run concurrently with same-group stages
 
 
 def _pipeline(cfg: dict) -> dict:
@@ -111,6 +112,7 @@ def stages_for(cfg: dict) -> list[Phase]:
             steps=list(entry.get("steps") or []),
             use_gpus=bool(entry.get("use_gpus", False)),
             optional=bool(entry.get("optional", False)),
+            parallel_group=str(entry.get("parallel_group", "")),
         ))
     return out
 
@@ -133,6 +135,51 @@ def get_stage(cfg: dict, name: str) -> Phase:
         if st.name == name:
             return st
     raise KeyError(f"stage {name!r} not in config")
+
+
+def dump_stage_batches(
+    cfg: dict,
+    stage_names: list[str],
+) -> list[list[str]]:
+    """Group stage_names into ordered execution batches by parallel_group.
+
+    Stages sharing the same non-empty ``parallel_group`` are placed in the
+    same batch and will be run concurrently by the shell orchestrator.
+    Stages without a group (or with ``servers != "none"``) form
+    single-element batches and run serially.
+
+    The output preserves the original relative order of stage_names.
+
+    Example with D and D2 both having ``parallel_group: "D+D2"``::
+
+        dump_stage_batches(cfg, ["A", "C", "D", "D2", "E"])
+        → [["A"], ["C"], ["D", "D2"], ["E"]]
+    """
+    by_name = {ph.name: ph for ph in stages_for(cfg)}
+    batches: list[list[str]] = []
+    group_to_idx: dict[str, int] = {}   # parallel_group → index in batches
+
+    for name in stage_names:
+        ph = by_name.get(name)
+        group = (ph.parallel_group if ph else "") or ""
+        # Fall back to serial if stage needs external servers (safety guard)
+        if group and ph and ph.servers != "none":
+            import logging as _log
+            _log.getLogger("scheduler").warning(
+                "[scheduler] stage %s is in parallel_group %r but servers=%r "
+                "— running serially",
+                name, group, ph.servers,
+            )
+            group = ""
+        if group and group in group_to_idx:
+            batches[group_to_idx[group]].append(name)
+        else:
+            idx = len(batches)
+            batches.append([name])
+            if group:
+                group_to_idx[group] = idx
+
+    return batches
 
 
 def dump_shell_env(
@@ -197,4 +244,5 @@ __all__ = [
     "stages_for", "select_stages", "get_stage",
     "phases_for", "select_phases", "get_phase",
     "dump_shell_env",
+    "dump_stage_batches",
 ]
