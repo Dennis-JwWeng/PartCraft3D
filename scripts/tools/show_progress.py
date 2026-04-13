@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -116,13 +117,16 @@ def _collect(status_dir: Path, stages: list[dict]) -> dict:
             })
 
     n_phase1_skip  = 0
+    n_parse_errors = 0
     s1_kept_total  = 0
     sq3_pass = sq3_fail = sq3_skip = 0
 
     for sp in status_files:
         try:
             data = json.loads(sp.read_text())
-        except Exception:
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"[WARN] skipping {sp}: {exc}", file=sys.stderr)
+            n_parse_errors += 1
             continue
         steps = data.get("steps") or {}
 
@@ -168,13 +172,14 @@ def _collect(status_dir: Path, stages: list[dict]) -> dict:
                 row["edit_skip"] += int(entry.get(skip_f)  or 0)
 
     return {
-        "n_total":       len(status_files),
-        "n_phase1_skip": n_phase1_skip,
-        "rows":          rows,
-        "s1_kept_total": s1_kept_total,
-        "sq3_pass":      sq3_pass,
-        "sq3_fail":      sq3_fail,
-        "sq3_skip":      sq3_skip,
+        "n_total":        len(status_files),
+        "n_phase1_skip":  n_phase1_skip,
+        "n_parse_errors": n_parse_errors,
+        "rows":           rows,
+        "s1_kept_total":  s1_kept_total,
+        "sq3_pass":       sq3_pass,
+        "sq3_fail":       sq3_fail,
+        "sq3_skip":       sq3_skip,
     }
 
 
@@ -197,7 +202,9 @@ def _print_report(result: dict, shard: str) -> None:
     )
     sep = "─" * 100
 
-    print(f"\nShard {shard} — {n} objects  (phase1-skip={skip}, net={net})")
+    parse_errors = result.get("n_parse_errors", 0)
+    parse_warn = f"  ⚠ {parse_errors} unreadable" if parse_errors else ""
+    print(f"\nShard {shard} — {n} objects  (phase1-skip={skip}, net={net}{parse_warn})")
     print(sep)
     print(header)
     print(sep)
@@ -256,6 +263,8 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = yaml.safe_load(args.config.read_text())
+    if not isinstance(cfg, dict):
+        raise SystemExit(f"[CONFIG] {args.config} is empty or not a valid YAML mapping")
     filter_names = (
         {s.strip() for s in args.stages.split(",")} if args.stages else None
     )
