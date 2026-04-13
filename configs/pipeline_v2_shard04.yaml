@@ -5,6 +5,8 @@ data:
   mesh_root: /mnt/cfs/vffey4/omni3d/partverse/mesh
   images_root: /mnt/cfs/vffey4/omni3d/partverse/images
   slat_dir: /mnt/cfs/vffey4/omni3d/partverse/slat
+  normalized_glb_dir: null
+  anno_dir: null
 pipeline:
   gpus:
   - 0
@@ -35,30 +37,31 @@ pipeline:
     steps:
     - s5
     use_gpus: true
-    parallel_group: "D+D2"
+    parallel_group: D+D2
   - name: D2
-    desc: deletion mesh
+    desc: deletion GLB masking + add meta
     servers: none
     steps:
     - s5b
-    parallel_group: "D+D2"
+    parallel_group: D+D2
+  - name: E_pre
+    desc: 5-view preview render
+    servers: none
+    steps:
+    - s6p
+    use_gpus: true
+  - name: E_qc
+    desc: QC-E final (all types)
+    servers: vlm
+    steps:
+    - sq3
   - name: E
-    desc: 3D rerender
+    desc: 3D render + del encode
     servers: none
     steps:
     - s6
     - s6b
     use_gpus: true
-  - name: E_qc
-    desc: QC-E final quality
-    servers: vlm
-    steps:
-    - sq3
-  - name: F
-    desc: addition backfill
-    servers: none
-    steps:
-    - s7
 services:
   vlm:
     model: /mnt/cfs/vffey4/omni3d/ckpt/Qwen3.5-27B

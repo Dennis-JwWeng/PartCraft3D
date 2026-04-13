@@ -5,6 +5,8 @@ data:
   mesh_root: /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/mesh
   images_root: /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/images
   slat_dir: /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/slat
+  normalized_glb_dir: null
+  anno_dir: null
 pipeline:
   gpus:
   - 4
@@ -18,10 +20,11 @@ pipeline:
   flux_port_stride: 1
   stages:
   - name: A
-    desc: phase1 VLM
+    desc: phase1 VLM + QC-A
     servers: vlm
     steps:
     - s1
+    - sq1
   - name: C
     desc: FLUX 2D
     servers: flux
@@ -33,25 +36,31 @@ pipeline:
     steps:
     - s5
     use_gpus: true
-    parallel_group: "D+D2"
+    parallel_group: D+D2
   - name: D2
-    desc: deletion mesh
+    desc: deletion GLB masking + add meta
     servers: none
     steps:
     - s5b
-    parallel_group: "D+D2"
+    parallel_group: D+D2
+  - name: E_pre
+    desc: 5-view preview render
+    servers: none
+    steps:
+    - s6p
+    use_gpus: true
+  - name: E_qc
+    desc: QC-E final (all types)
+    servers: vlm
+    steps:
+    - sq3
   - name: E
-    desc: 3D rerender
+    desc: 3D render + del encode
     servers: none
     steps:
     - s6
     - s6b
     use_gpus: true
-  - name: F
-    desc: addition backfill
-    servers: none
-    steps:
-    - s7
 services:
   vlm:
     model: Qwen3.5-27B
@@ -71,3 +80,20 @@ services:
 step_params:
   s5:
     num_views: 40
+qc:
+  vlm_score_threshold: 0.7
+  thresholds_by_type:
+    deletion:
+      min_visual_quality: 3
+    modification:
+      min_visual_quality: 3
+      require_preserve_other: true
+    scale:
+      min_visual_quality: 3
+      require_preserve_other: true
+    material:
+      min_visual_quality: 3
+    global:
+      min_visual_quality: 3
+    addition:
+      min_visual_quality: 3
