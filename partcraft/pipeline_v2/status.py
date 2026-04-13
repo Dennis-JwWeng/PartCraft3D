@@ -119,7 +119,7 @@ def update_step(
     status: str = STATUS_OK,
     **fields: Any,
 ) -> dict[str, Any]:
-    """Read-modify-write a single step entry (process-safe via flock)."""
+    """Read-modify-write a single step entry (process-safe via lockf + threading.Lock)."""
     with _status_lock(ctx):
         s = load_status(ctx)
         s.setdefault("steps", {})[step] = {
