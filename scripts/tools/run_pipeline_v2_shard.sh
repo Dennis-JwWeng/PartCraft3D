@@ -248,13 +248,61 @@ print(dump_shell_env(cfg, stage_name='$stage'))
     fi
 }
 
+run_parallel_group() {
+    # Run one or more stages; single stage → serial, multiple → parallel with & wait.
+    # run_pipeline_stage already tees output to stage_N.log; suppress its stdout
+    # here to avoid interleaved terminal output from concurrent stages.
+    if [ "$#" -eq 1 ]; then
+        run_pipeline_stage "$1"
+        return $?
+    fi
+
+    local pids=() names=("$@") _rc=0 _any_fail=0
+    echo
+    echo "▶ Parallel group [${names[*]}] — launching"
+    for _stage in "${names[@]}"; do
+        run_pipeline_stage "$_stage" >/dev/null &
+        pids+=($!)
+        echo "  ${_stage} → PID ${pids[-1]}"
+    done
+
+    for _i in "${!pids[@]}"; do
+        wait "${pids[$_i]}"; _rc=$?
+        if [ "$_rc" -ne 0 ]; then
+            echo "[scheduler] stage ${names[$_i]} FAILED (exit=$_rc)"
+            _any_fail=$_rc
+        else
+            echo "[scheduler] stage ${names[$_i]} OK"
+        fi
+    done
+
+    if [ "$_any_fail" -ne 0 ]; then
+        echo "[scheduler] parallel group [${names[*]}] had failures — aborting"
+        exit "$_any_fail"
+    fi
+}
+
 # ═══ MAIN LOOP ═══════════════════════════════════════════════════════
-_stage_idx=0
-while [ "$_stage_idx" -lt "${#SELECTED_STAGES[@]}" ]; do
-    stage="${SELECTED_STAGES[$_stage_idx]}"
-    run_pipeline_stage "$stage"
-    _stage_idx=$(( _stage_idx + 1 ))
-done
+# Ask Python to group SELECTED_STAGES by parallel_group; each output line
+# is one batch (space-separated stage names). Single-element lines run
+# serially (via run_parallel_group with 1 arg), multi-element lines run
+# concurrently (& + wait). Stage names are alphanumeric+_+- — safe to
+# pass via space-separated string.
+_stages_str="${SELECTED_STAGES[*]}"
+
+while IFS=' ' read -ra _batch; do
+    [ ${#_batch[@]} -eq 0 ] && continue
+    run_parallel_group "${_batch[@]}"
+done < <(
+    "$PY_PIPE" -c "
+import yaml
+from partcraft.pipeline_v2.scheduler import dump_stage_batches
+cfg = yaml.safe_load(open('$CFG'))
+stages = '$_stages_str'.split()
+for batch in dump_stage_batches(cfg, stages):
+    print(' '.join(batch))
+"
+)
 
 echo
 echo "=== ALL STAGES DONE ==="
