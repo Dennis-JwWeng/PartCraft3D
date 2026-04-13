@@ -128,7 +128,8 @@ def _collect(status_dir: Path, stages: list[dict]) -> dict:
 
         # phase1 skip detection
         s1 = steps.get("s1_phase1") or {}
-        if s1.get("status") == "skip":
+        is_phase1_skip = s1.get("status") == "skip"
+        if is_phase1_skip:
             n_phase1_skip += 1
         s1_kept_total += int(s1.get("n_kept") or 0)
 
@@ -137,6 +138,10 @@ def _collect(status_dir: Path, stages: list[dict]) -> dict:
         sq3_pass += int(sq3.get("n_pass") or 0)
         sq3_fail += int(sq3.get("n_fail") or 0)
         sq3_skip += int(sq3.get("n_skip") or 0)
+
+        # Skip per-row accumulation entirely for phase1-skip objects
+        if is_phase1_skip:
+            continue
 
         # per-row accumulation
         for row in rows:
@@ -152,8 +157,8 @@ def _collect(status_dir: Path, stages: list[dict]) -> dict:
                 r = _reason_from_entry(entry)
                 if r:
                     row["reasons"][r] += 1
-            # "skip" (phase1-skip objects) are already counted in n_phase1_skip;
-            # they appear as neither ok/fail/absent here — intentional omission.
+            # Step status "skip" is neither ok/fail/absent for obj_* columns.
+            # Phase1-skip objects are excluded from this loop entirely (see above).
 
             ef = EDIT_FIELDS.get(row["step_key"])
             if ef:
