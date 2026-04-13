@@ -5,8 +5,6 @@ data:
   mesh_root: /mnt/cfs/vffey4/omni3d/partverse/mesh
   images_root: /mnt/cfs/vffey4/omni3d/partverse/images
   slat_dir: /mnt/cfs/vffey4/omni3d/partverse/slat
-  normalized_glb_dir: /mnt/zsn/data/partverse/source/normalized_glbs
-  anno_dir: /mnt/zsn/data/partverse/source/anno_infos/anno_infos
 pipeline:
   gpus:
   - 0

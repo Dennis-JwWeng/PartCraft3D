@@ -5,8 +5,6 @@ data:
   mesh_root: /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/mesh
   images_root: /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/images
   slat_dir: /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/slat
-  normalized_glb_dir: /mnt/zsn/data/partverse/source/normalized_glbs
-  anno_dir: /mnt/zsn/data/partverse/source/anno_infos/anno_infos
 pipeline:
   gpus:
   - 4
