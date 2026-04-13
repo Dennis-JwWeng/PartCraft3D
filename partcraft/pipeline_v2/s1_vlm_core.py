@@ -174,6 +174,13 @@ you reason before you write the prompt):
                                     Shrink only. Prefer large/dominant parts (main body, primary limbs).
                                     Do NOT enlarge small decorative parts.
                       material:     {{"target_material": "..."}}
+                                    Target must be a specific surface substance or finish, e.g.:
+                                    "polished walnut wood", "brushed stainless steel",
+                                    "frosted borosilicate glass", "hand-stitched leather",
+                                    "poured concrete", "translucent amber resin".
+                                    FORBIDDEN in target_material: style/aesthetic words
+                                    (cartoon, vintage, futuristic, minimalist, steampunk,
+                                    cyberpunk) — those belong in "global" edits.
                       global:       {{"target_style": "..."}}
   after_desc_full / after_desc_stage1 / after_desc_stage2
                       object after the edit. For deletion: ALL three null.
@@ -183,6 +190,42 @@ you reason before you write the prompt):
                       modification only: describe the new replacement parts.
                       null for non-modification edits.
   confidence          "high" | "medium" | "low"
+
+# GLOBAL STYLE EDITS — ARTISTIC / RENDERING AESTHETIC ONLY
+
+  A global edit transforms the ENTIRE object's artistic or rendering aesthetic.
+  It must change how the object looks as a *visual artwork* — NOT what material
+  it is made of.
+
+  STRICTLY FORBIDDEN in global target_style:
+    • Surface-material words: gold, silver, metal, wood, stone, clay, glass,
+      ceramic, rubber, plastic, ice, crystal, fabric, concrete, leather.
+      → Those belong in "material" edits.
+    • Generic quality descriptors: "realistic", "detailed", "high quality".
+    • Near-duplicate styles: "cartoon", "cartoonish", "toon" count as ONE choice.
+
+  VALID target_style — choose from DIFFERENT categories for each object:
+
+    Rendering / shading aesthetics:
+      cel-shading, flat-shading, wireframe-outline with colored faces,
+      watercolor wash, oil-painting impasto, impressionist brushstroke,
+      pointillist dots, charcoal sketch, ink wash (sumi-e), stained-glass mosaic,
+      neon-glow bloom
+
+    Historical / regional art movements:
+      Art Nouveau organic lines, Art Deco geometric, ukiyo-e woodblock print,
+      Bauhaus functional, brutalist concrete aesthetic, baroque gilded,
+      gothic cathedral tracery, ancient terracotta figurine,
+      Ming dynasty blue-and-white porcelain
+
+    Genre / subculture aesthetics:
+      cyberpunk neon-and-chrome, steampunk brass-and-gears, solarpunk organic-tech,
+      vaporwave pastel grid, retro-1980s pixel-art, lo-fi cassette-tape grain,
+      biomechanical flesh-and-machine, origami paper-fold geometry,
+      LEGO brick construction, Islamic geometric mosaic tile
+
+  DIVERSITY RULE: For this object's {n_global} global edits, each target_style
+  MUST come from a DIFFERENT category above. Near-synonyms count as the same choice.
 
 # HARD RULES (violations drop that edit)
 
