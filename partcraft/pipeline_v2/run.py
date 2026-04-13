@@ -200,6 +200,8 @@ def run_step(
         # by s6b later (Blender 40 views → DINOv2 → SLAT enc → SS enc).
         run_mesh_delete(ctxs, cfg=cfg, images_root=images_root,
                         mesh_root=mesh_root, shard=shard,
+                        normalized_glb_dir=roots.normalized_glb_dir,
+                        anno_dir=roots.anno_dir,
                         force=args.force, logger=log)
 
     elif step == "s6p":

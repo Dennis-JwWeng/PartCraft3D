@@ -84,10 +84,87 @@ def _backfill_add(ctx, del_spec, add_seq, *, force=False, logger=None):
         return False
 
 
+
+def _build_deletion_glb(
+    obj_id: str,
+    selected_part_ids: list,
+    pair_dir: "Path",
+    normalized_glb_dir: "Path",
+    anno_dir: "Path",
+    *,
+    force: bool = False,
+    logger: "logging.Logger | None" = None,
+) -> bool:
+    """Build after_new.glb by masking selected parts from the normalized GLB.
+
+    Uses KD-tree face-centroid matching: segmented.glb (annotated, coarse) ->
+    normalized GLB (high-quality UV). Returns True on success, False on error.
+    """
+    import numpy as np
+    import trimesh
+    from scipy.spatial import cKDTree
+    log = logger or logging.getLogger("pipeline_v2.s5b")
+
+    norm_path    = normalized_glb_dir / f"{obj_id}.glb"
+    anno_obj_dir = anno_dir / obj_id
+    seg_path     = anno_obj_dir / f"{obj_id}_segmented.glb"
+    f2l_path     = anno_obj_dir / f"{obj_id}_face2label.json"
+
+    for p in (norm_path, seg_path, f2l_path):
+        if not p.is_file():
+            log.warning("[s5b] _build_deletion_glb: missing %s", p)
+            return False
+
+    after_glb  = pair_dir / "after_new.glb"
+    before_glb = pair_dir / "before_new.glb"
+
+    if after_glb.is_file() and not force:
+        return True
+
+    try:
+        norm_scene = trimesh.load(str(norm_path), force='scene')
+        meshes = list(norm_scene.geometry.values())
+        norm_mesh = meshes[0] if len(meshes) == 1 else trimesh.util.concatenate(meshes)
+        seg_mesh   = trimesh.load(str(seg_path), force='mesh')
+        f2l        = {int(k): int(v)
+                      for k, v in json.load(open(f2l_path)).items()}
+
+        seg_centroids  = seg_mesh.vertices[seg_mesh.faces].mean(axis=1)
+        norm_centroids = norm_mesh.vertices[norm_mesh.faces].mean(axis=1)
+        _, nn_idxs     = cKDTree(seg_centroids).query(norm_centroids, k=1)
+
+        face_labels = np.array([f2l.get(int(i), -1) for i in nn_idxs])
+        mask_keep   = ~np.isin(face_labels, selected_part_ids)
+
+        masked = trimesh.Trimesh(
+            vertices=norm_mesh.vertices,
+            faces=norm_mesh.faces[mask_keep],
+            visual=norm_mesh.visual,
+            process=False,
+        )
+        masked.remove_unreferenced_vertices()
+        masked.export(str(after_glb))
+
+        if not before_glb.exists():
+            try:
+                before_glb.symlink_to(norm_path.resolve())
+            except OSError:
+                pass
+
+        log.info("[s5b] GLB del=%d keep=%d -> %s",
+                 (~mask_keep).sum(), mask_keep.sum(), after_glb.name)
+        return True
+    except Exception as exc:
+        log.warning("[s5b] _build_deletion_glb %s: %s", obj_id, exc)
+        return False
+
+
 def run_mesh_delete_for_object(
     ctx: ObjectContext,
     *,
     dataset,
+    normalized_glb_dir: "Path | None" = None,
+    anno_dir: "Path | None" = None,
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> DelMeshResult:
@@ -119,6 +196,12 @@ def run_mesh_delete_for_object(
         a_ply = pair_dir / "after.ply"
         if a_ply.is_file() and not force:
             # PLY already exists — still backfill add meta if missing
+            if normalized_glb_dir and anno_dir:
+                _build_deletion_glb(
+                    ctx.obj_id, list(spec.selected_part_ids),
+                    pair_dir, normalized_glb_dir, anno_dir,
+                    force=False, logger=log,
+                )
             _backfill_add(ctx, spec, add_seq, force=False, logger=log)
             res.n_skip += 1
             add_seq += 1
@@ -128,6 +211,12 @@ def run_mesh_delete_for_object(
             TrellisRefiner.direct_delete_mesh(
                 obj_record, spec.selected_part_ids, pair_dir, export_ply=True,
             )
+            if normalized_glb_dir and anno_dir:
+                _build_deletion_glb(
+                    ctx.obj_id, list(spec.selected_part_ids),
+                    pair_dir, normalized_glb_dir, anno_dir,
+                    force=force, logger=log,
+                )
             _backfill_add(ctx, spec, add_seq, force=force, logger=log)
             res.n_ok += 1
         except Exception as e:
@@ -151,6 +240,8 @@ def run_mesh_delete(
     images_root: Path,
     mesh_root: Path,
     shard: str = "01",
+    normalized_glb_dir: "Path | None" = None,
+    anno_dir: "Path | None" = None,
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> list[DelMeshResult]:
@@ -166,7 +257,10 @@ def run_mesh_delete(
             out.append(DelMeshResult(ctx.obj_id))
             continue
         out.append(run_mesh_delete_for_object(
-            ctx, dataset=dataset, force=force, logger=log,
+            ctx, dataset=dataset,
+            normalized_glb_dir=normalized_glb_dir,
+            anno_dir=anno_dir,
+            force=force, logger=log,
         ))
     return out
 
