@@ -169,6 +169,7 @@ def run_step(
             vlm_model=model, n_prerender_workers=n_pre,
             force=args.force,
             post_object_fn=post_object_fn,
+            anno_dir=roots.anno_dir,
         ))
 
     elif step == "s2":
@@ -246,12 +247,13 @@ def run_step(
 
     elif step == "sq3":
         from .sq3_qc_e import run as sq3_run
+        import asyncio
         urls = ([u.strip() for u in args.vlm_url.split(",") if u.strip()]
                 if getattr(args, "vlm_url", None) else sched.vlm_urls_for(cfg))
         if not urls:
             raise SystemExit("[CONFIG] no VLM urls for sq3 (set pipeline.gpus or services.vlm.base_urls)")
-        sq3_run(ctxs, vlm_url=urls[0], vlm_model=psvc.vlm_model_name(cfg),
-                cfg=cfg, force=args.force)
+        asyncio.run(sq3_run(ctxs, vlm_urls=urls, vlm_model=psvc.vlm_model_name(cfg),
+                            cfg=cfg, force=args.force))
 
     else:
         raise SystemExit(f"unknown step: {step}")

@@ -59,7 +59,11 @@ class Phase1Result:
 
 # ─────────────────── render-only (cheap, sequential) ──────────────────
 
-def prerender(ctx: ObjectContext, blender: str) -> tuple[bytes, str, list[int], dict, str] | None:
+def prerender(
+    ctx: ObjectContext,
+    blender: str,
+    anno_dir: "Path | None" = None,
+) -> tuple[bytes, str, list[int], dict, str] | None:
     """Render overview + build menu + quota. Returns ``None`` if the
     object exceeds ``MAX_PARTS``.
 
@@ -70,7 +74,7 @@ def prerender(ctx: ObjectContext, blender: str) -> tuple[bytes, str, list[int], 
     """
     if ctx.mesh_npz is None or ctx.image_npz is None:
         raise ValueError(f"{ctx} missing mesh_npz/image_npz")
-    _anno = ctx.root.anno_object_dir(ctx.obj_id)
+    _anno = (anno_dir / ctx.obj_id) if anno_dir else None
     pids, menu = build_part_menu(ctx.mesh_npz, ctx.image_npz, anno_obj_dir=_anno)
     if len(pids) > MAX_PARTS:
         return None
@@ -361,6 +365,7 @@ async def run_many_streaming(
     force: bool = False,
     log_every: int = 20,
     post_object_fn=None,
+    anno_dir: "Path | None" = None,
 ) -> list[Phase1Result]:
     """Producer-consumer streaming s1: ``n_prerender_workers`` blender
     processes feed an asyncio queue consumed by ``len(vlm_urls)`` VLM
@@ -425,7 +430,7 @@ async def run_many_streaming(
 
     async def render_one(ctx: ObjectContext):
         try:
-            _anno_dir = ctx.root.anno_object_dir(ctx.obj_id)
+            _anno_dir = (anno_dir / ctx.obj_id) if anno_dir else None
             pre = await loop.run_in_executor(
                 pool, _prerender_worker,
                 (str(ctx.mesh_npz), str(ctx.image_npz),
