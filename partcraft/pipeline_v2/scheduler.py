@@ -10,6 +10,7 @@ Imported by :mod:`run` and ``run_pipeline_v2_shard.sh`` (``dump_shell_env``).
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -164,8 +165,7 @@ def dump_stage_batches(
         group = (ph.parallel_group if ph else "") or ""
         # Fall back to serial if stage needs external servers (safety guard)
         if group and ph and ph.servers != "none":
-            import logging as _log
-            _log.getLogger("scheduler").warning(
+            logging.getLogger("scheduler").warning(
                 "[scheduler] stage %s is in parallel_group %r but servers=%r "
                 "— running serially",
                 name, group, ph.servers,

@@ -86,12 +86,33 @@ def test_dump_stage_batches_groups_d_and_d2():
     import yaml
     from partcraft.pipeline_v2.scheduler import dump_stage_batches
 
-    cfg = yaml.safe_load(open("configs/pipeline_v2_shard05_test.yaml"))
-    # Before Task 4 adds parallel_group to the yaml, D and D2 have no group
-    # so this test checks structure only: function exists, returns list[list[str]],
-    # every requested stage appears exactly once.
-    result = dump_stage_batches(cfg, ["A", "C", "D", "D2", "E_pre"])
-    assert isinstance(result, list)
-    assert all(isinstance(b, list) for b in result)
-    flat = [s for batch in result for s in batch]
-    assert sorted(flat) == sorted(["A", "C", "D", "D2", "E_pre"])
+    # Minimal inline config: D and D2 share a parallel_group, others do not.
+    cfg = yaml.safe_load("""
+pipeline:
+  stages:
+    - {name: A, servers: none, steps: [s1]}
+    - {name: C, servers: none, steps: [s4]}
+    - name: D
+      desc: TRELLIS 3D edit
+      servers: none
+      steps: [s5]
+      use_gpus: true
+      parallel_group: "D+D2"
+    - name: D2
+      desc: deletion PLY
+      servers: none
+      steps: [s5b]
+      parallel_group: "D+D2"
+    - {name: E, servers: none, steps: [s6], use_gpus: true}
+""")
+    result = dump_stage_batches(cfg, ["A", "C", "D", "D2", "E"])
+    assert result == [["A"], ["C"], ["D", "D2"], ["E"]], f"Unexpected batches: {result}"
+
+    # No parallel_group → every stage in its own batch (serial)
+    cfg_no_group = yaml.safe_load("""
+pipeline:
+  stages:
+    - {name: D, servers: none, steps: [s5]}
+    - {name: D2, servers: none, steps: [s5b]}
+""")
+    assert dump_stage_batches(cfg_no_group, ["D", "D2"]) == [["D"], ["D2"]]
