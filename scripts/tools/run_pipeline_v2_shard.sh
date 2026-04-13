@@ -267,7 +267,8 @@ run_parallel_group() {
     done
 
     for _i in "${!pids[@]}"; do
-        wait "${pids[$_i]}"; _rc=$?
+        _rc=0
+        wait "${pids[$_i]}" || _rc=$?
         if [ "$_rc" -ne 0 ]; then
             echo "[scheduler] stage ${names[$_i]} FAILED (exit=$_rc)"
             _any_fail=$_rc
