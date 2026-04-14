@@ -663,9 +663,36 @@ def run_del(
         )
 
     results: list[PreviewResult] = list(done_results)
+    n_total = len(pending)
+    n_done = 0
+    t_start = time.time()
+
+    try:
+        from tqdm import tqdm as _tqdm
+        _bar = _tqdm(total=n_total, desc="s6p_del", unit="obj",
+                     dynamic_ncols=True, leave=True)
+    except ImportError:
+        _bar = None
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
-        for res in pool.map(_do, pending):
+        futures = {pool.submit(_do, ctx): ctx for ctx in pending}
+        for fut in concurrent.futures.as_completed(futures):
+            res = fut.result()
             results.append(res)
+            n_done += 1
+            elapsed = time.time() - t_start
+            rate = n_done / elapsed if elapsed > 0 else 0
+            eta = (n_total - n_done) / rate if rate > 0 else 0
+            if _bar is not None:
+                _bar.set_postfix(ok=res.n_ok, fail=res.n_fail,
+                                 skip=res.n_skip, eta=f"{eta/60:.0f}m")
+                _bar.update(1)
+            elif n_done % 10 == 0 or n_done == n_total:
+                log.info("[s6p_del] %d/%d  elapsed=%.0fs  eta=%.0fm",
+                         n_done, n_total, elapsed, eta / 60)
+
+    if _bar is not None:
+        _bar.close()
 
     n_ok   = sum(r.n_ok   for r in results)
     n_fail = sum(r.n_fail for r in results)
