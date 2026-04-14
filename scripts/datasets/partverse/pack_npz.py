@@ -24,6 +24,8 @@ Reads from:
     source/anno_infos/{uuid}/{uuid}_face2label.json — per-face → part_id (integers only)
     img_Enc/{uuid}/                               — rendered views + transforms
     source/text_captions.json                     — per-part text captions (semantic labels)
+    source/textured_part_glbs/{uuid}/<N>.glb      — pre-split textured part GLBs (optional)
+    source/normalized_glbs/{uuid}.glb             — full textured GLB (optional)
 
 Writes:
     data/partverse/images/{shard}/{uuid}.npz      — render NPZ (pipeline input)
@@ -44,6 +46,11 @@ Usage:
 
     # Re-pack everything (overwrite)
     python scripts/datasets/partverse/pack_npz.py --force
+
+    # Pack with GLB source data
+    python scripts/datasets/partverse/pack_npz.py --limit 5 \\
+        --textured-part-glbs-dir /mnt/zsn/data/partverse/source/textured_part_glbs \\
+        --normalized-glb-dir /mnt/zsn/data/partverse/source/normalized_glbs
 """
 
 import argparse
@@ -149,11 +156,119 @@ def _load_source_mesh(obj_id: str, anno_dir: Path | None = None):
     return mesh
 
 
+def _pack_mesh_glb(
+    obj_id: str,
+    textured_part_glbs_dir: Path,
+    normalized_glb_dir: Path,
+    transforms: dict,
+) -> dict | None:
+    """Pack GLB-format mesh data for one object.
+
+    Returns dict with keys "full.glb" and "part_N.glb" (bytes as np.uint8 arrays),
+    or None if source data is unavailable.
+    """
+    import io as _io
+    import trimesh
+
+    part_glb_root = Path(textured_part_glbs_dir) / obj_id
+    norm_glb_path = Path(normalized_glb_dir) / f"{obj_id}.glb"
+
+    if not part_glb_root.exists() or not norm_glb_path.exists():
+        return None
+
+    result = {}
+
+    # Pack full mesh (normalized_glb → VD-space)
+    scene = trimesh.load(str(norm_glb_path), force="scene")
+    meshes = [g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)]
+    if not meshes:
+        return None
+    full_mesh = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
+    full_mesh = _align_source_to_vd(full_mesh, transforms)
+    buf = _io.BytesIO()
+    full_mesh.export(buf, file_type="glb")
+    result["full.glb"] = np.frombuffer(buf.getvalue(), dtype=np.uint8)
+
+    # Pack per-part meshes (textured_part_glbs/<obj>/<N>.glb → VD-space)
+    part_files = sorted(part_glb_root.glob("*.glb"), key=lambda p: int(p.stem))
+    if not part_files:
+        return None
+    for part_path in part_files:
+        pid = int(part_path.stem)
+        scene_p = trimesh.load(str(part_path), force="scene")
+        pmeshes = [g for g in scene_p.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        if not pmeshes:
+            continue
+        part_mesh = trimesh.util.concatenate(pmeshes) if len(pmeshes) > 1 else pmeshes[0]
+        part_mesh = _align_source_to_vd(part_mesh, transforms)
+        pbuf = _io.BytesIO()
+        part_mesh.export(pbuf, file_type="glb")
+        result[f"part_{pid}.glb"] = np.frombuffer(pbuf.getvalue(), dtype=np.uint8)
+
+    if "full.glb" not in result or not any(k.startswith("part_") for k in result):
+        return None
+    return result
+
+
+def _pack_mesh_ply(
+    obj_id: str,
+    anno_dir: Path | None,
+    transforms: dict,
+    captions: dict | None = None,
+) -> tuple[dict, dict, int] | str:
+    """Pack PLY-format mesh data for one object (segmented.glb path).
+
+    Returns (mesh_data, render_extras, n_parts) on success, or an error
+    reason string on failure.
+
+    mesh_data:     {"full.ply": np.uint8, "part_N.ply": np.uint8, ...}
+    render_extras: {"split_mesh.json": np.uint8}
+    """
+    instance_gt = _load_face2label(obj_id, anno_dir=anno_dir)
+    if instance_gt is None:
+        return "no face2label.json"
+
+    source_mesh = _load_source_mesh(obj_id, anno_dir=anno_dir)
+    if source_mesh is None:
+        return "no source GLB"
+
+    if len(instance_gt) != len(source_mesh.faces):
+        return (f"face2label ({len(instance_gt)}) != "
+                f"source faces ({len(source_mesh.faces)})")
+
+    source_mesh = _align_source_to_vd(source_mesh, transforms)
+
+    obj_caps = (captions or {}).get(obj_id, {})
+    n_parts = int(instance_gt.max()) + 1
+    labels = [
+        _label_from_part_captions(obj_caps.get(str(pid), [])) or f"part_{pid}"
+        for pid in range(n_parts)
+    ]
+
+    parts, split_mesh_json = _split_mesh(source_mesh, instance_gt, labels)
+
+    mesh_data: dict[str, np.ndarray] = {
+        "full.ply": np.frombuffer(_to_ply(source_mesh), dtype=np.uint8),
+    }
+    for pid, label, sub in parts:
+        mesh_data[f"part_{pid}.ply"] = np.frombuffer(_to_ply(sub), dtype=np.uint8)
+
+    render_extras: dict[str, np.ndarray] = {
+        "split_mesh.json": np.frombuffer(
+            json.dumps(split_mesh_json).encode("utf-8"), dtype=np.uint8
+        ),
+    }
+
+    return mesh_data, render_extras, len(parts)
+
+
 def _pack_one(obj_id: str, img_enc_dir: Path,
                render_out: Path, mesh_out: Path,
                captions: dict,
                keep_views: list[int] | None = None,
-               anno_dir: Path | None = None) -> dict:
+               anno_dir: Path | None = None,
+               textured_part_glbs_dir: Path | None = None,
+               normalized_glb_dir: Path | None = None) -> dict:
     """Pack one PartVerse object into render + mesh NPZ.
 
     Args:
@@ -161,6 +276,11 @@ def _pack_one(obj_id: str, img_enc_dir: Path,
                     transforms.json is always packed in full regardless.
         anno_dir:   Override for _ANNO_DIR (source/anno_infos) when source data
                     lives on a different mount than the output dataset_root.
+        textured_part_glbs_dir: Root dir of pre-split textured part GLBs
+                    (e.g. source/textured_part_glbs). When set together with
+                    normalized_glb_dir, GLB packing is attempted first.
+        normalized_glb_dir: Dir containing full textured GLBs named {obj_id}.glb
+                    (e.g. source/normalized_glbs).
     """
     transforms_path = img_enc_dir / "transforms.json"
     if not transforms_path.exists():
@@ -190,50 +310,40 @@ def _pack_one(obj_id: str, img_enc_dir: Path,
     render_data["transforms.json"] = np.frombuffer(
         json.dumps(transforms).encode("utf-8"), dtype=np.uint8)
 
-    # ---- Load source mesh and per-face part labels ----
-    instance_gt = _load_face2label(obj_id, anno_dir=anno_dir)
-    if instance_gt is None:
-        return {"status": "skip", "reason": "no face2label.json"}
+    # ---- Mesh data: try GLB first, fall back to PLY ----
+    use_glb = (
+        textured_part_glbs_dir is not None
+        and normalized_glb_dir is not None
+    )
+    mesh_data: dict[str, np.ndarray] = {}
+    n_parts = 0
 
-    source_mesh = _load_source_mesh(obj_id, anno_dir=anno_dir)
-    if source_mesh is None:
-        return {"status": "skip", "reason": "no source GLB"}
+    if use_glb:
+        mesh_data = _pack_mesh_glb(
+            obj_id, textured_part_glbs_dir, normalized_glb_dir, transforms
+        ) or {}
 
-    if len(instance_gt) != len(source_mesh.faces):
-        return {"status": "skip",
-                "reason": (f"face2label ({len(instance_gt)}) != "
-                           f"source faces ({len(source_mesh.faces)})")}
-
-    # ---- Align source mesh to VD coordinate space ----
-    source_mesh = _align_source_to_vd(source_mesh, transforms)
-
-    # ---- Part labels: full best caption (first non-empty line per part) ----
-    obj_caps = captions.get(obj_id, {})
-    n_parts = int(instance_gt.max()) + 1
-    labels = []
-    for pid in range(n_parts):
-        cap_list = obj_caps.get(str(pid), [])
-        label = _label_from_part_captions(cap_list)
-        if not label:
-            label = f"part_{pid}"
-        labels.append(label)
-
-    # ---- Split mesh ----
-    parts, split_mesh_json = _split_mesh(source_mesh, instance_gt, labels)
-
-    render_data["split_mesh.json"] = np.frombuffer(
-        json.dumps(split_mesh_json).encode("utf-8"), dtype=np.uint8)
-
-    mesh_data: dict[str, np.ndarray] = {
-        "full.ply": np.frombuffer(_to_ply(source_mesh), dtype=np.uint8),
-    }
-    for pid, label, sub in parts:
-        mesh_data[f"part_{pid}.ply"] = np.frombuffer(_to_ply(sub), dtype=np.uint8)
+    if mesh_data:
+        # GLB path succeeded: try to supplement render_data with split_mesh.json
+        # from PLY source if available (best-effort; non-fatal if missing).
+        ply_result = _pack_mesh_ply(obj_id, anno_dir, transforms, captions)
+        if not isinstance(ply_result, str):
+            _, render_extras, _ = ply_result
+            render_data.update(render_extras)
+        n_parts = len([k for k in mesh_data if k.startswith("part_") and
+                        (k.endswith(".glb") or k.endswith(".ply"))])
+    else:
+        # PLY fallback
+        ply_result = _pack_mesh_ply(obj_id, anno_dir, transforms, captions)
+        if isinstance(ply_result, str):
+            return {"status": "skip", "reason": ply_result}
+        mesh_data, render_extras, n_parts = ply_result
+        render_data.update(render_extras)
 
     np.savez_compressed(str(render_out / f"{obj_id}.npz"), **render_data)
     np.savez_compressed(str(mesh_out / f"{obj_id}.npz"), **mesh_data)
 
-    return {"status": "ok", "views": found, "parts": len(parts)}
+    return {"status": "ok", "views": found, "parts": n_parts}
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +377,17 @@ def main():
                         help="Re-pack even if output NPZs already exist")
     parser.add_argument("--workers", type=int, default=1,
                         help="Number of parallel CPU workers (default: 1)")
+
+    glb = parser.add_argument_group("GLB source data (optional)")
+    glb.add_argument("--textured-part-glbs-dir", type=str, default=None,
+                     help="Root dir of pre-split textured part GLBs "
+                          "(e.g. /mnt/zsn/data/partverse/source/textured_part_glbs). "
+                          "When set together with --normalized-glb-dir, GLB packing "
+                          "is attempted before PLY fallback.")
+    glb.add_argument("--normalized-glb-dir", type=str, default=None,
+                     help="Dir containing full textured GLBs named {obj_id}.glb "
+                          "(e.g. /mnt/zsn/data/partverse/source/normalized_glbs).")
+
     args = parser.parse_args()
 
     global _PARTVERSE_DIR, _ANNO_DIR, _CAPTIONS_PATH, _IMG_ENC_DIR, _IMAGES_DIR, _MESH_DIR
@@ -277,6 +398,13 @@ def main():
         _IMG_ENC_DIR   = _PARTVERSE_DIR / "img_Enc"
         _IMAGES_DIR    = _PARTVERSE_DIR / "images"
         _MESH_DIR      = _PARTVERSE_DIR / "mesh"
+
+    textured_part_glbs_dir = (
+        Path(args.textured_part_glbs_dir) if args.textured_part_glbs_dir else None
+    )
+    normalized_glb_dir = (
+        Path(args.normalized_glb_dir) if args.normalized_glb_dir else None
+    )
 
     # ---- Determine object list ----
     if args.obj_ids:
@@ -316,6 +444,9 @@ def main():
     mesh_out.mkdir(parents=True, exist_ok=True)
     logger.info(f"Output → images/{shard}/ and mesh/{shard}/")
 
+    if textured_part_glbs_dir and normalized_glb_dir:
+        logger.info(f"GLB source: {textured_part_glbs_dir} + {normalized_glb_dir}")
+
     # ---- Pack ----
     total = len(obj_ids)
 
@@ -343,7 +474,9 @@ def main():
 
     def _do_pack(oid: str) -> dict:
         return _pack_one(oid, _IMG_ENC_DIR / oid, render_out, mesh_out, captions,
-                         keep_views=PACK_VIEWS)
+                         keep_views=PACK_VIEWS,
+                         textured_part_glbs_dir=textured_part_glbs_dir,
+                         normalized_glb_dir=normalized_glb_dir)
 
     ok = fail = 0
     if args.workers <= 1:

@@ -115,7 +115,9 @@ def _pack_worker(oid: str) -> tuple[str, dict]:
     return oid, _pack_one(oid, ctx["img_enc_dir"] / oid,
                           ctx["render_out"], ctx["mesh_out"],
                           ctx["captions"], keep_views=PACK_VIEWS,
-                          anno_dir=ctx.get("anno_dir"))
+                          anno_dir=ctx.get("anno_dir"),
+                          textured_part_glbs_dir=ctx.get("textured_part_glbs_dir"),
+                          normalized_glb_dir=ctx.get("normalized_glb_dir"))
 
 
 def _run_pack(
@@ -130,6 +132,8 @@ def _run_pack(
     mesh_dir: Path,
     workers: int = 1,
     anno_dir: Path | None = None,
+    textured_part_glbs_dir: Path | None = None,
+    normalized_glb_dir: Path | None = None,
 ):
     """Pack rendered img_Enc outputs into images/{shard}/ + mesh/{shard}/ NPZ."""
     from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -164,7 +168,9 @@ def _run_pack(
     if workers <= 1:
         for i, obj_id in enumerate(pending):
             result = _pack_one(obj_id, img_enc_dir / obj_id, render_out, mesh_out,
-                               captions, keep_views=PACK_VIEWS, anno_dir=anno_dir)
+                               captions, keep_views=PACK_VIEWS, anno_dir=anno_dir,
+                               textured_part_glbs_dir=textured_part_glbs_dir,
+                               normalized_glb_dir=normalized_glb_dir)
             if result["status"] == "ok":
                 ok += 1
                 logger.info(f"[pack {i+1}/{len(pending)}] {obj_id}: "
@@ -174,7 +180,9 @@ def _run_pack(
                 logger.warning(f"[pack {i+1}/{len(pending)}] {obj_id}: skip — {result['reason']}")
     else:
         _pack_ctx.update(img_enc_dir=img_enc_dir, render_out=render_out,
-                         mesh_out=mesh_out, captions=captions, anno_dir=anno_dir)
+                         mesh_out=mesh_out, captions=captions, anno_dir=anno_dir,
+                         textured_part_glbs_dir=textured_part_glbs_dir,
+                         normalized_glb_dir=normalized_glb_dir)
         with ProcessPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(_pack_worker, oid): oid for oid in pending}
             done_count = 0
@@ -244,6 +252,16 @@ def main():
                              "Should not exceed the number of available GPUs.")
     parser.add_argument("--pack-workers", type=int, default=1,
                         help="Parallel CPU workers for pack step (default: 1)")
+
+    glb = parser.add_argument_group("GLB source data (optional)")
+    glb.add_argument("--textured-part-glbs-dir", type=str, default=None,
+                     help="Root dir of pre-split textured part GLBs "
+                          "(e.g. source/textured_part_glbs). When set together "
+                          "with --normalized-glb-dir, GLB packing is attempted "
+                          "before PLY fallback.")
+    glb.add_argument("--normalized-glb-dir", type=str, default=None,
+                     help="Dir containing full textured GLBs named {obj_id}.glb "
+                          "(e.g. source/normalized_glbs).")
     args = parser.parse_args()
 
     # region agent log
@@ -272,6 +290,14 @@ def main():
     images_dir = Path(paths["images_npz_dir"])
     mesh_dir = Path(paths["mesh_npz_dir"])
     anno_dir = Path(paths["anno_infos_dir"]) if "anno_infos_dir" in paths else None
+    textured_part_glbs_dir = (
+        Path(args.textured_part_glbs_dir) if args.textured_part_glbs_dir else
+        Path(paths["textured_part_glbs_dir"]) if "textured_part_glbs_dir" in paths else None
+    )
+    normalized_glb_dir = (
+        Path(args.normalized_glb_dir) if args.normalized_glb_dir else
+        Path(paths["normalized_glb_dir"]) if "normalized_glb_dir" in paths else None
+    )
     # region agent log
     _debug_log(
         "H1",
@@ -459,6 +485,8 @@ def main():
                 mesh_dir=mesh_dir,
                 workers=args.pack_workers,
                 anno_dir=anno_dir,
+                textured_part_glbs_dir=textured_part_glbs_dir,
+                normalized_glb_dir=normalized_glb_dir,
             )
         print_summary(obj_ids, img_enc_dir, slat_shard_dir, logger)
         return
@@ -511,6 +539,8 @@ def main():
             mesh_dir=mesh_dir,
             workers=args.pack_workers,
             anno_dir=anno_dir,
+            textured_part_glbs_dir=textured_part_glbs_dir,
+            normalized_glb_dir=normalized_glb_dir,
         )
 
     print_summary(obj_ids, img_enc_dir, slat_shard_dir, logger)
