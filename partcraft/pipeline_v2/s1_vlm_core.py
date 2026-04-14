@@ -346,8 +346,12 @@ def build_part_menu(
     sm = json.loads(bytes(z["split_mesh.json"]).decode())
     clusters = sm.get("valid_clusters", {})
     z2 = np.load(mesh_npz, allow_pickle=True)
-    pids = sorted(int(k.replace("part_", "").replace(".ply", ""))
-                  for k in z2.files if k.startswith("part_"))
+    import re as _re
+    pids = sorted(
+        int(_re.search(r'\d+', k).group())
+        for k in z2.files
+        if k.startswith("part_") and (k.endswith(".glb") or k.endswith(".ply"))
+    )
 
     peer_groups, structural_pids, pid_levels = _load_anno_peer_groups(anno_obj_dir, pids)
 

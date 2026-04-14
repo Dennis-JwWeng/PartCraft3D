@@ -424,12 +424,14 @@ class TrellisRefiner:
             vd_mesh = o3d.io.read_triangle_mesh(vd_mesh_path)
         else:
             npz = np.load(obj_record.mesh_npz_path, allow_pickle=False)
-            if "full.ply" not in npz:
+            fmt_key = "full.glb" if "full.glb" in npz.files else "full.ply"
+            if fmt_key not in npz.files:
                 raise FileNotFoundError(
                     f"VD mesh.ply not found at {vd_mesh_path} and "
-                    f"full.ply not found in {obj_record.mesh_npz_path}.")
-            _tmp = tempfile.NamedTemporaryFile(suffix=".ply", delete=False)
-            _tmp.write(npz["full.ply"].tobytes())
+                    f"neither full.glb nor full.ply found in {obj_record.mesh_npz_path}.")
+            tmp_suffix = ".glb" if fmt_key == "full.glb" else ".ply"
+            _tmp = tempfile.NamedTemporaryFile(suffix=tmp_suffix, delete=False)
+            _tmp.write(npz[fmt_key].tobytes())
             _tmp.close()
             vd_mesh = o3d.io.read_triangle_mesh(_tmp.name)
             os.unlink(_tmp.name)
