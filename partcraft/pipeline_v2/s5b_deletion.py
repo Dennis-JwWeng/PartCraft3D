@@ -40,9 +40,9 @@ sys.path.insert(0, str(_ROOT / "scripts" / "tools"))
 
 from .paths import ObjectContext
 from .specs import EditSpec, iter_deletion_specs
-from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
+from .status import update_step, STATUS_OK, STATUS_FAIL
 from .qc_io import is_edit_qc_failed, is_gate_a_failed
-from .edit_status_io import edit_needs_step, update_edit_stage
+from .edit_status_io import edit_needs_step, update_edit_stage, obj_needs_stage
 from . import services_cfg as psvc
 from .addition_utils import invert_delete_prompt
 
@@ -231,6 +231,12 @@ def _build_deletion_from_npz(
         log.warning("[s5b] _build_deletion_from_npz: all parts selected for deletion")
         return False
 
+    # Detect if NPZ stores raw Y-up GLBs (new format) needing VD transform
+    has_vd_transform = "vd_scale" in npz.files
+    if has_vd_transform:
+        vd_scale = float(npz["vd_scale"][0])
+        vd_offset = np.array(npz["vd_offset"])
+
     meshes = []
     for pid in keep_pids:
         key = f"part_{pid}.glb"
@@ -248,6 +254,15 @@ def _build_deletion_from_npz(
         return False
 
     result = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
+
+    # Apply VD-space transform (Y-up → Z-up + scale/offset) for new-format NPZs
+    if has_vd_transform:
+        v = np.array(result.vertices)
+        vd = np.empty_like(v)
+        vd[:, 0] = v[:, 0]
+        vd[:, 1] = -v[:, 2]
+        vd[:, 2] = v[:, 1]
+        result.vertices = (vd + vd_offset) * vd_scale
     pair_dir.mkdir(parents=True, exist_ok=True)
     result.export(str(out_path))
     log.info("[s5b] _build_deletion_from_npz: wrote %s (%d parts kept)", out_path, len(keep_pids))
@@ -420,7 +435,10 @@ def run_mesh_delete(
 
     out: list[DelMeshResult] = []
     for ctx in list(ctxs):
-        if not force and step_done(ctx, "s5b_del_mesh"):
+        del_ids = [sp.edit_id for sp in iter_deletion_specs(ctx)]
+        _all_done = (not force and del_ids
+                     and not obj_needs_stage(ctx, del_ids, "s5b", prereq_map or {}, force=force))
+        if _all_done:
             # For GLB path: still run if any edit is missing its GLB (backfill).
             if use_glb and _needs_glb_backfill(ctx):
                 pass  # fall through to run_mesh_delete_for_object
@@ -558,12 +576,12 @@ def run_reencode_for_object(
             add_seq += 1
             continue
 
-        # Skip if a_npz already has the full encoded payload and step is done.
+        # Skip if a_npz already has the full encoded payload (per-edit done check).
         if a_npz.is_file() and not force:
             try:
                 d = np.load(a_npz)
                 if "ss" in d.files and d["slat_feats"].shape[0] > 0 and \
-                        step_done(ctx, "s6b_del_reencode"):
+                        not edit_needs_step(ctx, spec.edit_id, "s6b", prereq_map or {}, force=force):
                     res.n_skip += 1
                     add_seq += 1
                     continue
@@ -629,7 +647,10 @@ def run_reencode(
 
     out: list[DelReencodeResult] = []
     for ctx in list(ctxs):
-        if not force and step_done(ctx, "s6b_del_reencode"):
+        del_ids = [sp.edit_id for sp in iter_deletion_specs(ctx)]
+        if del_ids and not force and not obj_needs_stage(
+            ctx, del_ids, "s6b", prereq_map or {}, force=force
+        ):
             out.append(DelReencodeResult(ctx.obj_id))
             continue
         out.append(run_reencode_for_object(

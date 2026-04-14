@@ -196,35 +196,28 @@ def _pack_mesh_glb(
 ) -> dict | None:
     """Pack GLB-format mesh data for one object.
 
-    Returns dict with keys "full.glb" and "part_N.glb" (bytes as np.uint8 arrays),
+    Copies raw GLB bytes directly (no re-encoding). The VD-space transform
+    (Y-up → Z-up + scale/offset normalization) is stored as ``vd_scale`` and
+    ``vd_offset`` keys so that consumers can apply it lazily at load time.
+
+    Returns dict with "full.glb", "part_N.glb", "vd_scale", "vd_offset" keys,
     or None if source data is unavailable.
     """
-    import io as _io
-    import trimesh
-
     part_glb_root = Path(textured_part_glbs_dir) / obj_id
     norm_glb_path = Path(normalized_glb_dir) / f"{obj_id}.glb"
 
     if not part_glb_root.exists() or not norm_glb_path.exists():
         return None
 
-    result = {}
+    result: dict = {}
 
-    # Pack full mesh (normalized_glb → VD-space)
+    # Full mesh — raw bytes, no re-encoding
     try:
-        scene = trimesh.load(str(norm_glb_path), force="scene")
-    except Exception:
+        result["full.glb"] = np.frombuffer(norm_glb_path.read_bytes(), dtype=np.uint8)
+    except OSError:
         return None
-    meshes = [g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)]
-    if not meshes:
-        return None
-    full_mesh = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
-    full_mesh = _align_source_to_vd(full_mesh, transforms)
-    buf = _io.BytesIO()
-    full_mesh.export(buf, file_type="glb")
-    result["full.glb"] = np.frombuffer(buf.getvalue(), dtype=np.uint8)
 
-    # Pack per-part meshes (textured_part_glbs/<obj>/<N>.glb → VD-space)
+    # Per-part meshes — raw bytes
     part_files = sorted(
         (p for p in part_glb_root.glob("*.glb") if _is_int_stem(p)),
         key=lambda p: int(p.stem),
@@ -234,20 +227,19 @@ def _pack_mesh_glb(
     for part_path in part_files:
         pid = int(part_path.stem)
         try:
-            scene_p = trimesh.load(str(part_path), force="scene")
-        except Exception:
+            result[f"part_{pid}.glb"] = np.frombuffer(
+                part_path.read_bytes(), dtype=np.uint8
+            )
+        except OSError:
             continue
-        pmeshes = [g for g in scene_p.geometry.values() if isinstance(g, trimesh.Trimesh)]
-        if not pmeshes:
-            continue
-        part_mesh = trimesh.util.concatenate(pmeshes) if len(pmeshes) > 1 else pmeshes[0]
-        part_mesh = _align_source_to_vd(part_mesh, transforms)
-        pbuf = _io.BytesIO()
-        part_mesh.export(pbuf, file_type="glb")
-        result[f"part_{pid}.glb"] = np.frombuffer(pbuf.getvalue(), dtype=np.uint8)
 
-    if "full.glb" not in result or not any(k.startswith("part_") for k in result):
+    if not any(k.startswith("part_") for k in result):
         return None
+
+    # Store VD-space transform so loaders can apply it lazily (no trimesh at pack time)
+    result["vd_scale"] = np.array([transforms["scale"]], dtype=np.float64)
+    result["vd_offset"] = np.array(transforms["offset"], dtype=np.float64)
+
     return result
 
 

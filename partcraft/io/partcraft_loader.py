@@ -113,14 +113,32 @@ class ObjectRecord:
         return "glb" if "full.glb" in self._mesh_npz.files else "ply"
 
     def _load_mesh_bytes(self, key: str) -> "trimesh.Trimesh":
-        """Load mesh from NPZ bytes, handling both PLY and GLB (Scene → geometry)."""
+        """Load mesh from NPZ bytes, handling both PLY and GLB (Scene → geometry).
+
+        For GLB-format NPZs that store raw Y-up source bytes (new format), the
+        VD-space transform (axis swap + scale/offset) is applied lazily if
+        ``vd_scale`` / ``vd_offset`` keys are present in the NPZ.  Older NPZs
+        that already store VD-space GLBs (no ``vd_scale`` key) are returned as-is.
+        """
         assert trimesh is not None, "trimesh is required"
         raw = bytes(self._mesh_npz[key])
         fmt = "glb" if key.endswith(".glb") else "ply"
         mesh_or_scene = trimesh.load(io.BytesIO(raw), file_type=fmt)
         if isinstance(mesh_or_scene, trimesh.Scene):
-            return mesh_or_scene.to_geometry()
-        return mesh_or_scene
+            mesh = mesh_or_scene.to_geometry()
+        else:
+            mesh = mesh_or_scene
+        # Lazy VD-space transform: Y-up → Z-up + scale/offset normalization
+        if fmt == "glb" and "vd_scale" in self._mesh_npz.files:
+            scale = float(self._mesh_npz["vd_scale"][0])
+            offset = np.array(self._mesh_npz["vd_offset"])
+            v = np.array(mesh.vertices)
+            vd = np.empty_like(v)
+            vd[:, 0] = v[:, 0]
+            vd[:, 1] = -v[:, 2]
+            vd[:, 2] = v[:, 1]
+            mesh.vertices = (vd + offset) * scale
+        return mesh
 
     def close(self):
         if self._render_npz is not None:
