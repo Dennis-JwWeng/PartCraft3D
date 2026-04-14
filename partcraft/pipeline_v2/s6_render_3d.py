@@ -39,6 +39,7 @@ sys.path.insert(0, str(_ROOT / "third_party"))
 from .paths import ObjectContext
 from .specs import VIEW_INDICES
 from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
+from .edit_status_io import edit_needs_step, update_edit_stage
 
 
 @dataclass
@@ -87,6 +88,7 @@ def run_for_object(
     *,
     pipeline,
     resolution: int = 518,
+    prereq_map: dict[str, str | None] | None = None,
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> Render3DResult:
@@ -132,11 +134,17 @@ def run_for_object(
         if spec is None:
             log.warning("[s6] %s: no spec for %s", ctx.obj_id, edit_id)
             continue
+        # gate_e enforcement (D3): skip edits that failed final quality gate
+        if prereq_map is not None:
+            if not edit_needs_step(ctx, edit_id, "s6", prereq_map, force=force):
+                res.n_skip += 1
+                continue
         if not (0 <= spec.view_index < len(frames)):
             res.n_fail += 1
             continue
         frame = frames[spec.view_index]
 
+        _edit_ok = True
         for which in ("before", "after"):
             npz = edit_dir / f"{which}.npz"
             png = edit_dir / f"{which}.png"
@@ -163,6 +171,13 @@ def run_for_object(
             except Exception as e:
                 log.warning("[s6] %s/%s: %s", edit_id, which, e)
                 res.n_fail += 1
+                _edit_ok = False
+
+        if _edit_ok:
+            update_edit_stage(ctx, edit_id, spec.edit_type, "s6", status="done")
+        else:
+            update_edit_stage(ctx, edit_id, spec.edit_type, "s6",
+                              status="error", reason="render_failed")
 
     update_step(
         ctx, "s6_render_3d",
@@ -180,6 +195,7 @@ def run(
     *,
     ckpt: str = "checkpoints/TRELLIS-text-xlarge",
     resolution: int = 518,
+    prereq_map: dict[str, str | None] | None = None,
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> list[Render3DResult]:
@@ -196,7 +212,7 @@ def run(
             continue
         results.append(run_for_object(
             ctx, pipeline=pipeline, resolution=resolution,
-            force=force, logger=log,
+            prereq_map=prereq_map, force=force, logger=log,
         ))
     return results
 

@@ -32,6 +32,7 @@ from .paths import ObjectContext
 from .specs import iter_all_specs, VIEW_INDICES
 from .status import update_step, STATUS_OK, step_done
 from .qc_io import update_edit_gate, is_edit_qc_failed
+from .edit_status_io import update_edit_stage
 
 
 _DEFS = {
@@ -251,6 +252,7 @@ async def _judge_one_async(
         update_edit_gate(ctx, edit_id, edit_type, "E",
                          vlm_result={"pass": False, "score": 0.0,
                                      "reason": "missing_previews"})
+        update_edit_stage(ctx, edit_id, edit_type, "gate_e", status="fail")
         return False, 0, 1
 
     # For addition edits the preview is the before-addition state (object minus
@@ -264,6 +266,7 @@ async def _judge_one_async(
         update_edit_gate(ctx, edit_id, edit_type, "E",
                          vlm_result={"pass": False, "score": 0.0,
                                      "reason": "collage_failed"})
+        update_edit_stage(ctx, edit_id, edit_type, "gate_e", status="fail")
         return False, 0, 1
 
     j = await _call_vlm_judge_async(
@@ -277,6 +280,7 @@ async def _judge_one_async(
         update_edit_gate(ctx, edit_id, edit_type, "E",
                          vlm_result={"pass": False, "score": 0.0,
                                      "reason": "vlm_no_response"})
+        update_edit_stage(ctx, edit_id, edit_type, "gate_e", status="fail")
         return False, 0, 1
 
     ok = _passes(j, edit_type, thr)
@@ -284,6 +288,8 @@ async def _judge_one_async(
                      vlm_result={"pass": ok,
                                  "score": round(j.get("visual_quality", 0) / 5.0, 2),
                                  "reason": j.get("reason", "")})
+    update_edit_stage(ctx, edit_id, edit_type, "gate_e",
+                      status="pass" if ok else "fail")
     return ok, (1 if ok else 0), (0 if ok else 1)
 
 

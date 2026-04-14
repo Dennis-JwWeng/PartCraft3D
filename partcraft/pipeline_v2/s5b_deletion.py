@@ -42,6 +42,7 @@ from .paths import ObjectContext
 from .specs import EditSpec, iter_deletion_specs
 from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
 from .qc_io import is_edit_qc_failed, is_gate_a_failed
+from .edit_status_io import edit_needs_step, update_edit_stage
 from . import services_cfg as psvc
 from .addition_utils import invert_delete_prompt
 
@@ -189,6 +190,7 @@ def run_mesh_delete_for_object(
     dataset=None,          # only used in legacy PLY path (normalized_glb_dir not set)
     normalized_glb_dir: "Path | None" = None,
     anno_dir: "Path | None" = None,
+    prereq_map: dict[str, str | None] | None = None,
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> DelMeshResult:
@@ -223,7 +225,12 @@ def run_mesh_delete_for_object(
 
     add_seq = 0
     for spec in specs:
-        if is_gate_a_failed(ctx, spec.edit_id):
+        if prereq_map is not None:
+            if not edit_needs_step(ctx, spec.edit_id, "s5b", prereq_map, force=force):
+                res.n_skip += 1
+                add_seq += 1
+                continue
+        elif is_gate_a_failed(ctx, spec.edit_id):
             log.info("[s5b] skip %s (gate_a_fail)", spec.edit_id)
             res.n_skip += 1
             add_seq += 1
@@ -247,8 +254,11 @@ def run_mesh_delete_for_object(
             if ok:
                 _backfill_add(ctx, spec, add_seq, force=force, logger=log)
                 res.n_ok += 1
+                update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s5b", status="done")
             else:
                 res.n_fail += 1
+                update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s5b",
+                                  status="error", reason="glb_build_failed")
         else:
             # ── Legacy PLY path (fallback when GLB dirs not configured) ─
             a_ply = pair_dir / "after.ply"
@@ -264,9 +274,12 @@ def run_mesh_delete_for_object(
                 )
                 _backfill_add(ctx, spec, add_seq, force=force, logger=log)
                 res.n_ok += 1
+                update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s5b", status="done")
             except Exception as e:
                 log.error("[s5b] %s failed: %s", spec.edit_id, e)
                 res.n_fail += 1
+                update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s5b",
+                                  status="error", reason=str(e)[:200])
 
         add_seq += 1
 
@@ -301,6 +314,7 @@ def run_mesh_delete(
     shard: str = "01",
     normalized_glb_dir: "Path | None" = None,
     anno_dir: "Path | None" = None,
+    prereq_map: dict[str, str | None] | None = None,
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> list[DelMeshResult]:
@@ -335,6 +349,7 @@ def run_mesh_delete(
             ctx, dataset=dataset,
             normalized_glb_dir=normalized_glb_dir,
             anno_dir=anno_dir,
+            prereq_map=prereq_map,
             force=force, logger=log,
         ))
     return out
@@ -411,6 +426,7 @@ def run_reencode_for_object(
     slat_dir: Path,
     work_dir: Path,
     num_views: int = 40,
+    prereq_map: dict[str, str | None] | None = None,
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> DelReencodeResult:
@@ -434,7 +450,12 @@ def run_reencode_for_object(
     t0 = time.time()
     add_seq = 0
     for spec in specs:
-        if is_gate_a_failed(ctx, spec.edit_id):
+        if prereq_map is not None:
+            if not edit_needs_step(ctx, spec.edit_id, "s6b", prereq_map, force=force):
+                res.n_skip += 1
+                add_seq += 1
+                continue
+        elif is_gate_a_failed(ctx, spec.edit_id):
             log.info("[s6b] skip %s (gate_a_fail)", spec.edit_id)
             res.n_skip += 1
             add_seq += 1
@@ -480,9 +501,12 @@ def run_reencode_for_object(
                 _write_before_npz(ctx, slat_dir, before_npz)
             _link_add_pair(ctx, spec, add_seq, pair_dir, logger=log)
             res.n_ok += 1
+            update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s6b", status="done")
         except Exception as e:
             log.warning("[s6b] %s: %s", spec.edit_id, e)
             res.n_fail += 1
+            update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s6b",
+                              status="error", reason=str(e)[:200])
         add_seq += 1
 
     update_step(
@@ -501,6 +525,7 @@ def run_reencode(
     blender_path: str,
     work_dir: Path | None = None,
     num_views: int = 40,
+    prereq_map: dict[str, str | None] | None = None,
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> list[DelReencodeResult]:
@@ -528,7 +553,8 @@ def run_reencode(
         out.append(run_reencode_for_object(
             ctx, ss_encoder=ss_encoder, blender_path=blender_path,
             slat_dir=slat_dir, work_dir=work_dir,
-            num_views=num_views, force=force, logger=log,
+            num_views=num_views, prereq_map=prereq_map,
+            force=force, logger=log,
         ))
     return out
 

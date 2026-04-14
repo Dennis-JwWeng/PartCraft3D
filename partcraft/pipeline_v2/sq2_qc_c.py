@@ -6,6 +6,7 @@ from .paths import ObjectContext
 from .specs import iter_flux_specs
 from .status import update_step, STATUS_OK, step_done
 from .qc_io import update_edit_gate, is_edit_qc_failed
+from .edit_status_io import update_edit_stage
 from .s1_vlm_core import extract_json_object
 
 LOG = logging.getLogger("pipeline_v2.sq2")
@@ -50,17 +51,21 @@ async def _process_one(ctx, vlm_url, vlm_model, force):
         if not hl.is_file() or not ed.is_file():
             update_edit_gate(ctx, spec.edit_id, spec.edit_type, "C",
                              vlm_result={"pass": False, "score": 0.0, "reason": "missing_artifact"})
+            update_edit_stage(ctx, spec.edit_id, spec.edit_type, "gate_c", status="fail")
             n_fail += 1; return
         hi = cv2.imread(str(hl)); ei = cv2.imread(str(ed))
         if hi is None or ei is None:
             update_edit_gate(ctx, spec.edit_id, spec.edit_type, "C",
                              vlm_result={"pass": False, "score": 0.0, "reason": "unreadable_image"})
+            update_edit_stage(ctx, spec.edit_id, spec.edit_type, "gate_c", status="fail")
             n_fail += 1; return
         raw = await _vlm_one(client, vlm_model, _stitch(hi, ei))
         ok = bool(raw.get("region_match"))
         update_edit_gate(ctx, spec.edit_id, spec.edit_type, "C",
                          vlm_result={"pass": ok, "score": 1.0 if ok else 0.0,
                                      "reason": raw.get("reason", "")})
+        update_edit_stage(ctx, spec.edit_id, spec.edit_type, "gate_c",
+                          status="pass" if ok else "fail")
         if ok: n_pass += 1
         else: n_fail += 1
 

@@ -47,6 +47,7 @@ from . import services_cfg as psvc
 from .specs import EditSpec, iter_flux_specs
 from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
 from .qc_io import is_edit_qc_failed, is_gate_a_failed
+from .edit_status_io import edit_needs_step, update_edit_stage
 
 
 GPU_TYPES = frozenset({"modification", "scale", "material", "global"})
@@ -94,6 +95,7 @@ def run_for_object(
     seed: int = 1,
     use_2d: bool = True,
     debug: bool = False,
+    prereq_map: dict[str, str | None] | None = None,
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> Trellis3DResult:
@@ -107,15 +109,20 @@ def run_for_object(
     pending: list[EditSpec] = []
     for spec in iter_flux_specs(ctx):
         all_specs.append(spec)
-        if is_gate_a_failed(ctx, spec.edit_id):
-            log.debug("[s5] skip %s (gate_a_fail)", spec.edit_id)
-            res.n_skip += 1
-            continue
-        before = ctx.edit_3d_npz(spec.edit_id, "before")
-        after = ctx.edit_3d_npz(spec.edit_id, "after")
-        if before.is_file() and after.is_file() and not force:
-            res.n_skip += 1
-            continue
+        if prereq_map is not None:
+            if not edit_needs_step(ctx, spec.edit_id, "s5", prereq_map, force=force):
+                res.n_skip += 1
+                continue
+        else:
+            if is_gate_a_failed(ctx, spec.edit_id):
+                log.debug("[s5] skip %s (gate_a_fail)", spec.edit_id)
+                res.n_skip += 1
+                continue
+            before = ctx.edit_3d_npz(spec.edit_id, "before")
+            after = ctx.edit_3d_npz(spec.edit_id, "after")
+            if before.is_file() and after.is_file() and not force:
+                res.n_skip += 1
+                continue
         pending.append(spec)
 
     if not all_specs:
@@ -212,10 +219,13 @@ def run_for_object(
                 z_s_after=best.get("z_s_after"),
             )
             res.n_ok += 1
+            update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s5", status="done")
             log.info("[s5] %s ok", spec.edit_id)
         except Exception as e:
             log.error("[s5] %s failed: %s", spec.edit_id, e)
             res.n_fail += 1
+            update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s5",
+                              status="error", reason=str(e)[:200])
 
     obj_record.close()
     update_step(
@@ -238,6 +248,7 @@ def run(
     shard: str = "01",
     seed: int = 1,
     debug: bool = False,
+    prereq_map: dict[str, str | None] | None = None,
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> list[Trellis3DResult]:
@@ -268,7 +279,8 @@ def run(
             continue
         results.append(run_for_object(
             ctx, refiner=refiner, dataset=dataset, p25_cfg=p25_cfg,
-            seed=seed, use_2d=True, debug=debug, force=force, logger=log,
+            seed=seed, use_2d=True, debug=debug,
+            prereq_map=prereq_map, force=force, logger=log,
         ))
     return results
 

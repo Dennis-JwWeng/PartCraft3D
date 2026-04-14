@@ -44,6 +44,7 @@ import yaml
 from .paths import (DatasetRoots, PipelineRoot, ObjectContext, normalize_shard,
                       resolve_blender_executable)
 from .status import rebuild_manifest, manifest_summary, step_done
+from .edit_status_io import build_prereq_map
 from .validators import apply_check
 from . import scheduler as sched
 from . import services_cfg as psvc
@@ -153,6 +154,7 @@ def run_step(
     if not ctxs:
         return
 
+    prereq_map = build_prereq_map(cfg)
     roots = DatasetRoots.from_pipeline_cfg(cfg)
     images_root = roots.images_root
     mesh_root = roots.mesh_root
@@ -190,12 +192,12 @@ def run_step(
         s4_run(ctxs, edit_urls=urls,
                workers_per_server=psvc.image_edit_service(cfg).get("workers_per_server", 2),
                images_root=images_root, mesh_root=mesh_root, shard=shard,
-               force=args.force, logger=log)
+               prereq_map=prereq_map, force=args.force, logger=log)
 
     elif step == "s5":
         from .s5_trellis_3d import run as s5_run
         s5_run(ctxs, cfg=cfg, images_root=images_root, mesh_root=mesh_root,
-               shard=shard, force=args.force, logger=log)
+               shard=shard, prereq_map=prereq_map, force=args.force, logger=log)
 
     elif step == "s5b":
         from .s5b_deletion import run_mesh_delete
@@ -206,6 +208,7 @@ def run_step(
                         mesh_root=mesh_root, shard=shard,
                         normalized_glb_dir=roots.normalized_glb_dir,
                         anno_dir=roots.anno_dir,
+                        prereq_map=prereq_map,
                         force=args.force, logger=log)
 
     elif step == "s6p":
@@ -219,30 +222,35 @@ def run_step(
     elif step == "s6p_del":
         from .s6_preview import run_del as s6p_del_run
         blender = resolve_blender_executable(cfg)
-        # Default workers = number of GPUs (each Blender uses one GPU).
-        # Override via pipeline.s6p_del_workers in config.
-        _n_gpus = len(sched.gpus_for(cfg))
-        _n_workers = int((cfg.get("pipeline") or {}).get("s6p_del_workers", _n_gpus))
+        # One worker thread per GPU; thread-local CUDA_VISIBLE_DEVICES binding.
+        # Fallback n_workers via pipeline.s6p_del_workers if no GPUs configured.
+        _gpus = sched.gpus_for(cfg)
+        _n_workers = int((cfg.get("pipeline") or {}).get("s6p_del_workers", 4))
         s6p_del_run(ctxs, blender=blender, n_workers=_n_workers,
+                    gpus=_gpus if _gpus else None,
+                    prereq_map=prereq_map,
                     force=args.force, logger=log)
 
     elif step == "s6p_flux":
         from .s6_preview import run_flux as s6p_flux_run
         ckpt = psvc.image_edit_service(cfg).get(
             "trellis_text_ckpt", "checkpoints/TRELLIS-text-xlarge")
-        s6p_flux_run(ctxs, ckpt=ckpt, force=args.force, logger=log)
+        s6p_flux_run(ctxs, ckpt=ckpt, prereq_map=prereq_map,
+                     force=args.force, logger=log)
 
     elif step == "s6":
         from .s6_render_3d import run as s6_run
         ckpt = psvc.image_edit_service(cfg).get(
             "trellis_text_ckpt", "checkpoints/TRELLIS-text-xlarge")
-        s6_run(ctxs, ckpt=ckpt, force=args.force, logger=log)
+        s6_run(ctxs, ckpt=ckpt, prereq_map=prereq_map,
+               force=args.force, logger=log)
 
     elif step == "s6b":
         from .s5b_deletion import run_reencode
         blender = resolve_blender_executable(cfg)
         run_reencode(ctxs, cfg=cfg, blender_path=blender,
                      num_views=psvc.step_params_for(cfg, "s5").get("num_views", 40),
+                     prereq_map=prereq_map,
                      force=args.force, logger=log)
 
     elif step == "s7":

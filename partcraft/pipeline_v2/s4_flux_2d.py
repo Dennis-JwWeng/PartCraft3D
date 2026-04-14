@@ -36,6 +36,7 @@ from .paths import ObjectContext
 from .specs import EditSpec, iter_flux_specs
 from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
 from .qc_io import is_edit_qc_failed
+from .edit_status_io import edit_needs_step, update_edit_stage
 
 
 @dataclass
@@ -60,6 +61,7 @@ def run(
     images_root: Path,
     mesh_root: Path,
     shard: str = "01",
+    prereq_map: dict[str, str | None] | None = None,
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> list[Flux2DResult]:
@@ -83,14 +85,19 @@ def run(
         per_obj_results[ctx.obj_id] = Flux2DResult(ctx.obj_id)
         ctx.edits_2d_dir.mkdir(parents=True, exist_ok=True)
         for spec in iter_flux_specs(ctx):
-            if is_edit_qc_failed(ctx, spec.edit_id):
-                log.info("[s4] skip %s (qc_fail)", spec.edit_id)
-                per_obj_results[ctx.obj_id].n_skip += 1
-                continue
-            out = ctx.edit_2d_output(spec.edit_id)
-            if out.is_file() and not force:
-                per_obj_results[ctx.obj_id].n_skip += 1
-                continue
+            if prereq_map is not None:
+                if not edit_needs_step(ctx, spec.edit_id, "s4", prereq_map, force=force):
+                    per_obj_results[ctx.obj_id].n_skip += 1
+                    continue
+            else:
+                if is_edit_qc_failed(ctx, spec.edit_id):
+                    log.info("[s4] skip %s (qc_fail)", spec.edit_id)
+                    per_obj_results[ctx.obj_id].n_skip += 1
+                    continue
+                out = ctx.edit_2d_output(spec.edit_id)
+                if out.is_file() and not force:
+                    per_obj_results[ctx.obj_id].n_skip += 1
+                    continue
             jobs.append((ctx, spec))
 
     log.info(f"pending={len(jobs)} "
@@ -114,17 +121,24 @@ def run(
             futures[fut] = (ctx, spec)
         for k, fut in enumerate(as_completed(futures)):
             ctx, spec = futures[fut]
+            err_reason = None
             try:
                 rec = fut.result()
                 ok = rec.get("status") == "success"
+                if not ok:
+                    err_reason = rec.get("error", "flux_failed")
             except Exception as e:
                 log.warning(f"  {spec.edit_id}: {e}")
                 ok = False
+                err_reason = str(e)[:200]
             r = per_obj_results[ctx.obj_id]
             if ok:
                 r.n_ok += 1
+                update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s4", status="done")
             else:
                 r.n_fail += 1
+                update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s4",
+                                  status="error", reason=err_reason)
             if (k + 1) % 5 == 0:
                 done = sum(r.n_ok + r.n_fail for r in per_obj_results.values())
                 log.info(f"  {done}/{len(jobs)}")

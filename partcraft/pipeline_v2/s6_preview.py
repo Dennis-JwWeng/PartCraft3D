@@ -47,6 +47,7 @@ from .paths import ObjectContext
 from .specs import VIEW_INDICES
 from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
 from .qc_io import is_gate_a_failed
+from .edit_status_io import edit_needs_step, update_edit_stage
 
 
 @dataclass
@@ -175,6 +176,7 @@ def _render_glb_views(
     resolution: int,
     *,
     force_cpu: bool = False,
+    cuda_device: str | None = None,
 ) -> list[np.ndarray]:
     """Render GLB at VIEW_INDICES cameras using encode_asset Cycles renderer.
 
@@ -209,6 +211,8 @@ def _render_glb_views(
         env = dict(os.environ)
         if force_cpu:
             env["CUDA_VISIBLE_DEVICES"] = ""  # hide all GPUs → Blender falls back to CPU
+        elif cuda_device is not None:
+            env["CUDA_VISIBLE_DEVICES"] = str(cuda_device)  # pin to specific GPU
         result = subprocess.run(
             cmd,
             capture_output=True, text=True, timeout=600,
@@ -306,13 +310,19 @@ def run_for_object(
     # --- deletion edits ---
     from .specs import iter_deletion_specs
     for spec in iter_deletion_specs(ctx):
-        if is_gate_a_failed(ctx, spec.edit_id):
-            res.n_skip += 1
-            continue
+        if prereq_map is not None:
+            if not edit_needs_step(ctx, spec.edit_id, "s6p", prereq_map, force=force):
+                res.n_skip += 1
+                continue
+        else:
+            if is_gate_a_failed(ctx, spec.edit_id):
+                res.n_skip += 1
+                continue
+            edit_dir_chk = ctx.edit_3d_dir(spec.edit_id)
+            if _previews_exist(edit_dir_chk) and not force:
+                res.n_skip += 1
+                continue
         edit_dir = ctx.edit_3d_dir(spec.edit_id)
-        if _previews_exist(edit_dir) and not force:
-            res.n_skip += 1
-            continue
         a_ply = edit_dir / "after.ply"
         after_glb = edit_dir / "after_new.glb"
         if not a_ply.is_file() and not after_glb.is_file():
@@ -336,13 +346,19 @@ def run_for_object(
 
     # --- addition edits (use source_del's before.ply as after state) ---
     for add_id, meta in _iter_add_edits(ctx):
-        if is_gate_a_failed(ctx, add_id):
-            res.n_skip += 1
-            continue
+        if prereq_map is not None:
+            if not edit_needs_step(ctx, add_id, "s6p", prereq_map, force=force):
+                res.n_skip += 1
+                continue
+        else:
+            if is_gate_a_failed(ctx, add_id):
+                res.n_skip += 1
+                continue
+            add_dir_chk = ctx.edit_3d_dir(add_id)
+            if _previews_exist(add_dir_chk) and not force:
+                res.n_skip += 1
+                continue
         add_dir = ctx.edit_3d_dir(add_id)
-        if _previews_exist(add_dir) and not force:
-            res.n_skip += 1
-            continue
         source_del_id = meta.get("source_del_id")
         if not source_del_id:
             log.warning("[s6p] add %s: no source_del_id in meta", add_id)
@@ -371,13 +387,19 @@ def run_for_object(
     for spec in iter_all_specs(ctx):
         if spec.edit_type in PLY_TYPES:
             continue
-        if is_gate_a_failed(ctx, spec.edit_id):
-            res.n_skip += 1
-            continue
+        if prereq_map is not None:
+            if not edit_needs_step(ctx, spec.edit_id, "s6p", prereq_map, force=force):
+                res.n_skip += 1
+                continue
+        else:
+            if is_gate_a_failed(ctx, spec.edit_id):
+                res.n_skip += 1
+                continue
+            edit_dir_chk = ctx.edit_3d_dir(spec.edit_id)
+            if _previews_exist(edit_dir_chk) and not force:
+                res.n_skip += 1
+                continue
         edit_dir = ctx.edit_3d_dir(spec.edit_id)
-        if _previews_exist(edit_dir) and not force:
-            res.n_skip += 1
-            continue
         a_npz = edit_dir / "after.npz"
         if not a_npz.is_file():
             log.warning("[s6p] %s %s: after.npz missing", spec.edit_type, spec.edit_id)
@@ -467,6 +489,8 @@ def run_del_for_object(
     blender: str,
     resolution: int = 518,
     force: bool = False,
+    cuda_device: str | None = None,
+    progress_bar=None,
     logger: logging.Logger | None = None,
 ) -> PreviewResult:
     """Render preview_{0..4}.png for deletion and addition edits only.
@@ -498,13 +522,19 @@ def run_del_for_object(
     # --- deletion edits ---
     from .specs import iter_deletion_specs
     for spec in iter_deletion_specs(ctx):
-        if is_gate_a_failed(ctx, spec.edit_id):
-            res.n_skip += 1
-            continue
+        if prereq_map is not None:
+            if not edit_needs_step(ctx, spec.edit_id, "s6p", prereq_map, force=force):
+                res.n_skip += 1
+                continue
+        else:
+            if is_gate_a_failed(ctx, spec.edit_id):
+                res.n_skip += 1
+                continue
+            edit_dir_chk = ctx.edit_3d_dir(spec.edit_id)
+            if _previews_exist(edit_dir_chk) and not force:
+                res.n_skip += 1
+                continue
         edit_dir = ctx.edit_3d_dir(spec.edit_id)
-        if _previews_exist(edit_dir) and not force:
-            res.n_skip += 1
-            continue
         a_ply = edit_dir / "after.ply"
         after_glb = edit_dir / "after_new.glb"
         if not a_ply.is_file() and not after_glb.is_file():
@@ -516,24 +546,37 @@ def run_del_for_object(
                 imgs = _render_glb_views(
                     after_glb, ctx.image_npz, _encode_asset_script(),
                     blender, resolution,
+                    cuda_device=cuda_device,
                 )
             else:
                 imgs = _render_ply_views(a_ply, frames, blender, resolution, samples=32)
             _save_previews(edit_dir, imgs)
             res.n_ok += 1
+            update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s6p", status="done")
         except Exception as e:
             log.warning("[s6p_del] del %s: %s", spec.edit_id, e)
             res.n_fail += 1
+            update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s6p",
+                              status="error", reason=str(e)[:200])
+        finally:
+            if progress_bar is not None:
+                progress_bar.update(1)
 
     # --- addition edits (copy source del's preview_*.png) ---
     for add_id, meta in _iter_add_edits(ctx):
-        if is_gate_a_failed(ctx, add_id):
-            res.n_skip += 1
-            continue
+        if prereq_map is not None:
+            if not edit_needs_step(ctx, add_id, "s6p", prereq_map, force=force):
+                res.n_skip += 1
+                continue
+        else:
+            if is_gate_a_failed(ctx, add_id):
+                res.n_skip += 1
+                continue
+            add_dir_chk = ctx.edit_3d_dir(add_id)
+            if _previews_exist(add_dir_chk) and not force:
+                res.n_skip += 1
+                continue
         add_dir = ctx.edit_3d_dir(add_id)
-        if _previews_exist(add_dir) and not force:
-            res.n_skip += 1
-            continue
         source_del_id = meta.get("source_del_id")
         if not source_del_id:
             log.warning("[s6p_del] add %s: no source_del_id in meta", add_id)
@@ -549,9 +592,15 @@ def run_del_for_object(
             for src in del_previews:
                 shutil.copy2(src, add_dir / src.name)
             res.n_ok += 1
+            update_edit_stage(ctx, add_id, "addition", "s6p", status="done")
         except Exception as e:
             log.warning("[s6p_del] add %s: %s", add_id, e)
             res.n_fail += 1
+            update_edit_stage(ctx, add_id, "addition", "s6p",
+                              status="error", reason=str(e)[:200])
+        finally:
+            if progress_bar is not None:
+                progress_bar.update(1)
 
     update_step(
         ctx, "s6p_del",
@@ -567,6 +616,7 @@ def run_flux_for_object(
     *,
     pipeline,
     resolution: int = 518,
+    prereq_map: dict[str, str | None] | None = None,
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> PreviewResult:
@@ -599,13 +649,19 @@ def run_flux_for_object(
     for spec in iter_all_specs(ctx):
         if spec.edit_type not in FLUX_TYPES:
             continue
-        if is_gate_a_failed(ctx, spec.edit_id):
-            res.n_skip += 1
-            continue
+        if prereq_map is not None:
+            if not edit_needs_step(ctx, spec.edit_id, "s6p", prereq_map, force=force):
+                res.n_skip += 1
+                continue
+        else:
+            if is_gate_a_failed(ctx, spec.edit_id):
+                res.n_skip += 1
+                continue
+            edit_dir_chk = ctx.edit_3d_dir(spec.edit_id)
+            if _previews_exist(edit_dir_chk) and not force:
+                res.n_skip += 1
+                continue
         edit_dir = ctx.edit_3d_dir(spec.edit_id)
-        if _previews_exist(edit_dir) and not force:
-            res.n_skip += 1
-            continue
         a_npz = edit_dir / "after.npz"
         if not a_npz.is_file():
             log.warning("[s6p_flux] %s %s: after.npz missing", spec.edit_type, spec.edit_id)
@@ -619,9 +675,12 @@ def run_flux_for_object(
             imgs = _render_slat_views(a_npz, pipeline, frames, resolution)
             _save_previews(edit_dir, imgs)
             res.n_ok += 1
+            update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s6p", status="done")
         except Exception as e:
             log.warning("[s6p_flux] %s %s: %s", spec.edit_type, spec.edit_id, e)
             res.n_fail += 1
+            update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s6p",
+                              status="error", reason=str(e)[:200])
 
     update_step(
         ctx, "s6p_flux",
@@ -637,67 +696,112 @@ def run_del(
     *,
     blender: str = "blender",
     resolution: int = 518,
+    prereq_map: dict[str, str | None] | None = None,
     force: bool = False,
     n_workers: int = 8,
+    gpus: list[int] | None = None,
     logger: logging.Logger | None = None,
 ) -> list[PreviewResult]:
     """Batch entry for s6p_del (deletion + addition preview, GPU/Blender).
 
-    Runs ``n_workers`` Blender subprocesses in parallel (one object per slot).
-    Each Blender process uses CUDA by default; set CUDA_VISIBLE_DEVICES before
-    invoking to pin to specific GPUs.
+    GPU binding strategy (when ``gpus`` is provided):
+    - n_workers is overridden to len(gpus): one worker thread per GPU.
+    - Each thread is initialised with exactly one GPU index via a thread-local,
+      so CUDA_VISIBLE_DEVICES is set once per thread and never shared.
+    - This guarantees at most one Blender process per GPU at any moment.
     """
     import concurrent.futures
+    import itertools
+    import threading
+
     log = logger or logging.getLogger("pipeline_v2.s6p_del")
-    log.info("[s6p_del] CUDA_VISIBLE_DEVICES=%s  n_workers=%d",
-             os.environ.get("CUDA_VISIBLE_DEVICES"), n_workers)
+
+    # --- GPU affinity setup ---
+    _thread_local = threading.local()
+    if gpus:
+        effective_workers = len(gpus)
+        _gpu_counter = itertools.count()
+
+        def _thread_init():
+            # Called once when the thread is first created.
+            _thread_local.cuda_device = str(gpus[next(_gpu_counter) % len(gpus)])
+
+        pool_kwargs: dict = {"max_workers": effective_workers, "initializer": _thread_init}
+    else:
+        effective_workers = n_workers
+        pool_kwargs = {"max_workers": effective_workers}
+
+    log.info("[s6p_del] n_workers=%d  gpus=%s", effective_workers, gpus)
 
     ctx_list = list(ctxs)
     pending = [c for c in ctx_list if force or not step_done(c, "s6p_del")]
     done_results = [PreviewResult(c.obj_id) for c in ctx_list if c not in set(pending)]
 
-    def _do(ctx):
-        return run_del_for_object(
-            ctx, blender=blender, resolution=resolution,
-            force=force, logger=log,
-        )
+    # --- pre-scan: count total pending edits for accurate progress bar ---
+    def _count_pending_edits(ctx: ObjectContext) -> int:
+        if not ctx.edits_3d_dir.is_dir():
+            return 0
+        from .specs import iter_deletion_specs
+        count = 0
+        for spec in iter_deletion_specs(ctx):
+            if is_gate_a_failed(ctx, spec.edit_id):
+                continue
+            edit_dir = ctx.edit_3d_dir(spec.edit_id)
+            if _previews_exist(edit_dir) and not force:
+                continue
+            count += 1
+        for add_id, _ in _iter_add_edits(ctx):
+            if is_gate_a_failed(ctx, add_id):
+                continue
+            add_dir = ctx.edit_3d_dir(add_id)
+            if _previews_exist(add_dir) and not force:
+                continue
+            count += 1
+        return count
 
-    results: list[PreviewResult] = list(done_results)
-    n_total = len(pending)
-    n_done = 0
-    t_start = time.time()
+    total_edits = sum(_count_pending_edits(c) for c in pending)
+    log.info("[s6p_del] %d objects  %d edits pending", len(pending), total_edits)
 
+    # --- shared per-edit progress bar (thread-safe tqdm updates) ---
     try:
         from tqdm import tqdm as _tqdm
-        _bar = _tqdm(total=n_total, desc="s6p_del", unit="obj",
+        _bar = _tqdm(total=total_edits, desc="s6p_del", unit="edit",
                      dynamic_ncols=True, leave=True)
     except ImportError:
         _bar = None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+    _n_ok = _n_fail = _n_skip = 0
+    _bar_lock = threading.Lock()
+
+    def _do(ctx):
+        nonlocal _n_ok, _n_fail, _n_skip
+        res = run_del_for_object(
+            ctx, blender=blender, resolution=resolution,
+            cuda_device=getattr(_thread_local, "cuda_device", None),
+            progress_bar=_bar,
+            prereq_map=prereq_map,
+            force=force, logger=log,
+        )
+        with _bar_lock:
+            _n_ok   += res.n_ok
+            _n_fail += res.n_fail
+            _n_skip += res.n_skip
+            if _bar is not None:
+                _bar.set_postfix(ok=_n_ok, fail=_n_fail, skip=_n_skip,
+                                 gpu=getattr(_thread_local, "cuda_device", "?"))
+        return res
+
+    results: list[PreviewResult] = list(done_results)
+
+    with concurrent.futures.ThreadPoolExecutor(**pool_kwargs) as pool:
         futures = {pool.submit(_do, ctx): ctx for ctx in pending}
         for fut in concurrent.futures.as_completed(futures):
-            res = fut.result()
-            results.append(res)
-            n_done += 1
-            elapsed = time.time() - t_start
-            rate = n_done / elapsed if elapsed > 0 else 0
-            eta = (n_total - n_done) / rate if rate > 0 else 0
-            if _bar is not None:
-                _bar.set_postfix(ok=res.n_ok, fail=res.n_fail,
-                                 skip=res.n_skip, eta=f"{eta/60:.0f}m")
-                _bar.update(1)
-            elif n_done % 10 == 0 or n_done == n_total:
-                log.info("[s6p_del] %d/%d  elapsed=%.0fs  eta=%.0fm",
-                         n_done, n_total, elapsed, eta / 60)
+            results.append(fut.result())
 
     if _bar is not None:
         _bar.close()
 
-    n_ok   = sum(r.n_ok   for r in results)
-    n_fail = sum(r.n_fail for r in results)
-    n_skip = sum(r.n_skip for r in results)
-    log.info("[s6p_del] done: ok=%d fail=%d skip=%d", n_ok, n_fail, n_skip)
+    log.info("[s6p_del] done: ok=%d fail=%d skip=%d", _n_ok, _n_fail, _n_skip)
     return results
 
 
@@ -706,6 +810,7 @@ def run_flux(
     *,
     ckpt: str = "checkpoints/TRELLIS-text-xlarge",
     resolution: int = 518,
+    prereq_map: dict[str, str | None] | None = None,
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> list[PreviewResult]:
@@ -721,6 +826,6 @@ def run_flux(
     for ctx in pending:
         results.append(run_flux_for_object(
             ctx, pipeline=pipeline, resolution=resolution,
-            force=force, logger=log,
+            prereq_map=prereq_map, force=force, logger=log,
         ))
     return results

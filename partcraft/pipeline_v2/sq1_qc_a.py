@@ -10,6 +10,7 @@ from .specs import iter_all_specs
 from .status import update_step, STATUS_OK, STATUS_FAIL, STATUS_SKIP, step_done
 from .qc_rules import check_rules, count_part_pixels_in_overview
 from .qc_io import update_edit_gate
+from .edit_status_io import update_edit_stage
 from .s1_vlm_core import extract_json_object
 from .validators import _phase1_skipped
 
@@ -95,6 +96,7 @@ async def _process_one(ctx, vlm_url, vlm_model, force):
         rr = {"pass": not fails, "checks": fails}
         if fails:
             update_edit_gate(ctx, spec.edit_id, spec.edit_type, "A", rule_result=rr)
+            update_edit_stage(ctx, spec.edit_id, spec.edit_type, "gate_a", status="fail")
             n_fail += 1
         else:
             vlm_q.append((spec, rr))
@@ -109,6 +111,8 @@ async def _process_one(ctx, vlm_url, vlm_model, force):
             update_edit_gate(ctx, spec.edit_id, spec.edit_type, "A", rule_result=rr,
                              vlm_result={"pass": ok, "score": round(sc, 3),
                                          "reason": v.get("reason", "")})
+            update_edit_stage(ctx, spec.edit_id, spec.edit_type, "gate_a",
+                              status="pass" if ok else "fail")
             return ok
         res = await asyncio.gather(*[_c(s, r) for s, r in vlm_q])
         n_pass += sum(res); n_fail += len(res) - sum(res)
@@ -116,6 +120,7 @@ async def _process_one(ctx, vlm_url, vlm_model, force):
         for spec, rr in vlm_q:
             update_edit_gate(ctx, spec.edit_id, spec.edit_type, "A", rule_result=rr,
                              vlm_result={"pass": True, "score": 1.0, "reason": "no_overview_skip"})
+            update_edit_stage(ctx, spec.edit_id, spec.edit_type, "gate_a", status="pass")
             n_pass += 1
     update_step(ctx, "sq1_qc_A", status=STATUS_OK, n_pass=n_pass, n_fail=n_fail)
     return {"obj_id": ctx.obj_id, "n_pass": n_pass, "n_fail": n_fail}
