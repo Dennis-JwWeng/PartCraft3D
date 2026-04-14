@@ -35,6 +35,8 @@ data:
 paths:
   dataset_root:           "/Node11_nvme/wjw/3D_Editing/data/inputs/partverse"
   source_glb_dir:         "source/normalized_glbs"
+  textured_part_glbs_dir: "/Node11_nvme/wjw/3D_Editing/data/inputs/partverse/source/textured_part_glbs"
+  normalized_glb_dir:     "/Node11_nvme/wjw/3D_Editing/data/inputs/partverse/source/normalized_glbs"
   captions_json:          "source/text_captions.json"
   img_enc_dir:            "img_Enc"
   slat_dir:               "slat"
