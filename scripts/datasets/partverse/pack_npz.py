@@ -49,8 +49,8 @@ Usage:
 
     # Pack with GLB source data
     python scripts/datasets/partverse/pack_npz.py --limit 5 \\
-        --textured-part-glbs-dir /mnt/zsn/data/partverse/source/textured_part_glbs \\
-        --normalized-glb-dir /mnt/zsn/data/partverse/source/normalized_glbs
+        --textured-part-glbs-dir $DATA_ROOT/source/textured_part_glbs \\
+        --normalized-glb-dir $DATA_ROOT/source/normalized_glbs
 """
 
 import argparse
@@ -73,6 +73,8 @@ _CAPTIONS_PATH = _PARTVERSE_DIR / "source" / "text_captions.json"
 _IMG_ENC_DIR   = _PARTVERSE_DIR / "img_Enc"
 _IMAGES_DIR    = _PARTVERSE_DIR / "images"
 _MESH_DIR      = _PARTVERSE_DIR / "mesh"
+
+_LOG = logging.getLogger("pack_npz_partverse")
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
@@ -156,6 +158,14 @@ def _load_source_mesh(obj_id: str, anno_dir: Path | None = None):
     return mesh
 
 
+def _is_int_stem(p: Path) -> bool:
+    try:
+        int(p.stem)
+        return True
+    except ValueError:
+        return False
+
+
 def _pack_mesh_glb(
     obj_id: str,
     textured_part_glbs_dir: Path,
@@ -179,7 +189,10 @@ def _pack_mesh_glb(
     result = {}
 
     # Pack full mesh (normalized_glb → VD-space)
-    scene = trimesh.load(str(norm_glb_path), force="scene")
+    try:
+        scene = trimesh.load(str(norm_glb_path), force="scene")
+    except Exception:
+        return None
     meshes = [g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)]
     if not meshes:
         return None
@@ -190,12 +203,18 @@ def _pack_mesh_glb(
     result["full.glb"] = np.frombuffer(buf.getvalue(), dtype=np.uint8)
 
     # Pack per-part meshes (textured_part_glbs/<obj>/<N>.glb → VD-space)
-    part_files = sorted(part_glb_root.glob("*.glb"), key=lambda p: int(p.stem))
+    part_files = sorted(
+        (p for p in part_glb_root.glob("*.glb") if _is_int_stem(p)),
+        key=lambda p: int(p.stem),
+    )
     if not part_files:
         return None
     for part_path in part_files:
         pid = int(part_path.stem)
-        scene_p = trimesh.load(str(part_path), force="scene")
+        try:
+            scene_p = trimesh.load(str(part_path), force="scene")
+        except Exception:
+            continue
         pmeshes = [g for g in scene_p.geometry.values() if isinstance(g, trimesh.Trimesh)]
         if not pmeshes:
             continue
@@ -319,9 +338,13 @@ def _pack_one(obj_id: str, img_enc_dir: Path,
     n_parts = 0
 
     if use_glb:
-        mesh_data = _pack_mesh_glb(
-            obj_id, textured_part_glbs_dir, normalized_glb_dir, transforms
-        ) or {}
+        try:
+            mesh_data = _pack_mesh_glb(
+                obj_id, textured_part_glbs_dir, normalized_glb_dir, transforms
+            ) or {}
+        except Exception as exc:
+            _LOG.warning("%s: GLB load failed (%s), falling back to PLY", obj_id, exc)
+            mesh_data = {}
 
     if mesh_data:
         # GLB path succeeded: try to supplement render_data with split_mesh.json
@@ -381,12 +404,12 @@ def main():
     glb = parser.add_argument_group("GLB source data (optional)")
     glb.add_argument("--textured-part-glbs-dir", type=str, default=None,
                      help="Root dir of pre-split textured part GLBs "
-                          "(e.g. /mnt/zsn/data/partverse/source/textured_part_glbs). "
+                          "(e.g. $DATA_ROOT/source/textured_part_glbs). "
                           "When set together with --normalized-glb-dir, GLB packing "
                           "is attempted before PLY fallback.")
     glb.add_argument("--normalized-glb-dir", type=str, default=None,
                      help="Dir containing full textured GLBs named {obj_id}.glb "
-                          "(e.g. /mnt/zsn/data/partverse/source/normalized_glbs).")
+                          "(e.g. $DATA_ROOT/source/normalized_glbs).")
 
     args = parser.parse_args()
 
