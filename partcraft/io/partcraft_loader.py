@@ -103,6 +103,25 @@ class ObjectRecord:
         if self._mesh_npz is None:
             self._mesh_npz = np.load(self.mesh_npz_path, allow_pickle=True)
 
+    def _mesh_fmt(self) -> str:
+        """Detect mesh format stored in the NPZ.
+
+        Returns 'glb' if the NPZ contains 'full.glb', otherwise 'ply'.
+        Backward-compatible: existing PLY NPZs return 'ply'.
+        """
+        self._ensure_mesh_npz()
+        return "glb" if "full.glb" in self._mesh_npz.files else "ply"
+
+    def _load_mesh_bytes(self, key: str) -> "trimesh.Trimesh":
+        """Load mesh from NPZ bytes, handling both PLY and GLB (Scene → dump)."""
+        assert trimesh is not None, "trimesh is required"
+        raw = bytes(self._mesh_npz[key])
+        fmt = "glb" if key.endswith(".glb") else "ply"
+        mesh_or_scene = trimesh.load(io.BytesIO(raw), file_type=fmt)
+        if isinstance(mesh_or_scene, trimesh.Scene):
+            return mesh_or_scene.dump(concatenate=True)
+        return mesh_or_scene
+
     def close(self):
         if self._render_npz is not None:
             self._render_npz.close()
@@ -185,12 +204,12 @@ class ObjectRecord:
         offset = 0
         part_ids = sorted(p.part_id for p in self.parts)
 
+        fmt = self._mesh_fmt()
         for pid in part_ids:
-            key = f"part_{pid}.ply"
+            key = f"part_{pid}.{fmt}"
             if key not in self._mesh_npz:
                 continue
-            part_mesh = trimesh.load(
-                io.BytesIO(self._mesh_npz[key].tobytes()), file_type="ply")
+            part_mesh = self._load_mesh_bytes(key)
             n_faces = len(part_mesh.faces)
 
             fc = np.zeros((n_faces, 4), dtype=np.uint8)
@@ -348,9 +367,10 @@ class ObjectRecord:
     def get_full_mesh(self, colored: bool = True) -> "trimesh.Trimesh":
         assert trimesh is not None, "trimesh is required"
         self._ensure_mesh_npz()
-        mesh = trimesh.load(
-            io.BytesIO(self._mesh_npz["full.ply"].tobytes()), file_type="ply")
-        if colored:
+        fmt = self._mesh_fmt()
+        key = f"full.{fmt}"
+        mesh = self._load_mesh_bytes(key)
+        if colored and fmt == "ply":
             self.bake_vertex_colors(mesh)
         return mesh
 
@@ -358,12 +378,12 @@ class ObjectRecord:
                       colored: bool = True) -> "trimesh.Trimesh":
         assert trimesh is not None, "trimesh is required"
         self._ensure_mesh_npz()
-        key = f"part_{part_id}.ply"
+        fmt = self._mesh_fmt()
+        key = f"part_{part_id}.{fmt}"
         if key not in self._mesh_npz:
             raise KeyError(f"'{key}' not found in {self.mesh_npz_path}")
-        mesh = trimesh.load(
-            io.BytesIO(self._mesh_npz[key].tobytes()), file_type="ply")
-        if colored:
+        mesh = self._load_mesh_bytes(key)
+        if colored and fmt == "ply":
             self.bake_vertex_colors(mesh)
         return mesh
 
