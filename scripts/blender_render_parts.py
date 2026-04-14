@@ -210,8 +210,13 @@ def main(args):
         pid_str = fname.replace("part_", "").rsplit(".", 1)[0]
         pid = int(pid_str)
         if part_path.suffix == ".glb":
-            bpy.ops.import_scene.gltf(filepath=str(part_path))
-            new_objs = bpy.context.selected_objects
+            try:
+                before = set(bpy.data.objects)
+                bpy.ops.import_scene.gltf(filepath=str(part_path))
+                new_objs = [o for o in bpy.data.objects if o not in before]
+            except (AttributeError, RuntimeError) as e:
+                print(f'[ERROR] part_{pid}: gltf import failed: {e}')
+                continue
         else:
             new_objs = import_ply(str(part_path))
         if not new_objs:

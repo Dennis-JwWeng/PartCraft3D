@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -64,7 +65,6 @@ def extract_parts(npz_path: Path, out_dir: Path) -> list[int]:
     Supports both GLB-format (part_N.glb) and PLY-format (part_N.ply) NPZs.
     Returns sorted list of part IDs extracted.
     """
-    import re
     npz = np.load(npz_path, allow_pickle=False)
 
     # Detect format from available keys
@@ -80,10 +80,7 @@ def extract_parts(npz_path: Path, out_dir: Path) -> list[int]:
 
     pids = []
     for key in part_keys:
-        m = re.match(r'^part_(\d+)\.' + ext[1:] + r'$', key)
-        if not m:
-            continue
-        pid = int(m.group(1))
+        pid = int(re.search(r'\d+', key).group())
         out_path = out_dir / f"part_{pid}{ext}"
         out_path.write_bytes(bytes(npz[key]))
         pids.append(pid)
