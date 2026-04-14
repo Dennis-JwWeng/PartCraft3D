@@ -29,6 +29,7 @@ import json
 import math
 import os
 import sys
+from pathlib import Path
 
 import bpy
 from mathutils import Matrix
@@ -197,16 +198,22 @@ def main(args):
         init_lighting()
 
     palette = json.loads(args.palette)
+    all_files = os.listdir(args.parts_dir)
     parts = sorted(
-        f for f in os.listdir(args.parts_dir)
-        if f.startswith("part_") and f.endswith(".ply")
+        f for f in all_files
+        if f.startswith("part_") and (f.endswith(".ply") or f.endswith(".glb"))
     )
     print(f'[INFO] Found {len(parts)} part files in {args.parts_dir}')
 
     for fname in parts:
-        pid = int(fname.replace("part_", "").replace(".ply", ""))
-        path = os.path.join(args.parts_dir, fname)
-        new_objs = import_ply(path)
+        part_path = Path(os.path.join(args.parts_dir, fname))
+        pid_str = fname.replace("part_", "").rsplit(".", 1)[0]
+        pid = int(pid_str)
+        if part_path.suffix == ".glb":
+            bpy.ops.import_scene.gltf(filepath=str(part_path))
+            new_objs = bpy.context.selected_objects
+        else:
+            new_objs = import_ply(str(part_path))
         if not new_objs:
             print(f'[WARN] part_{pid}: import returned 0 new objects')
             continue

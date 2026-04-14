@@ -59,16 +59,36 @@ _PALETTE = [
 
 
 def extract_parts(npz_path: Path, out_dir: Path) -> list[int]:
-    """Extract part_*.ply from a mesh NPZ. Returns sorted part_ids."""
-    z = np.load(npz_path, allow_pickle=True)
+    """Extract per-part mesh files from a mesh NPZ to out_dir.
+
+    Supports both GLB-format (part_N.glb) and PLY-format (part_N.ply) NPZs.
+    Returns sorted list of part IDs extracted.
+    """
+    import re
+    npz = np.load(npz_path, allow_pickle=False)
+
+    # Detect format from available keys
+    glb_keys = [k for k in npz.files if re.match(r'^part_\d+\.glb$', k)]
+    ply_keys = [k for k in npz.files if re.match(r'^part_\d+\.ply$', k)]
+
+    if glb_keys:
+        part_keys = glb_keys
+        ext = ".glb"
+    else:
+        part_keys = ply_keys
+        ext = ".ply"
+
     pids = []
-    for k in z.files:
-        if k.startswith("part_") and k.endswith(".ply"):
-            pid = int(k.replace("part_", "").replace(".ply", ""))
-            (out_dir / f"part_{pid}.ply").write_bytes(bytes(z[k]))
-            pids.append(pid)
-    pids.sort()
-    return pids
+    for key in part_keys:
+        m = re.match(r'^part_(\d+)\.' + ext[1:] + r'$', key)
+        if not m:
+            continue
+        pid = int(m.group(1))
+        out_path = out_dir / f"part_{pid}{ext}"
+        out_path.write_bytes(bytes(npz[key]))
+        pids.append(pid)
+
+    return sorted(pids)
 
 
 def load_views_from_npz(images_npz: Path, view_indices: list[int]):
