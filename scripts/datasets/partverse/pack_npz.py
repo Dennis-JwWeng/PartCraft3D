@@ -411,6 +411,11 @@ def main():
                      help="Dir containing full textured GLBs named {obj_id}.glb "
                           "(e.g. $DATA_ROOT/source/normalized_glbs).")
 
+    parser.add_argument("--mesh-out-dir", type=str, default=None,
+                        help="Override output directory for mesh NPZs (replaces "
+                             "the default <data-root>/mesh/<shard>/). Useful for "
+                             "in-place repack of an existing inputs/ tree.")
+
     args = parser.parse_args()
 
     global _PARTVERSE_DIR, _ANNO_DIR, _CAPTIONS_PATH, _IMG_ENC_DIR, _IMAGES_DIR, _MESH_DIR
@@ -462,10 +467,10 @@ def main():
 
     # ---- Output directories ----
     render_out = _IMAGES_DIR / shard
-    mesh_out   = _MESH_DIR / shard
+    mesh_out   = Path(args.mesh_out_dir) if args.mesh_out_dir else (_MESH_DIR / shard)
     render_out.mkdir(parents=True, exist_ok=True)
     mesh_out.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Output → images/{shard}/ and mesh/{shard}/")
+    logger.info(f"Output → images/{shard}/ and mesh: {mesh_out}/")
 
     if textured_part_glbs_dir and normalized_glb_dir:
         logger.info(f"GLB source: {textured_part_glbs_dir} + {normalized_glb_dir}")
