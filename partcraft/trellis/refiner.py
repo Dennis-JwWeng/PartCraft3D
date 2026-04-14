@@ -429,9 +429,26 @@ class TrellisRefiner:
                 raise FileNotFoundError(
                     f"VD mesh.ply not found at {vd_mesh_path} and "
                     f"neither full.glb nor full.ply found in {obj_record.mesh_npz_path}.")
+            raw_bytes = npz[fmt_key].tobytes()
+            # New-format NPZs store Y-up GLBs; apply VD transform before writing
+            if fmt_key == "full.glb" and "vd_scale" in npz.files:
+                import io as _io, trimesh as _tm
+                _vd_scale = float(npz["vd_scale"][0])
+                _vd_offset = np.array(npz["vd_offset"])
+                _sc = _tm.load(_io.BytesIO(raw_bytes), file_type="glb", force="scene")
+                _ms = [g for g in (_sc.geometry.values() if hasattr(_sc, "geometry") else [_sc])
+                       if isinstance(g, _tm.Trimesh)]
+                if _ms:
+                    _m = _tm.util.concatenate(_ms) if len(_ms) > 1 else _ms[0]
+                    _v = np.array(_m.vertices)
+                    _vd = np.empty_like(_v)
+                    _vd[:, 0] = _v[:, 0]; _vd[:, 1] = -_v[:, 2]; _vd[:, 2] = _v[:, 1]
+                    _m.vertices = (_vd + _vd_offset) * _vd_scale
+                    _buf = _io.BytesIO(); _m.export(_buf, file_type="glb")
+                    raw_bytes = _buf.getvalue()
             tmp_suffix = ".glb" if fmt_key == "full.glb" else ".ply"
             _tmp = tempfile.NamedTemporaryFile(suffix=tmp_suffix, delete=False)
-            _tmp.write(npz[fmt_key].tobytes())
+            _tmp.write(raw_bytes)
             _tmp.close()
             vd_mesh = o3d.io.read_triangle_mesh(_tmp.name)
             os.unlink(_tmp.name)

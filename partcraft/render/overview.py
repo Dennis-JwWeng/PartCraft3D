@@ -78,11 +78,32 @@ def extract_parts(npz_path: Path, out_dir: Path) -> list[int]:
         part_keys = ply_keys
         ext = ".ply"
 
+    # New-format NPZs store Y-up GLBs with vd_scale/vd_offset for lazy transform
+    has_vd = (ext == ".glb") and ("vd_scale" in npz.files)
+    if has_vd:
+        import trimesh as _tm, io as _io
+        _vd_scale = float(npz["vd_scale"][0])
+        _vd_offset = np.array(npz["vd_offset"])
+
     pids = []
     for key in part_keys:
         pid = int(re.search(r'\d+', key).group())
         out_path = out_dir / f"part_{pid}{ext}"
-        out_path.write_bytes(bytes(npz[key]))
+        raw = bytes(npz[key])
+        if has_vd:
+            # Apply VD transform (Y-up → Z-up + scale) before writing for Blender
+            _sc = _tm.load(_io.BytesIO(raw), file_type="glb", force="scene")
+            _ms = [g for g in (_sc.geometry.values() if hasattr(_sc, "geometry") else [_sc])
+                   if isinstance(g, _tm.Trimesh)]
+            if _ms:
+                _m = _tm.util.concatenate(_ms) if len(_ms) > 1 else _ms[0]
+                _v = np.array(_m.vertices)
+                _vd = np.empty_like(_v)
+                _vd[:, 0] = _v[:, 0]; _vd[:, 1] = -_v[:, 2]; _vd[:, 2] = _v[:, 1]
+                _m.vertices = (_vd + _vd_offset) * _vd_scale
+                _buf = _io.BytesIO(); _m.export(_buf, file_type="glb")
+                raw = _buf.getvalue()
+        out_path.write_bytes(raw)
         pids.append(pid)
 
     return sorted(pids)
