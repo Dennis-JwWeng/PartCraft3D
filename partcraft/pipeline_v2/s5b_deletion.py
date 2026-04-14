@@ -184,6 +184,76 @@ def _build_deletion_glb(
         return False
 
 
+def _build_deletion_from_npz(
+    mesh_npz: "Path",
+    selected_part_ids: "list[int]",
+    pair_dir: "Path",
+    *,
+    force: bool = False,
+    logger: "logging.Logger | None" = None,
+) -> bool:
+    """Build deletion result by concatenating non-deleted part GLBs from mesh NPZ.
+
+    Returns True if successful, False if NPZ doesn't have GLB format or is missing.
+    Writes after_new.glb to pair_dir.
+    """
+    import io
+    import re
+    import numpy as np
+    import trimesh
+    from pathlib import Path as _Path
+
+    log = logger or logging.getLogger("pipeline_v2.s5b")
+    mesh_npz = _Path(mesh_npz)
+    pair_dir = _Path(pair_dir)
+    out_path = pair_dir / "after_new.glb"
+
+    if not force and out_path.exists():
+        return True
+
+    if not mesh_npz.exists():
+        return False
+
+    npz = np.load(mesh_npz, allow_pickle=False)
+
+    glb_part_keys = [k for k in npz.files if k.startswith("part_") and k.endswith(".glb")]
+    if not glb_part_keys:
+        return False  # PLY format — caller should use the KD-tree path
+
+    all_pids = sorted(
+        int(re.search(r'\d+', k).group())
+        for k in glb_part_keys
+        if re.search(r'\d+', k)
+    )
+    keep_pids = [pid for pid in all_pids if pid not in selected_part_ids]
+
+    if not keep_pids:
+        log.warning("[s5b] _build_deletion_from_npz: all parts selected for deletion")
+        return False
+
+    meshes = []
+    for pid in keep_pids:
+        key = f"part_{pid}.glb"
+        if key not in npz.files:
+            continue
+        raw = bytes(npz[key])
+        scene = trimesh.load(io.BytesIO(raw), file_type="glb", force="scene")
+        if isinstance(scene, trimesh.Scene):
+            geoms = [g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)]
+            meshes.extend(geoms)
+        elif isinstance(scene, trimesh.Trimesh):
+            meshes.append(scene)
+
+    if not meshes:
+        return False
+
+    result = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
+    pair_dir.mkdir(parents=True, exist_ok=True)
+    result.export(str(out_path))
+    log.info("[s5b] _build_deletion_from_npz: wrote %s (%d parts kept)", out_path, len(keep_pids))
+    return True
+
+
 def run_mesh_delete_for_object(
     ctx: ObjectContext,
     *,
@@ -246,11 +316,23 @@ def run_mesh_delete_for_object(
                 add_seq += 1
                 continue
             pair_dir.mkdir(parents=True, exist_ok=True)
-            ok = _build_deletion_glb(
-                ctx.obj_id, list(spec.selected_part_ids),
-                pair_dir, normalized_glb_dir, anno_dir,
-                force=force, logger=log,
-            )
+            # Primary: NPZ-based deletion (no KD-tree needed)
+            ok = False
+            if ctx.mesh_npz is not None:
+                ok = _build_deletion_from_npz(
+                    ctx.mesh_npz,
+                    list(spec.selected_part_ids),
+                    pair_dir,
+                    force=force,
+                    logger=log,
+                )
+            # Fallback: KD-tree matching from normalized GLB
+            if not ok:
+                ok = _build_deletion_glb(
+                    ctx.obj_id, list(spec.selected_part_ids),
+                    pair_dir, normalized_glb_dir, anno_dir,
+                    force=force, logger=log,
+                )
             if ok:
                 _backfill_add(ctx, spec, add_seq, force=force, logger=log)
                 res.n_ok += 1
@@ -561,6 +643,7 @@ def run_reencode(
 
 __all__ = [
     "DelMeshResult", "DelReencodeResult",
+    "_build_deletion_from_npz",
     "run_mesh_delete", "run_mesh_delete_for_object",
     "run_reencode", "run_reencode_for_object",
 ]
