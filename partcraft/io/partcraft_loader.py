@@ -113,13 +113,13 @@ class ObjectRecord:
         return "glb" if "full.glb" in self._mesh_npz.files else "ply"
 
     def _load_mesh_bytes(self, key: str) -> "trimesh.Trimesh":
-        """Load mesh from NPZ bytes, handling both PLY and GLB (Scene → dump)."""
+        """Load mesh from NPZ bytes, handling both PLY and GLB (Scene → geometry)."""
         assert trimesh is not None, "trimesh is required"
         raw = bytes(self._mesh_npz[key])
         fmt = "glb" if key.endswith(".glb") else "ply"
         mesh_or_scene = trimesh.load(io.BytesIO(raw), file_type=fmt)
         if isinstance(mesh_or_scene, trimesh.Scene):
-            return mesh_or_scene.dump(concatenate=True)
+            return mesh_or_scene.to_geometry()
         return mesh_or_scene
 
     def close(self):
@@ -369,6 +369,8 @@ class ObjectRecord:
         self._ensure_mesh_npz()
         fmt = self._mesh_fmt()
         key = f"full.{fmt}"
+        if key not in self._mesh_npz:
+            raise KeyError(f"'{key}' not found in {self.mesh_npz_path}")
         mesh = self._load_mesh_bytes(key)
         if colored and fmt == "ply":
             self.bake_vertex_colors(mesh)
@@ -390,6 +392,7 @@ class ObjectRecord:
     def get_assembled_mesh(self, part_ids: list[int],
                            colored: bool = True) -> "trimesh.Trimesh":
         assert trimesh is not None, "trimesh is required"
+        fmt = self._mesh_fmt()
         meshes = []
         for pid in part_ids:
             try:
@@ -399,7 +402,7 @@ class ObjectRecord:
         if not meshes:
             raise ValueError(f"No valid meshes for parts {part_ids}")
         result = trimesh.util.concatenate(meshes)
-        if colored:
+        if colored and fmt == "ply":
             self.bake_vertex_colors(result)
         return result
 
