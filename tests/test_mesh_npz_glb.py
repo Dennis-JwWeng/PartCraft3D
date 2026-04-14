@@ -15,15 +15,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-trimesh = pytest.importorskip("trimesh")
-
 # ---------------------------------------------------------------------------
 # Shared fixture paths (real data; missing paths trigger xfail in dependent tests)
 # ---------------------------------------------------------------------------
 OBJ = "0008dc75fb3648f2af4ca8c4d711e53e"
 PART_GLB_DIR = Path("/mnt/zsn/data/partverse/source/textured_part_glbs") / OBJ
 NORM_GLB = Path("/mnt/zsn/data/partverse/source/normalized_glbs") / f"{OBJ}.glb"
-ANNO_DIR = Path("/mnt/zsn/data/partverse/source/anno_infos") / OBJ
 TRANSFORMS = {"scale": 0.5005004940503051, "offset": [0.0, 0.0, 0.0]}
 
 _REAL_DATA_AVAILABLE = PART_GLB_DIR.exists() and NORM_GLB.exists()
@@ -48,6 +45,7 @@ def test_glb_pack_roundtrip_uv(tmp_path):
     Expected to FAIL (ImportError / AttributeError) until Task 3 implements
     _pack_mesh_glb in scripts.datasets.partverse.pack_npz.
     """
+    trimesh = pytest.importorskip("trimesh")
     if not _REAL_DATA_AVAILABLE:
         pytest.xfail("real data not available; function also not yet implemented")
 
@@ -149,6 +147,7 @@ def test_get_part_mesh_from_glb(tmp_path):
 
     Expected to FAIL until Tasks 2+3 are done.
     """
+    trimesh = pytest.importorskip("trimesh")
     if not _REAL_DATA_AVAILABLE:
         pytest.xfail("real data not available; function also not yet implemented")
 
@@ -194,11 +193,11 @@ def test_get_part_mesh_from_glb(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Test 5 - _build_deletion_from_npz produces edit_mesh.glb
+# Test 5 - _build_deletion_from_npz produces after_new.glb
 # ---------------------------------------------------------------------------
 @pytest.mark.real_data
 def test_build_deletion_from_npz(tmp_path):
-    """_build_deletion_from_npz must write 'edit_mesh.glb' to pair_dir.
+    """_build_deletion_from_npz must write 'after_new.glb' to pair_dir.
 
     Expected to FAIL (ImportError / AttributeError) until Task 6 implements it
     in partcraft.pipeline_v2.s5b_deletion.
@@ -229,10 +228,11 @@ def test_build_deletion_from_npz(tmp_path):
 
     pair_dir = tmp_path / "pair"
     pair_dir.mkdir()
-    _build_deletion_from_npz(npz_path, [0], pair_dir)
+    ok = _build_deletion_from_npz(npz_path, [0], pair_dir)
 
-    assert (pair_dir / "edit_mesh.glb").exists(), \
-        f"edit_mesh.glb not found in {pair_dir}"
+    assert ok is True, "function returned False"
+    assert (pair_dir / "after_new.glb").exists(), \
+        f"after_new.glb not found in {pair_dir}"
 
 
 # ---------------------------------------------------------------------------
