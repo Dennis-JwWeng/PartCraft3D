@@ -219,7 +219,12 @@ def run_step(
     elif step == "s6p_del":
         from .s6_preview import run_del as s6p_del_run
         blender = resolve_blender_executable(cfg)
-        s6p_del_run(ctxs, blender=blender, force=args.force, logger=log)
+        # Default workers = number of GPUs (each Blender uses one GPU).
+        # Override via pipeline.s6p_del_workers in config.
+        _n_gpus = len(sched.gpus_for(cfg))
+        _n_workers = int((cfg.get("pipeline") or {}).get("s6p_del_workers", _n_gpus))
+        s6p_del_run(ctxs, blender=blender, n_workers=_n_workers,
+                    force=args.force, logger=log)
 
     elif step == "s6p_flux":
         from .s6_preview import run_flux as s6p_flux_run

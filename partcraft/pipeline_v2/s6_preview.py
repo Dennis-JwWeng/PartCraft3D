@@ -173,6 +173,8 @@ def _render_glb_views(
     encode_script: str,
     blender: str,
     resolution: int,
+    *,
+    force_cpu: bool = False,
 ) -> list[np.ndarray]:
     """Render GLB at VIEW_INDICES cameras using encode_asset Cycles renderer.
 
@@ -204,9 +206,13 @@ def _render_glb_views(
         if norm_scale is not None and norm_offset is not None:
             cmd += ["--normalize_scale", str(norm_scale),
                     "--normalize_offset", str(norm_offset[0]), str(norm_offset[1]), str(norm_offset[2])]
+        env = dict(os.environ)
+        if force_cpu:
+            env["CUDA_VISIBLE_DEVICES"] = ""  # hide all GPUs → Blender falls back to CPU
         result = subprocess.run(
             cmd,
             capture_output=True, text=True, timeout=600,
+            env=env,
         )
         if result.returncode != 0:
             raise RuntimeError(
@@ -632,17 +638,39 @@ def run_del(
     blender: str = "blender",
     resolution: int = 518,
     force: bool = False,
+    n_workers: int = 8,
     logger: logging.Logger | None = None,
 ) -> list[PreviewResult]:
-    """Batch entry for s6p_del (deletion + addition preview, CPU/Blender)."""
+    """Batch entry for s6p_del (deletion + addition preview, GPU/Blender).
+
+    Runs ``n_workers`` Blender subprocesses in parallel (one object per slot).
+    Each Blender process uses CUDA by default; set CUDA_VISIBLE_DEVICES before
+    invoking to pin to specific GPUs.
+    """
+    import concurrent.futures
     log = logger or logging.getLogger("pipeline_v2.s6p_del")
-    log.info("[s6p_del] CUDA_VISIBLE_DEVICES=%s", os.environ.get("CUDA_VISIBLE_DEVICES"))
-    results = []
-    for ctx in ctxs:
-        results.append(run_del_for_object(
+    log.info("[s6p_del] CUDA_VISIBLE_DEVICES=%s  n_workers=%d",
+             os.environ.get("CUDA_VISIBLE_DEVICES"), n_workers)
+
+    ctx_list = list(ctxs)
+    pending = [c for c in ctx_list if force or not step_done(c, "s6p_del")]
+    done_results = [PreviewResult(c.obj_id) for c in ctx_list if c not in set(pending)]
+
+    def _do(ctx):
+        return run_del_for_object(
             ctx, blender=blender, resolution=resolution,
             force=force, logger=log,
-        ))
+        )
+
+    results: list[PreviewResult] = list(done_results)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+        for res in pool.map(_do, pending):
+            results.append(res)
+
+    n_ok   = sum(r.n_ok   for r in results)
+    n_fail = sum(r.n_fail for r in results)
+    n_skip = sum(r.n_skip for r in results)
+    log.info("[s6p_del] done: ok=%d fail=%d skip=%d", n_ok, n_fail, n_skip)
     return results
 
 
