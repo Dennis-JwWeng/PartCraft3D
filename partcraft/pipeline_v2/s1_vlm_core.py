@@ -347,10 +347,16 @@ def build_part_menu(
     clusters = sm.get("valid_clusters", {})
     z2 = np.load(mesh_npz, allow_pickle=True)
     import re as _re
+
+    def _parse_pid(k: str) -> int | None:
+        m = _re.search(r"\d+", k)
+        return int(m.group()) if m else None
+
     pids = sorted(
-        int(_re.search(r'\d+', k).group())
+        pid
         for k in z2.files
         if k.startswith("part_") and (k.endswith(".glb") or k.endswith(".ply"))
+        if (pid := _parse_pid(k)) is not None
     )
 
     peer_groups, structural_pids, pid_levels = _load_anno_peer_groups(anno_obj_dir, pids)
