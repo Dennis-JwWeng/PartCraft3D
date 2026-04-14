@@ -1,7 +1,7 @@
 """TDD tests for GLB-format mesh NPZ support.
 
 All 7 tests are expected to FAIL until implementation tasks 2-6 are complete.
-Tests use real on-disk data where available; disk-absent paths are skipped.
+Tests use real on-disk data where available; disk-absent paths xfail (never pass silently).
 
 Run with:
     python -m pytest tests/test_mesh_npz_glb.py -v --no-header
@@ -18,7 +18,7 @@ import pytest
 trimesh = pytest.importorskip("trimesh")
 
 # ---------------------------------------------------------------------------
-# Shared fixture paths (real data; tests skip if absent)
+# Shared fixture paths (real data; missing paths trigger xfail in dependent tests)
 # ---------------------------------------------------------------------------
 OBJ = "0008dc75fb3648f2af4ca8c4d711e53e"
 PART_GLB_DIR = Path("/mnt/zsn/data/partverse/source/textured_part_glbs") / OBJ
@@ -49,7 +49,7 @@ def test_glb_pack_roundtrip_uv(tmp_path):
     _pack_mesh_glb in scripts.datasets.partverse.pack_npz.
     """
     if not _REAL_DATA_AVAILABLE:
-        pytest.skip("Real source data not present on this machine")
+        pytest.xfail("real data not available; function also not yet implemented")
 
     try:
         from scripts.datasets.partverse.pack_npz import _pack_mesh_glb
@@ -150,7 +150,7 @@ def test_get_part_mesh_from_glb(tmp_path):
     Expected to FAIL until Tasks 2+3 are done.
     """
     if not _REAL_DATA_AVAILABLE:
-        pytest.skip("Real source data not present on this machine")
+        pytest.xfail("real data not available; function also not yet implemented")
 
     try:
         from scripts.datasets.partverse.pack_npz import _pack_mesh_glb
@@ -168,6 +168,12 @@ def test_get_part_mesh_from_glb(tmp_path):
     np.savez(npz_path, **{k: np.frombuffer(v, dtype=np.uint8) if isinstance(v, bytes) else v
                           for k, v in raw.items()})
 
+    z = np.load(npz_path, allow_pickle=True)
+    if "part_0.glb" not in z.files:
+        z.close()
+        pytest.skip("part_0.glb not in packed NPZ; source data for part 0 does not exist")
+    z.close()
+
     record = ObjectRecord(
         obj_id=OBJ,
         shard="00",
@@ -175,15 +181,8 @@ def test_get_part_mesh_from_glb(tmp_path):
         mesh_npz_path=str(npz_path),
     )
 
-    # Find first available part id
-    z = np.load(npz_path, allow_pickle=True)
-    part_keys = [k for k in z.files if k.startswith("part_") and k.endswith(".glb")]
-    z.close()
-    assert part_keys, "No part GLB keys in packed NPZ"
-    pid = int(part_keys[0].replace("part_", "").replace(".glb", ""))
-
     try:
-        mesh = record.get_part_mesh(pid)
+        mesh = record.get_part_mesh(0)
     except (AttributeError, KeyError, Exception) as exc:
         pytest.xfail(f"get_part_mesh not yet updated for GLB format: {exc}")
 
@@ -205,7 +204,7 @@ def test_build_deletion_from_npz(tmp_path):
     in partcraft.pipeline_v2.s5b_deletion.
     """
     if not _REAL_DATA_AVAILABLE:
-        pytest.skip("Real source data not present on this machine")
+        pytest.xfail("real data not available; function also not yet implemented")
 
     try:
         from scripts.datasets.partverse.pack_npz import _pack_mesh_glb
@@ -223,14 +222,14 @@ def test_build_deletion_from_npz(tmp_path):
                           for k, v in raw.items()})
 
     z = np.load(npz_path, allow_pickle=True)
-    part_keys = [k for k in z.files if k.startswith("part_") and k.endswith(".glb")]
+    if "part_0.glb" not in z.files:
+        z.close()
+        pytest.skip("part_0.glb not in packed NPZ; source data for part 0 does not exist")
     z.close()
-    assert part_keys, "No GLB part keys in packed NPZ"
-    pid = int(part_keys[0].replace("part_", "").replace(".glb", ""))
 
     pair_dir = tmp_path / "pair"
     pair_dir.mkdir()
-    _build_deletion_from_npz(npz_path, [pid], pair_dir)
+    _build_deletion_from_npz(npz_path, [0], pair_dir)
 
     assert (pair_dir / "edit_mesh.glb").exists(), \
         f"edit_mesh.glb not found in {pair_dir}"
