@@ -96,6 +96,28 @@ PACK_VIEWS: list[int] = [
 ]
 
 # ---------------------------------------------------------------------------
+# Worker context (module-level so ProcessPoolExecutor can pickle it)
+# ---------------------------------------------------------------------------
+
+_pack_ctx: dict = {}
+
+
+def _pack_worker(oid: str) -> dict:
+    """Top-level worker function (picklable) for ProcessPoolExecutor."""
+    ctx = _pack_ctx
+    return _pack_one(
+        oid,
+        ctx["img_enc_dir"] / oid,
+        ctx["render_out"],
+        ctx["mesh_out"],
+        ctx["captions"],
+        keep_views=PACK_VIEWS,
+        textured_part_glbs_dir=ctx.get("textured_part_glbs_dir"),
+        normalized_glb_dir=ctx.get("normalized_glb_dir"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -500,16 +522,20 @@ def main():
         logger.info("Nothing to pack.")
         return
 
-    def _do_pack(oid: str) -> dict:
-        return _pack_one(oid, _IMG_ENC_DIR / oid, render_out, mesh_out, captions,
-                         keep_views=PACK_VIEWS,
-                         textured_part_glbs_dir=textured_part_glbs_dir,
-                         normalized_glb_dir=normalized_glb_dir)
+    # Store context for worker (module-level _pack_worker can be pickled)
+    _pack_ctx.update({
+        "img_enc_dir": _IMG_ENC_DIR,
+        "render_out": render_out,
+        "mesh_out": mesh_out,
+        "captions": captions,
+        "textured_part_glbs_dir": textured_part_glbs_dir,
+        "normalized_glb_dir": normalized_glb_dir,
+    })
 
     ok = fail = 0
     if args.workers <= 1:
         for i, obj_id in enumerate(pending):
-            result = _do_pack(obj_id)
+            result = _pack_worker(obj_id)
             if result["status"] == "ok":
                 ok += 1
                 logger.info(f"[{i+1}/{len(pending)}] {obj_id}: "
@@ -519,7 +545,7 @@ def main():
                 logger.warning(f"[{i+1}/{len(pending)}] {obj_id}: SKIP — {result['reason']}")
     else:
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(_do_pack, oid): oid for oid in pending}
+            futures = {pool.submit(_pack_worker, oid): oid for oid in pending}
             done_count = 0
             for future in as_completed(futures):
                 done_count += 1
