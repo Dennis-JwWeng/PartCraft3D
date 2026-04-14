@@ -414,8 +414,12 @@ def run_reencode_for_object(
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> DelReencodeResult:
-    """For each deletion ``after.ply`` in this object, render → encode
-    → overwrite ``after.npz``. Reuses the legacy phase5 helper."""
+    """For each deletion edit render → encode → write ``after.npz``.
+
+    GLB path (primary): reads ``after_new.glb`` produced by s5b and passes it
+    directly to encode_asset's Blender renderer (which supports GLB natively).
+    PLY path (fallback): reads ``after.ply`` for legacy pipeline compatibility.
+    """
     import numpy as np
     from migrate_slat_to_npz import _render_and_full_encode  # type: ignore
 
@@ -436,16 +440,22 @@ def run_reencode_for_object(
             add_seq += 1
             continue
         pair_dir = ctx.edit_3d_dir(spec.edit_id)
+        a_glb = pair_dir / "after_new.glb"
         a_ply = pair_dir / "after.ply"
         a_npz = pair_dir / "after.npz"
-        if not a_ply.is_file():
+
+        # Determine mesh source: GLB preferred (textured, no PLY artefacts).
+        if a_glb.is_file():
+            mesh_path = a_glb
+        elif a_ply.is_file():
+            mesh_path = a_ply
+        else:
+            log.warning("[s6b] %s: no after_new.glb or after.ply", spec.edit_id)
             res.n_fail += 1
             add_seq += 1
             continue
-        # Skip if a_npz already has the full DINOv2-encoded payload.
-        # Heuristic: full reencode produces a `dino_voxel_mean` field; the
-        # legacy export_deletion_pair does not. Cheaper: just skip when
-        # status entry says ok.
+
+        # Skip if a_npz already has the full encoded payload and step is done.
         if a_npz.is_file() and not force:
             try:
                 d = np.load(a_npz)
@@ -457,8 +467,10 @@ def run_reencode_for_object(
             except Exception:
                 pass
         try:
+            # encode_asset render() accepts both .glb and .ply via --object arg;
+            # the blender_script determines import method from file extension.
             payload = _render_and_full_encode(
-                a_ply, f"after_{spec.edit_id}", work_dir,
+                mesh_path, f"after_{spec.edit_id}", work_dir,
                 ss_encoder, "cuda",
                 num_views=num_views, blender_path=blender_path,
             )

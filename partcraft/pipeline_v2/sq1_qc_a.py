@@ -81,7 +81,10 @@ async def _process_one(ctx, vlm_url, vlm_model, force):
         # Visibility check: if selected parts have zero pixels in the chosen
         # view of the overview bottom-row, the edit is geometrically invalid.
         # This replaces the former s2_highlights Blender re-render.
-        if not fails and spec.selected_part_ids and ov_img is not None:
+        # Skip for deletion: s5b removes parts directly by ID from the 3D mesh
+        # and never consults 2D renders, so view-level visibility is irrelevant.
+        if (not fails and spec.selected_part_ids and ov_img is not None
+                and spec.edit_type != "deletion"):
             vi = int(e.get("view_index", 0))
             n_px = count_part_pixels_in_overview(ov_img, vi, list(spec.selected_part_ids))
             if n_px == 0:

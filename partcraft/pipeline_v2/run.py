@@ -50,8 +50,8 @@ from . import services_cfg as psvc
 
 LOG = logging.getLogger("pipeline_v2")
 
-ALL_STEPS = ("s1", "s2", "sq1", "s4", "s5", "s5b", "s6p", "sq2", "sq3", "s6", "s6b")
-GPU_STEPS = frozenset({"s5", "s6p", "s6", "s6b"})
+ALL_STEPS = ("s1", "s2", "sq1", "s4", "s5", "s5b", "s6p", "s6p_del", "s6p_flux", "sq2", "sq3", "s6", "s6b")
+GPU_STEPS = frozenset({"s5", "s6p", "s6p_flux", "s6", "s6b"})  # s6p_del is CPU/Blender only
 
 
 # ─────────────────── config + ctx resolution ─────────────────────────
@@ -85,16 +85,19 @@ def resolve_ctxs(
     if obj_ids:
         ids = obj_ids
     elif all_objs:
-        # First try existing object dirs (resume mode); if empty, fall
-        # back to discovering from input npz under mesh_root/<shard>/.
-        ids = []
-        if root.shard_dir(shard).is_dir():
-            ids = [d.name for d in sorted(root.shard_dir(shard).iterdir())
-                   if d.is_dir()]
-        if not ids:
-            mesh_shard = roots.mesh_root / shard
-            if mesh_shard.is_dir():
-                ids = sorted(p.stem for p in mesh_shard.glob("*.npz"))
+        # Always use mesh_root as the authoritative full set of objects for
+        # this shard, then union with any existing output dirs so that
+        # in-progress objects are never dropped on resume.
+        mesh_shard = roots.mesh_root / shard
+        mesh_ids = (
+            {p.stem for p in mesh_shard.glob("*.npz")}
+            if mesh_shard.is_dir() else set()
+        )
+        existing_ids = (
+            {d.name for d in root.shard_dir(shard).iterdir() if d.is_dir()}
+            if root.shard_dir(shard).is_dir() else set()
+        )
+        ids = sorted(mesh_ids | existing_ids)
     else:
         raise SystemExit("[CLI] one of --obj-ids or --all is required")
 
@@ -212,6 +215,17 @@ def run_step(
             "trellis_text_ckpt", "checkpoints/TRELLIS-text-xlarge")
         s6p_run(ctxs, blender=blender, ckpt=ckpt,
                 force=args.force, logger=log)
+
+    elif step == "s6p_del":
+        from .s6_preview import run_del as s6p_del_run
+        blender = resolve_blender_executable(cfg)
+        s6p_del_run(ctxs, blender=blender, force=args.force, logger=log)
+
+    elif step == "s6p_flux":
+        from .s6_preview import run_flux as s6p_flux_run
+        ckpt = psvc.image_edit_service(cfg).get(
+            "trellis_text_ckpt", "checkpoints/TRELLIS-text-xlarge")
+        s6p_flux_run(ctxs, ckpt=ckpt, force=args.force, logger=log)
 
     elif step == "s6":
         from .s6_render_3d import run as s6_run
@@ -486,6 +500,7 @@ def main():
 _STATUS_KEYS = {
     "s1": "s1_phase1", "s2": "s2_highlights", "s4": "s4_flux_2d",
     "s5": "s5_trellis", "s5b": "s5b_del_mesh", "s6p": "s6p_preview",
+    "s6p_del": "s6p_del", "s6p_flux": "s6p_flux",
     "s6": "s6_render_3d", "s6b": "s6b_del_reencode",
     "sq1": "sq1_qc_A", "sq2": "sq2_qc_C", "sq3": "sq3_qc_E",
 }

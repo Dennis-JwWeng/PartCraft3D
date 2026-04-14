@@ -137,9 +137,12 @@ def run(
         r = per_obj_results[ctx.obj_id]
         # If we did nothing for this object (already done) and it had any
         # flux specs, we still want to mark s4 done if all outputs exist.
+        # Gate-A-failed edits are intentionally skipped (no output produced),
+        # so exclude them from the presence check to avoid false FAIL status.
         all_present = all(
             ctx.edit_2d_output(s.edit_id).is_file()
             for s in iter_flux_specs(ctx)
+            if not is_edit_qc_failed(ctx, s.edit_id)
         )
         update_step(
             ctx, "s4_flux_2d",
