@@ -154,7 +154,7 @@ async def process_one(
     shard = SHARD
     mesh_npz  = MESH_ROOT   / shard / f"{obj_id}.npz"
     img_npz   = IMAGES_ROOT / shard / f"{obj_id}.npz"
-    ov_path   = OVERVIEWS_ROOT / shard / obj_id / "overview.png"
+    ov_path   = OVERVIEWS_ROOT / "objects" / shard / obj_id / "phase1" / "overview.png"
     out_dir   = out_base / "objects" / shard / obj_id / "phase1"
     out_dir.mkdir(parents=True, exist_ok=True)
     result_path = out_dir / "edit_status.json"
