@@ -43,7 +43,7 @@ import yaml
 
 from .paths import (DatasetRoots, PipelineRoot, ObjectContext, normalize_shard,
                       resolve_blender_executable)
-from .status import rebuild_manifest, manifest_summary, step_done
+from .status import rebuild_manifest, manifest_summary, step_done, load_status
 from .edit_status_io import build_prereq_map
 from .validators import apply_check
 from . import scheduler as sched
@@ -426,11 +426,7 @@ def main():
         _done_statuses = {"ok", "skip"}
         _pending = 0
         for _c in ctxs:
-            _sf = _c.dir / "status.json"
-            if not _sf.exists():
-                _pending += 1
-                continue
-            _step_data = json.loads(_sf.read_text()).get("steps", {})
+            _step_data = (load_status(_c).get("steps") or {})
             if any(_step_data.get(_step_to_status_key(_s), {}).get("status")
                    not in _done_statuses for _s in _cp_steps):
                 _pending += 1

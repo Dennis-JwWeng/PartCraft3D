@@ -183,6 +183,78 @@ stop_flux() {
 cleanup_all() { stop_vlm; stop_flux; }
 trap cleanup_all EXIT
 
+# ─── terminal error visualization ────────────────────────────────────
+
+# ANSI colour codes (disabled automatically when not a tty)
+if [ -t 1 ]; then
+    _RED='[0;31m'; _YEL='[1;33m'; _CYN='[0;36m'
+    _GRN='[0;32m'; _BOLD='[1m';   _RST='[0m'
+else
+    _RED=''; _YEL=''; _CYN=''; _GRN=''; _BOLD=''; _RST=''
+fi
+
+# show_stage_errors <log_file> <stage_name>
+# Dumps the tail of a failed stage's log with coloured error highlights.
+show_stage_errors() {
+    local log_file="$1" stage_name="$2"
+    [ -f "$log_file" ] || return
+
+    local width=70
+    local bar; bar=$(printf '%*s' "$width" '' | tr ' ' '─')
+
+    echo -e "${_RED}┌${bar}┐${_RST}"
+    printf "${_RED}│${_RST}  ${_BOLD}${_RED}STAGE FAILED: %-$((width-14))s${_RST}${_RED}│${_RST}
+" "$stage_name"
+    printf "${_RED}│${_RST}  log: %-$((width-7))s${_RED}│${_RST}
+" "$log_file"
+    echo -e "${_RED}├${bar}┤${_RST}"
+
+    # Print last 60 lines; highlight ERROR/Traceback/Exception in red
+    tail -60 "$log_file" | while IFS= read -r line; do
+        if echo "$line" | grep -qE '(Traceback|TypeError|Error:|Exception:|FAILED|exit=[^0])'; then
+            printf "${_RED}│${_RST}  ${_RED}%s${_RST}
+" "$line"
+        elif echo "$line" | grep -qE '(WARNING|warn)'; then
+            printf "${_RED}│${_RST}  ${_YEL}%s${_RST}
+" "$line"
+        else
+            printf "${_RED}│${_RST}  %s
+" "$line"
+        fi
+    done
+
+    echo -e "${_RED}└${bar}┘${_RST}"
+    echo
+}
+
+# _live_monitor <interval_sec> <log1> <name1> [<log2> <name2> ...]
+# Background heartbeat: every N seconds prints the last status line from
+# each parallel stage's log so the user sees progress without interleaving.
+_live_monitor() {
+    local interval="$1"; shift
+    local -a log_files names
+    while [ "$#" -ge 2 ]; do
+        log_files+=("$1"); names+=("$2"); shift 2
+    done
+
+    while true; do
+        sleep "$interval" || return
+        local ts; ts=$(date '+%H:%M:%S')
+        local i
+        for i in "${!log_files[@]}"; do
+            local lf="${log_files[$i]}" nm="${names[$i]}"
+            if [ -f "$lf" ]; then
+                local last; last=$(tail -1 "$lf" 2>/dev/null | sed 's/\[[0-9;]*m//g')
+                printf "${_CYN}[%s %-14s]${_RST} %s
+" "$ts" "$nm" "$last"
+            else
+                printf "${_CYN}[%s %-14s]${_RST} (waiting for log…)
+" "$ts" "$nm"
+            fi
+        done
+    done
+}
+
 # ─── per-phase invocation ────────────────────────────────────────────
 
 
@@ -202,14 +274,23 @@ print(dump_shell_env(cfg, stage_name='$stage'))
     echo
     echo "▶ Stage ${STAGE_NAME} — ${STAGE_DESC}  (steps=${STAGE_STEPS[*]} servers=${STAGE_SERVERS} use_gpus=${STAGE_USE_GPUS})"
 
-    # Pre-check: count objects with pending work before starting servers
+    # Pre-check: count objects with pending work before starting servers.
+    # If server_steps is defined, use it for the pending check — this avoids
+    # starting FLUX/VLM servers when only non-server steps (e.g. s5, s6p) remain.
     _SERVERS_STARTED=0
     if [ "$STAGE_SERVERS" != "none" ]; then
-        _PENDING=$(LIMIT="${LIMIT:-}" "$PY_PIPE" -m partcraft.pipeline_v2.run             --config "$CFG" --shard "${TAG#shard}" --all             --stage "$stage" --count-pending 2>/dev/null || echo 1)
-        if [ "${_PENDING}" = "0" ]; then
-            echo "[scheduler] stage $stage: all objects already complete — skipping server startup"
+        if [ ${#STAGE_SERVER_STEPS[@]} -gt 0 ]; then
+            _SERVER_STEPS_CSV=$(IFS=','; echo "${STAGE_SERVER_STEPS[*]}")
+            _PENDING=$(LIMIT="${LIMIT:-}" "$PY_PIPE" -m partcraft.pipeline_v2.run                 --config "$CFG" --shard "${TAG#shard}" --all                 --steps "$_SERVER_STEPS_CSV" --count-pending 2>/dev/null || echo 1)
+            _PENDING_MSG="(server_steps: ${STAGE_SERVER_STEPS[*]})"
         else
-            echo "[scheduler] stage $stage: ${_PENDING} objects pending"
+            _PENDING=$(LIMIT="${LIMIT:-}" "$PY_PIPE" -m partcraft.pipeline_v2.run                 --config "$CFG" --shard "${TAG#shard}" --all                 --stage "$stage" --count-pending 2>/dev/null || echo 1)
+            _PENDING_MSG=""
+        fi
+        if [ "${_PENDING}" = "0" ]; then
+            echo "[scheduler] stage $stage: server steps all complete — skipping server startup ${_PENDING_MSG}"
+        else
+            echo "[scheduler] stage $stage: ${_PENDING} objects pending ${_PENDING_MSG}"
             case "$STAGE_SERVERS" in
                 vlm)  start_vlm  && _SERVERS_STARTED=1 ;;
                 flux) start_flux && _SERVERS_STARTED=1 ;;
@@ -259,26 +340,38 @@ run_parallel_group() {
 
     local pids=() names=("$@") _rc=0 _any_fail=0
     echo
-    echo "▶ Parallel group [${names[*]}] — launching"
+    echo -e "${_BOLD}▶ Parallel group [${names[*]}] — launching${_RST}"
     for _stage in "${names[@]}"; do
         run_pipeline_stage "$_stage" >/dev/null &
         pids+=($!)
-        echo "  ${_stage} → PID ${pids[-1]}"
+        echo -e "  ${_CYN}${_stage}${_RST} → PID ${pids[-1]}"
     done
+
+    # Background heartbeat — one status line per stage every 15 s
+    local _monitor_args=()
+    for _stage in "${names[@]}"; do
+        _monitor_args+=("$LOG_DIR/stage_${_stage}.log" "$_stage")
+    done
+    _live_monitor 15 "${_monitor_args[@]}" &
+    local _monitor_pid=$!
 
     for _i in "${!pids[@]}"; do
         _rc=0
         wait "${pids[$_i]}" || _rc=$?
         if [ "$_rc" -ne 0 ]; then
-            echo "[scheduler] stage ${names[$_i]} FAILED (exit=$_rc)"
+            echo -e "${_RED}[scheduler] stage ${names[$_i]} FAILED (exit=$_rc)${_RST}"
+            show_stage_errors "$LOG_DIR/stage_${names[$_i]}.log" "${names[$_i]}"
             _any_fail=$_rc
         else
-            echo "[scheduler] stage ${names[$_i]} OK"
+            echo -e "${_GRN}[scheduler] stage ${names[$_i]} OK${_RST}"
         fi
     done
 
+    kill "$_monitor_pid" 2>/dev/null || true
+    wait "$_monitor_pid" 2>/dev/null || true
+
     if [ "$_any_fail" -ne 0 ]; then
-        echo "[scheduler] parallel group [${names[*]}] had failures — aborting"
+        echo -e "${_RED}[scheduler] parallel group [${names[*]}] had failures — aborting${_RST}"
         exit "$_any_fail"
     fi
 }

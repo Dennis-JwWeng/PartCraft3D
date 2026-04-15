@@ -79,6 +79,66 @@ def _gate_status(gate_dict: dict | None) -> str | None:
     return "pass"
 
 
+def _load_qc_for_backfill(ctx: ObjectContext) -> dict:
+    """Prefer legacy qc.json when present; fallback to qc_io view."""
+    if ctx.qc_path.is_file():
+        try:
+            return json.loads(ctx.qc_path.read_text())
+        except Exception:
+            pass
+    return load_qc(ctx)
+
+
+def _load_legacy_status_steps(ctx: ObjectContext) -> dict[str, dict]:
+    """Load legacy status.json steps if available."""
+    p = ctx.status_path
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+        steps = data.get("steps") or {}
+        return steps if isinstance(steps, dict) else {}
+    except Exception:
+        return {}
+
+
+def _merge_steps(
+    existing: dict[str, dict],
+    incoming: dict[str, dict],
+    *,
+    force: bool,
+) -> tuple[dict[str, dict], int]:
+    """Merge legacy step entries into edit_status steps."""
+    out = {} if force else dict(existing or {})
+    wrote = 0
+    if force:
+        for k, v in (incoming or {}).items():
+            if isinstance(v, dict):
+                out[k] = dict(v)
+                wrote += 1
+        return out, wrote
+
+    for k, v in (incoming or {}).items():
+        if not isinstance(v, dict):
+            continue
+        cur = out.get(k)
+        if cur is None:
+            out[k] = dict(v)
+            wrote += 1
+            continue
+        # Fill missing subfields without overwriting fresh entries.
+        merged = dict(cur)
+        changed = False
+        for fk, fv in v.items():
+            if fk not in merged:
+                merged[fk] = fv
+                changed = True
+        if changed:
+            out[k] = merged
+            wrote += 1
+    return out, wrote
+
+
 # ─────────────────── per-edit inference ───────────────────────────────
 
 def _infer_stages(
@@ -188,7 +248,7 @@ def backfill_object(
     logger: logging.Logger,
 ) -> tuple[int, int]:
     """Rebuild edit_status.json for one object. Returns (n_written, n_skipped)."""
-    qc = load_qc(ctx)
+    qc = _load_qc_for_backfill(ctx)
     qc_edits = qc.get("edits") or {}
     qc_ts = qc.get("updated") or _now_iso()
 
@@ -200,17 +260,32 @@ def backfill_object(
     # Non-addition edits via iter_all_specs
     for spec in iter_all_specs(ctx):
         edit_id = spec.edit_id
-        if edit_id in new_edits and not force:
-            n_skipped += 1
-            continue
-
-        stages = _infer_stages(
+        inferred = _infer_stages(
             ctx, edit_id, spec.edit_type,
             qc_edits.get(edit_id), qc_ts,
         )
-        if stages:
-            new_edits[edit_id] = {"edit_type": spec.edit_type, "stages": stages}
-            n_written += 1
+        if not inferred:
+            continue
+
+        if edit_id in new_edits and not force:
+            cur = dict(new_edits[edit_id])
+            cur_stages = dict(cur.get("stages") or {})
+            wrote_any = False
+            for sk, sv in inferred.items():
+                if sk not in cur_stages:
+                    cur_stages[sk] = sv
+                    wrote_any = True
+            if wrote_any:
+                cur["edit_type"] = cur.get("edit_type") or spec.edit_type
+                cur["stages"] = cur_stages
+                new_edits[edit_id] = cur
+                n_written += 1
+            else:
+                n_skipped += 1
+            continue
+
+        new_edits[edit_id] = {"edit_type": spec.edit_type, "stages": inferred}
+        n_written += 1
 
     # Addition edits discovered from edits_3d/add_*/meta.json
     if ctx.edits_3d_dir.is_dir():
@@ -220,23 +295,43 @@ def backfill_object(
             if not (add_dir / "meta.json").is_file():
                 continue
             add_id = add_dir.name
-            if add_id in new_edits and not force:
-                n_skipped += 1
-                continue
 
-            stages = _infer_addition_stages(
+            inferred = _infer_addition_stages(
                 ctx, add_id, qc_edits.get(add_id), qc_ts,
             )
-            if stages:
-                new_edits[add_id] = {"edit_type": "addition", "stages": stages}
-                n_written += 1
+            if not inferred:
+                continue
+
+            if add_id in new_edits and not force:
+                cur = dict(new_edits[add_id])
+                cur_stages = dict(cur.get("stages") or {})
+                wrote_any = False
+                for sk, sv in inferred.items():
+                    if sk not in cur_stages:
+                        cur_stages[sk] = sv
+                        wrote_any = True
+                if wrote_any:
+                    cur["edit_type"] = cur.get("edit_type") or "addition"
+                    cur["stages"] = cur_stages
+                    new_edits[add_id] = cur
+                    n_written += 1
+                else:
+                    n_skipped += 1
+                continue
+
+            new_edits[add_id] = {"edit_type": "addition", "stages": inferred}
+            n_written += 1
+
+    legacy_steps = _load_legacy_status_steps(ctx)
+    merged_steps, n_steps_written = _merge_steps(es.get("steps") or {}, legacy_steps, force=force)
 
     es["obj_id"] = ctx.obj_id
     es["shard"] = ctx.shard
     es["schema_version"] = SCHEMA_VERSION
     es["edits"] = new_edits
+    es["steps"] = merged_steps
     save_edit_status(ctx, es)
-    return n_written, n_skipped
+    return n_written + n_steps_written, n_skipped
 
 
 # ─────────────────── CLI ───────────────────────────────────────────────

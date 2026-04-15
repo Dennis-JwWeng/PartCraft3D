@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable
 
 from .paths import ObjectContext
-from .qc_io import is_edit_qc_failed, is_gate_a_failed
+from .qc_io import load_qc, is_edit_qc_failed, is_gate_a_failed
 from .specs import iter_all_specs, iter_deletion_specs, iter_flux_specs
 from .status import (
     STATUS_OK, STATUS_FAIL, STATUS_SKIP, load_status, save_status,
@@ -184,37 +184,67 @@ def check_s6p(ctx: ObjectContext) -> StepCheck:
 def check_s7(ctx: ObjectContext) -> StepCheck:
     return StepCheck(step="s7_add_backfill", ok=True, expected=0, found=0, skip=True)
 
+def check_s6p_del(ctx: ObjectContext) -> StepCheck:
+    """s6p_del tracks per-edit completion in edit_status.json and per-object status via
+    update_step().  A simple gate_a check is sufficient — the step itself is the authority
+    on which edits succeeded or were skipped."""
+    gate = _require_phase1("s6p_del", ctx)
+    if gate is not None:
+        return gate
+    return StepCheck(step="s6p_del", ok=True, expected=0, found=0, skip=True)
+
+
+def check_s6p_flux(ctx: ObjectContext) -> StepCheck:
+    """s6p_flux tracks per-edit completion in edit_status.json and per-object status via
+    update_step().  A simple gate_a check is sufficient — the step itself is the authority
+    on which edits succeeded or were skipped."""
+    gate = _require_phase1("s6p_flux", ctx)
+    if gate is not None:
+        return gate
+    return StepCheck(step="s6p_flux", ok=True, expected=0, found=0, skip=True)
+
+
 
 def check_sq1(ctx: ObjectContext) -> StepCheck:
     sc = _require_phase1("sq1_qc_A", ctx)
     if sc is not None:
         return sc   # s1 was skip → sq1 is n/a; missing parsed.json → fail
-    return _check_files("sq1_qc_A", [("qc.json", ctx.qc_path)])
+    from .specs import iter_all_specs
+
+    expected_ids = [sp.edit_id for sp in iter_all_specs(ctx)]
+    if not expected_ids:
+        return StepCheck(step="sq1_qc_A", ok=True, expected=0, found=0, skip=True)
+
+    qc = load_qc(ctx)
+    edits = qc.get("edits") or {}
+    found = sum(1 for eid in expected_ids if (edits.get(eid, {}).get("gates") or {}).get("A") is not None)
+    return StepCheck(step="sq1_qc_A", ok=(found == len(expected_ids)),
+                     expected=len(expected_ids), found=found,
+                     missing=[] if found == len(expected_ids) else ["gate_A_not_written"])
 
 def check_sq2(ctx: ObjectContext) -> StepCheck:
     from .specs import iter_flux_specs
     if not any(True for _ in iter_flux_specs(ctx)):
         return StepCheck(step="sq2_qc_C", ok=True, expected=0, found=0, skip=True)
-    return _check_files("sq2_qc_C", [("qc.json", ctx.qc_path)])
+    qc = load_qc(ctx)
+    edits = qc.get("edits") or {}
+    flux_ids = {sp.edit_id for sp in iter_flux_specs(ctx)}
+    if not flux_ids:
+        return StepCheck(step="sq2_qc_C", ok=True, expected=0, found=0, skip=True)
+    found = sum(1 for eid in flux_ids if (edits.get(eid, {}).get("gates") or {}).get("C") is not None)
+    return StepCheck(step="sq2_qc_C", ok=(found == len(flux_ids)),
+                     expected=len(flux_ids), found=found,
+                     missing=[] if found == len(flux_ids) else ["gate_C_not_written"])
 
 def check_sq3(ctx: ObjectContext) -> StepCheck:
-    sc = _check_files("sq3_qc_E", [("qc.json", ctx.qc_path)])
-    if not sc.ok:
-        return sc
-    # Extra: verify at least one edit actually has gate E filled in.
-    try:
-        edits = json.loads(ctx.qc_path.read_text()).get("edits") or {}
-        has_gate_e = any(
-            (e.get("gates") or {}).get("E") is not None
-            for e in edits.values()
-        )
-        if edits and not has_gate_e:
-            return StepCheck(step="sq3_qc_E", ok=False,
-                             expected=len(edits), found=0,
-                             missing=["gate_E_not_written"])
-    except Exception:
-        pass
-    return sc
+    qc = load_qc(ctx)
+    edits = qc.get("edits") or {}
+    if not edits:
+        return StepCheck(step="sq3_qc_E", ok=True, expected=0, found=0, skip=True)
+    found = sum(1 for e in edits.values() if (e.get("gates") or {}).get("E") is not None)
+    return StepCheck(step="sq3_qc_E", ok=(found == len(edits)),
+                     expected=len(edits), found=found,
+                     missing=[] if found == len(edits) else ["gate_E_not_written"])
 
 
 VALIDATORS: dict[str, Callable[[ObjectContext], StepCheck]] = {
@@ -224,6 +254,8 @@ VALIDATORS: dict[str, Callable[[ObjectContext], StepCheck]] = {
     "s5":  check_s5,
     "s5b": check_s5b,
     "s6p": check_s6p,
+    "s6p_del": check_s6p_del,
+    "s6p_flux": check_s6p_flux,
     "s6":  check_s6,
     "s6b": check_s6b,
     "s7":  check_s7,    # no-op: s7 backfill moved to s5b

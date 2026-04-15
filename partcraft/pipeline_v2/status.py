@@ -1,34 +1,9 @@
-"""Per-object status.json + global manifest rebuild.
+"""Per-object step status backed by edit_status.json.
 
-``status.json`` lives at ``ObjectContext.status_path`` and tracks which
-pipeline steps have run for that object. It is the single source of
-truth for resume / skip logic — orchestration never relies on a separate
-cache directory.
-
-Schema (all keys optional, missing = not run)::
-
-    {
-      "obj_id": "...",
-      "shard": "01",
-      "steps": {
-        "s1_phase1":     {"status": "ok", "n_edits": 17, "ts": "2026-04-07T..."},
-        "s2_highlights": {"status": "ok", "n": 17},
-        "s4_flux_2d":    {"status": "ok", "n": 11, "fail": 0},
-        "s5_trellis":    {"status": "ok", "n": 11, "fail": 0},
-        "s6_render_3d":  {"status": "ok", "n": 22},
-        "s5b_del_mesh":  {"status": "pending"},
-        ...
-      },
-      "updated": "2026-04-07T..."
-    }
-
-Atomic writes: write to ``status.json.tmp`` then ``os.replace`` so a
-crash mid-write never leaves a half-file.
-
-The global manifest at ``PipelineRoot.manifest_path`` is a derived view:
-one line per object, regenerated from all ``status.json``s on demand.
-It is never updated incrementally — always rebuilt with
-:func:`rebuild_manifest`.
+This module keeps the legacy status API (`load_status`, `update_step`,
+`step_done`, `rebuild_manifest`) but stores data inside
+``edit_status.json`` as top-level ``steps``. This makes ``edit_status.json``
+the single source of truth for both per-edit and per-step orchestration.
 """
 from __future__ import annotations
 
@@ -41,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .paths import ObjectContext, PipelineRoot, normalize_shard
+from .paths import ObjectContext, PipelineRoot
 
 STATUS_OK = "ok"
 STATUS_FAIL = "fail"
@@ -53,17 +28,39 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _es_path(ctx: ObjectContext) -> Path:
+    return ctx.dir / "edit_status.json"
+
+
+def _load_edit_status(ctx: ObjectContext) -> dict[str, Any]:
+    from .edit_status_io import load_edit_status as _canonical_load
+    data = _canonical_load(ctx)
+    data.setdefault("steps", {})
+    return data
+
+
+def _save_edit_status(ctx: ObjectContext, data: dict[str, Any]) -> None:
+    data["obj_id"] = ctx.obj_id
+    data["shard"] = ctx.shard
+    data.setdefault("schema_version", 2)
+    data["updated"] = _now()
+    ctx.dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".es.", suffix=".tmp", dir=str(ctx.dir))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _es_path(ctx))
+    except Exception:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 @contextmanager
 def _status_lock(ctx: ObjectContext):
-    """Per-object exclusive lock for status.json read-modify-write operations.
-
-    Uses fcntl.lockf (POSIX record lock, F_SETLKW) on a companion .lock file.
-    POSIX record locks are NFS-safe via the NLM protocol. The kernel releases
-    the lock automatically if the holder process exits or crashes.
-    """
+    """Per-object exclusive lock for edit_status read-modify-write."""
     import threading
 
-    lock_path = ctx.dir / "status.json.lock"
+    lock_path = ctx.dir / "edit_status.json.lock"
     ctx.dir.mkdir(parents=True, exist_ok=True)
     key = str(lock_path.resolve())
     if not hasattr(_status_lock, "_thread_mutexes"):
@@ -80,36 +77,21 @@ def _status_lock(ctx: ObjectContext):
 
 
 def load_status(ctx: ObjectContext) -> dict[str, Any]:
-    """Read status.json. Returns empty skeleton if absent."""
-    if ctx.status_path.is_file():
-        try:
-            return json.loads(ctx.status_path.read_text())
-        except json.JSONDecodeError:
-            pass
+    """Read step-level status from edit_status.json."""
+    es = _load_edit_status(ctx)
     return {
         "obj_id": ctx.obj_id,
         "shard": ctx.shard,
-        "steps": {},
-        "updated": None,
+        "steps": es.get("steps") or {},
+        "updated": es.get("updated"),
     }
 
 
 def save_status(ctx: ObjectContext, status: dict[str, Any]) -> None:
-    """Atomic write to status.json."""
-    status["obj_id"] = ctx.obj_id
-    status["shard"] = ctx.shard
-    status["updated"] = _now()
-    ctx.dir.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(
-        prefix=".status.", suffix=".tmp", dir=str(ctx.dir)
-    )
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(status, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, ctx.status_path)
-    except Exception:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+    """Persist step-level status into edit_status.json."""
+    es = _load_edit_status(ctx)
+    es["steps"] = dict(status.get("steps") or {})
+    _save_edit_status(ctx, es)
 
 
 def update_step(
@@ -119,7 +101,7 @@ def update_step(
     status: str = STATUS_OK,
     **fields: Any,
 ) -> dict[str, Any]:
-    """Read-modify-write a single step entry (process-safe via lockf + threading.Lock)."""
+    """Read-modify-write one step entry (process-safe)."""
     with _status_lock(ctx):
         s = load_status(ctx)
         s.setdefault("steps", {})[step] = {
@@ -130,7 +112,7 @@ def update_step(
 
 
 def step_done(ctx: ObjectContext, step: str) -> bool:
-    """True iff status.json marks ``step`` as ``ok``."""
+    """True iff the step is marked as ok."""
     s = load_status(ctx)
     return (s.get("steps") or {}).get(step, {}).get("status") == STATUS_OK
 
@@ -139,14 +121,8 @@ def needs_step(ctx: ObjectContext, step: str, *, force: bool = False) -> bool:
     return force or not step_done(ctx, step)
 
 
-# ─────────────────── global manifest (derived) ────────────────────────
-
 def rebuild_manifest(root: PipelineRoot) -> Path:
-    """Scan all ``objects/<shard>/<obj>/status.json`` and rewrite the
-    global manifest at ``_global/manifest.jsonl``.
-
-    Each line: ``{"shard": ..., "obj_id": ..., "steps": {...}}``.
-    """
+    """Rebuild global manifest from edit_status-backed steps."""
     root.ensure()
     lines: list[str] = []
     if root.objects_root.is_dir():
@@ -165,10 +141,6 @@ def rebuild_manifest(root: PipelineRoot) -> Path:
                     "steps": s.get("steps") or {},
                     "updated": s.get("updated"),
                 }, ensure_ascii=False))
-    # Use a per-process tmp name to avoid races when multiple GPU workers
-    # call rebuild_manifest concurrently (fixed name causes FileNotFoundError
-    # when os.replace removes the tmp before another worker can rename it).
-    import tempfile
     fd, tmp_str = tempfile.mkstemp(
         suffix=".jsonl.tmp", dir=str(root.manifest_path.parent)
     )

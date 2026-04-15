@@ -38,8 +38,8 @@ sys.path.insert(0, str(_ROOT / "third_party"))
 
 from .paths import ObjectContext
 from .specs import VIEW_INDICES
-from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
-from .edit_status_io import edit_needs_step, update_edit_stage
+from .status import update_step, STATUS_OK, STATUS_FAIL
+from .edit_status_io import edit_needs_step, update_edit_stage, obj_needs_stage
 
 
 @dataclass
@@ -206,8 +206,12 @@ def run(
     pipeline = _build_pipeline(ckpt, log)
 
     results: list[Render3DResult] = []
+    from .specs import iter_flux_specs as _iter_flux_s6
     for ctx in list(ctxs):
-        if not force and step_done(ctx, "s6_render_3d"):
+        flux_ids = [sp.edit_id for sp in _iter_flux_s6(ctx)]
+        if flux_ids and not force and not obj_needs_stage(
+            ctx, flux_ids, "s6", prereq_map or {}, force=force
+        ):
             results.append(Render3DResult(ctx.obj_id))
             continue
         results.append(run_for_object(

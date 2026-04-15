@@ -81,18 +81,27 @@ def _es_path(ctx: ObjectContext) -> Path:
 
 def load_edit_status(ctx: ObjectContext) -> dict[str, Any]:
     p = _es_path(ctx)
-    if p.is_file():
-        try:
-            return json.loads(p.read_text())
-        except json.JSONDecodeError:
-            pass
-    return {
+    _empty: dict[str, Any] = {
         "obj_id": ctx.obj_id,
         "shard": ctx.shard,
         "schema_version": SCHEMA_VERSION,
         "updated": None,
         "edits": {},
     }
+    for _attempt in range(3):
+        try:
+            if not p.is_file():
+                return _empty
+            data = json.loads(p.read_text())
+            if isinstance(data, dict):
+                return data
+            return _empty
+        except json.JSONDecodeError:
+            return _empty
+        except OSError:
+            import time as _t
+            _t.sleep(0.5 * (_attempt + 1))
+    return _empty
 
 
 def save_edit_status(ctx: ObjectContext, data: dict[str, Any]) -> None:
@@ -194,6 +203,36 @@ def gate_already_done(
     return entry is not None and entry.get("status") in ("pass", "fail")
 
 
+def obj_needs_stage(
+    ctx: ObjectContext,
+    edit_ids: list[str],
+    stage_key: str,
+    prereq_map: dict[str, str | None],
+    *,
+    force: bool = False,
+) -> bool:
+    """Return True iff any edit in *edit_ids* needs *stage_key* processed.
+
+    Loads ``edit_status.json`` exactly once for the object, making this
+    efficient for per-object filtering before dispatching to a step runner.
+    Replicates the gate + force + own-status logic of :func:`edit_needs_step`.
+    """
+    es_edits = load_edit_status(ctx).get("edits", {})
+    prereq = prereq_map.get(stage_key)
+    for edit_id in edit_ids:
+        stages = es_edits.get(edit_id, {}).get("stages", {})
+        if prereq:
+            if not (edit_id.startswith("add_") and prereq == "gate_a"):
+                if stages.get(prereq, {}).get("status") != "pass":
+                    continue  # gate not passed → skip this edit
+        if force:
+            return True
+        own = stages.get(stage_key)
+        if own is None or own.get("status") == "error":
+            return True
+    return False
+
+
 # --- config-derived prerequisites ---
 
 def build_prereq_map(cfg: dict) -> dict[str, str | None]:
@@ -216,7 +255,7 @@ def build_prereq_map(cfg: dict) -> dict[str, str | None]:
 
 
 __all__ = [
-    "load_edit_status", "save_edit_status",
+    "load_edit_status", "save_edit_status", "obj_needs_stage",
     "update_edit_stage", "edit_needs_step", "gate_already_done",
     "build_prereq_map",
 ]

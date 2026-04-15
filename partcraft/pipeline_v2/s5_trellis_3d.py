@@ -45,9 +45,9 @@ from .paths import ObjectContext
 from . import services_cfg as psvc
 
 from .specs import EditSpec, iter_flux_specs
-from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
+from .status import update_step, STATUS_OK, STATUS_FAIL
 from .qc_io import is_edit_qc_failed, is_gate_a_failed
-from .edit_status_io import edit_needs_step, update_edit_stage
+from .edit_status_io import edit_needs_step, update_edit_stage, obj_needs_stage
 
 
 GPU_TYPES = frozenset({"modification", "scale", "material", "global"})
@@ -274,7 +274,10 @@ def run(
 
     results: list[Trellis3DResult] = []
     for ctx in list(ctxs):
-        if not force and step_done(ctx, "s5_trellis"):
+        edit_ids = [sp.edit_id for sp in iter_flux_specs(ctx)]
+        if edit_ids and not force and not obj_needs_stage(
+            ctx, edit_ids, "s5", prereq_map, force=force
+        ):
             results.append(Trellis3DResult(ctx.obj_id))
             continue
         results.append(run_for_object(

@@ -1,56 +1,78 @@
 #!/usr/bin/env python3
 """Pack PartVerse prerender outputs into PartCraft NPZ format.
 
-PartVerse layout (under ``PARTVERSE_DATA_ROOT`` / ``data/partverse/``) and
-where **per-part semantic text** lives:
+## Mesh NPZ format (two variants, both supported by partcraft_loader)
 
-1. ``source/text_captions.json``  (**唯一**按部件 ID 存自然语言描述)
-   - Top level: ``{ "<object_uuid>": { "<part_id>": [caption0, caption1, …], … }, … }``
-   - ``part_id`` 为字符串 ``"0"``, ``"1"``, …，与 ``face2label`` 里的部件整数 ID 一致。
-   - 每条 ``caption*`` 为一句/一段英文；通常 ``[0]`` 为短标题句，``[1+]`` 为更长 VLM 风格段落。
-   - ``pack_npz`` 用 ``_label_from_part_captions`` 取**第一条非空**字符串写入 NPZ 的 ``part_id_to_name``。
+**GLB format (new, preferred)** — produced when ``--textured-part-glbs-dir``
+and ``--normalized-glb-dir`` are provided:
+
+    full.glb       — raw bytes of the full textured GLB (Y-up, source coords)
+    part_N.glb     — raw bytes of each pre-split textured part GLB (Y-up)
+    vd_scale       — float64 scalar: uniform scale applied when converting to VD space
+    vd_offset      — float64[3] vector: offset applied after scale (in Y-up coords)
+
+The VD-space transform (Y-up → Z-up, bounding-box normalized to ``[-0.5, 0.5]³``)
+is **stored as metadata and applied lazily** by the reader (``partcraft_loader``,
+``refiner.build_part_mask``, ``overview.extract_parts``, ``s5b_deletion``).
+This eliminates the trimesh re-encode overhead at pack time — packing becomes
+a raw byte copy from the source GLBs.
+
+**PLY format (legacy fallback)** — produced when GLB sources are unavailable:
+
+    full.ply       — geometry-only mesh in VD space (vertex colors, no UV textures)
+    part_N.ply     — per-part PLY in VD space
+
+The PLY path preserves backward compatibility but loses UV texture information.
+
+## PartVerse source layout (under ``PARTVERSE_DATA_ROOT`` / ``data/partverse/``)
+
+1. ``source/text_captions.json``  — per-part semantic labels
+   - ``{ "<obj_id>": { "<part_id>": [caption0, …], … }, … }``
+   - ``part_id`` 是字符串 ``"0"`` 等，与 face2label 整数 ID 一致。
+   - ``[0]`` 为短标题句（管线 VLM prompt 使用），``[1+]`` 为更长段落。
 
 2. ``source/anno_infos/<uuid>/<uuid>_face2label.json``
-   - 仅 ``{ "<face_index>": <part_id_int>, … }``，**没有**文字语义；与 ``segmented.glb`` 面片一一对应。
+   - ``{ "<face_index>": <part_id_int>, … }`` — 与 segmented.glb 面片一一对应，无文字语义。
 
 3. ``source/anno_infos/<uuid>/<uuid>_info.json``
-   - 几何/顺序元数据（如 ``bboxes``, ``ordered_face_label``, ``weights`` 等），**不是**主要文本描述来源。
+   - 几何/顺序元数据（``bboxes``, ``ordered_face_label``, ``weights`` 等），非主要描述来源。
 
-4. ``normalized_glbs/<uuid>.glb``、``img_Enc/<uuid>/``
-   - 归一化整模与预渲染结果；语义标签仍来自 (1)。
+4. ``normalized_glbs/<uuid>.glb`` — full textured GLB (Y-up, source scale)
+5. ``textured_part_glbs/<uuid>/<N>.glb`` — pre-split textured parts (Y-up)
+6. ``img_Enc/<uuid>/`` — rendered views + ``transforms.json`` (scale / offset for VD space)
 
 Reads from:
-    source/anno_infos/{uuid}/{uuid}_segmented.glb — mesh for splitting (with part groups)
-    source/anno_infos/{uuid}/{uuid}_face2label.json — per-face → part_id (integers only)
-    img_Enc/{uuid}/                               — rendered views + transforms
-    source/text_captions.json                     — per-part text captions (semantic labels)
-    source/textured_part_glbs/{uuid}/<N>.glb      — pre-split textured part GLBs (optional)
-    source/normalized_glbs/{uuid}.glb             — full textured GLB (optional)
+    img_Enc/{uuid}/                               — rendered views + transforms.json
+    source/text_captions.json                     — per-part text captions
+    source/textured_part_glbs/{uuid}/<N>.glb      — pre-split textured part GLBs (GLB path)
+    source/normalized_glbs/{uuid}.glb             — full textured GLB (GLB path)
+    source/anno_infos/{uuid}/{uuid}_segmented.glb — coarse mesh (PLY fallback only)
+    source/anno_infos/{uuid}/{uuid}_face2label.json — per-face part IDs (PLY fallback only)
 
 Writes:
-    data/partverse/images/{shard}/{uuid}.npz      — render NPZ (pipeline input)
-    data/partverse/mesh/{shard}/{uuid}.npz        — mesh NPZ (pipeline input)
+    inputs/images/{shard}/{uuid}.npz  — render NPZ (pipeline input)
+    inputs/mesh/{shard}/{uuid}.npz    — mesh NPZ (pipeline input)
 
-Shard support mirrors prerender.py: --shard 00 --num-shards 10 processes
+Shard support mirrors prerender.py: ``--shard 00 --num-shards 10`` processes
 ~1203 objects of the 12030 total.
 
 Usage:
-    # Pack shard 00 of 10
-    python scripts/datasets/partverse/pack_npz.py --shard 00 --num-shards 10
+    # In-place repack shard 00 with GLB sources (preferred)
+    python scripts/datasets/partverse/pack_npz.py \\
+        --shard 00 --num-shards 10 --force --workers 8 \\
+        --data-root $DATA \\
+        --textured-part-glbs-dir $DATA/textured_part_glbs \\
+        --normalized-glb-dir $DATA/normalized_glbs \\
+        --mesh-out-dir $DATA/inputs/mesh/00
 
-    # Pack shard 01, skip already-packed objects
+    # Legacy PLY pack (no GLB sources)
     python scripts/datasets/partverse/pack_npz.py --shard 01 --num-shards 10
 
-    # Test: first 5 objects only
+    # Dry-run: first 5 objects only
     python scripts/datasets/partverse/pack_npz.py --limit 5
 
     # Re-pack everything (overwrite)
     python scripts/datasets/partverse/pack_npz.py --force
-
-    # Pack with GLB source data
-    python scripts/datasets/partverse/pack_npz.py --limit 5 \\
-        --textured-part-glbs-dir $DATA_ROOT/source/textured_part_glbs \\
-        --normalized-glb-dir $DATA_ROOT/source/normalized_glbs
 """
 
 import argparse

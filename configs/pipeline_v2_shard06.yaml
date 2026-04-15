@@ -23,49 +23,42 @@ pipeline:
   flux_port_base: 8028
   flux_port_stride: 1
   stages:
-  - name: A
+  - name: gate_a
     desc: phase1 VLM + QC-A
     servers: vlm
     steps:
     - s1
     - sq1
-  - name: C
-    desc: FLUX 2D
+  - name: flux_branch
+    desc: FLUX 2D + TRELLIS 3D + flux preview
     servers: flux
     steps:
     - s4
-  - name: D
-    desc: TRELLIS 3D edit
-    servers: none
-    steps:
     - s5
+    - s6p_flux
+    server_steps:
+    - s4
     use_gpus: true
-    parallel_group: D+D2
-  - name: D2
+    parallel_group: branches_after_gate_a
+  - name: del_branch
     desc: deletion GLB masking + del/add preview (Blender, CPU)
     servers: none
     steps:
     - s5b
     - s6p_del
-    parallel_group: D+D2
-  - name: E_pre
-    desc: TRELLIS-based 5-view preview (mod/scl/mat/glb)
-    servers: none
-    steps:
-    - s6p_flux
-    use_gpus: true
-  - name: E_qc
+    parallel_group: branches_after_gate_a
+  - name: gate_e_qc
     desc: QC-E final (all types)
     servers: vlm
     steps:
     - sq3
-  - name: E_encode
+  - name: gate_e_encode
     desc: deletion GLB encode (40 views -> after.npz)
     servers: none
     steps:
     - s6b
     use_gpus: true
-  - name: E_render
+  - name: gate_e_render
     desc: 3D report render (mod/scl/mat/glb only, optional)
     servers: none
     steps:

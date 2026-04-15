@@ -25,6 +25,7 @@ class Phase:
     desc: str = ""
     servers: str = "none"          # "vlm" | "flux" | "none"
     steps: list[str] = field(default_factory=list)
+    server_steps: list[str] = field(default_factory=list)  # subset of steps that need the server; empty → all steps
     use_gpus: bool = False
     optional: bool = False
     parallel_group: str = ""       # non-empty → run concurrently with same-group stages
@@ -111,6 +112,7 @@ def stages_for(cfg: dict) -> list[Phase]:
             desc=str(entry.get("desc", "")),
             servers=str(entry.get("servers", "none")),
             steps=list(entry.get("steps") or []),
+            server_steps=list(entry.get("server_steps") or []),
             use_gpus=bool(entry.get("use_gpus", False)),
             optional=bool(entry.get("optional", False)),
             parallel_group=str(entry.get("parallel_group", "")),
@@ -159,25 +161,32 @@ def dump_stage_batches(
     by_name = {ph.name: ph for ph in stages_for(cfg)}
     batches: list[list[str]] = []
     group_to_idx: dict[str, int] = {}   # parallel_group → index in batches
+    group_server_count: dict[str, int] = {}  # parallel_group → stages needing servers
 
     for name in stage_names:
         ph = by_name.get(name)
         group = (ph.parallel_group if ph else "") or ""
-        # Fall back to serial if stage needs external servers (safety guard)
-        if group and ph and ph.servers != "none":
+        needs_servers = bool(ph and ph.servers != "none")
+        # Safety guard: allow at most one server-backed stage per parallel group.
+        # This enables "server stage + CPU/GPU-only stage" concurrency while
+        # avoiding duplicate external server startups in the same group.
+        if group and needs_servers and group_server_count.get(group, 0) >= 1:
             logging.getLogger("scheduler").warning(
-                "[scheduler] stage %s is in parallel_group %r but servers=%r "
-                "— running serially",
+                "[scheduler] stage %s is in parallel_group %r with servers=%r "
+                "but that group already has a server-backed stage — running serially",
                 name, group, ph.servers,
             )
             group = ""
         if group and group in group_to_idx:
             batches[group_to_idx[group]].append(name)
+            if needs_servers:
+                group_server_count[group] = group_server_count.get(group, 0) + 1
         else:
             idx = len(batches)
             batches.append([name])
             if group:
                 group_to_idx[group] = idx
+                group_server_count[group] = 1 if needs_servers else 0
 
     return batches
 
@@ -212,6 +221,7 @@ def dump_shell_env(
             f"STAGE_DESC={ph.desc!r}",
             f"STAGE_SERVERS={ph.servers}",
             f"STAGE_STEPS=({' '.join(ph.steps)})",
+            f"STAGE_SERVER_STEPS=({' '.join(ph.server_steps)})",
             f"STAGE_USE_GPUS={1 if ph.use_gpus else 0}",
             f"STAGE_OPTIONAL={1 if ph.optional else 0}",
         ]

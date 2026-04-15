@@ -45,9 +45,9 @@ sys.path.insert(0, str(_ROOT / "third_party"))
 
 from .paths import ObjectContext
 from .specs import VIEW_INDICES
-from .status import update_step, STATUS_OK, STATUS_FAIL, step_done
+from .status import update_step, STATUS_OK, STATUS_FAIL
 from .qc_io import is_gate_a_failed
-from .edit_status_io import edit_needs_step, update_edit_stage
+from .edit_status_io import edit_needs_step, update_edit_stage, obj_needs_stage
 
 
 @dataclass
@@ -454,9 +454,15 @@ def run(
              os.environ.get("CUDA_VISIBLE_DEVICES"))
 
     ctx_list = list(ctxs)
-    # Filter out already-done objects
-    pending = [c for c in ctx_list
-               if force or not step_done(c, "s6p_preview")]
+    # Filter using per-edit status (authoritative)
+    from .specs import iter_flux_specs, iter_deletion_specs
+    def _s6p_obj_pending(c):
+        flux_ids = [sp.edit_id for sp in iter_flux_specs(c)]
+        del_ids  = [sp.edit_id for sp in iter_deletion_specs(c)]
+        add_ids  = [aid for aid, _ in _iter_add_edits(c)]
+        all_ids  = flux_ids + del_ids + add_ids
+        return not all_ids or obj_needs_stage(c, all_ids, "s6p", prereq_map or {}, force=force)
+    pending = [c for c in ctx_list if force or _s6p_obj_pending(c)]
     pending_set = set(pending)
     done = [c for c in ctx_list if c not in pending_set]
 
@@ -488,6 +494,7 @@ def run_del_for_object(
     *,
     blender: str,
     resolution: int = 518,
+    prereq_map: dict[str, str | None] | None = None,
     force: bool = False,
     cuda_device: str | None = None,
     progress_bar=None,
@@ -502,7 +509,15 @@ def run_del_for_object(
     log = logger or logging.getLogger("pipeline_v2.s6p_del")
     res = PreviewResult(obj_id=ctx.obj_id)
 
-    if not force and step_done(ctx, "s6p_del"):
+    # Per-edit gate check: skip object only if no del/add edits need s6p
+    from .specs import iter_deletion_specs as _iter_del_specs
+    _del_add_ids = (
+        [sp.edit_id for sp in _iter_del_specs(ctx)]
+        + [aid for aid, _ in _iter_add_edits(ctx)]
+    )
+    if _del_add_ids and not force and not obj_needs_stage(
+        ctx, _del_add_ids, "s6p", prereq_map or {}, force=force
+    ):
         return res
 
     if ctx.image_npz is None or not ctx.image_npz.is_file():
@@ -627,7 +642,12 @@ def run_flux_for_object(
     log = logger or logging.getLogger("pipeline_v2.s6p_flux")
     res = PreviewResult(obj_id=ctx.obj_id)
 
-    if not force and step_done(ctx, "s6p_flux"):
+    # Per-edit gate check: skip object only if no flux edits need s6p
+    from .specs import iter_flux_specs as _iter_flux_specs_inner
+    _flux_ids = [sp.edit_id for sp in _iter_flux_specs_inner(ctx)]
+    if _flux_ids and not force and not obj_needs_stage(
+        ctx, _flux_ids, "s6p", prereq_map or {}, force=force
+    ):
         return res
 
     if ctx.image_npz is None or not ctx.image_npz.is_file():
@@ -734,7 +754,12 @@ def run_del(
     log.info("[s6p_del] n_workers=%d  gpus=%s", effective_workers, gpus)
 
     ctx_list = list(ctxs)
-    pending = [c for c in ctx_list if force or not step_done(c, "s6p_del")]
+    from .specs import iter_deletion_specs as _iter_del_specs_outer
+    def _del_obj_pending(c):
+        ids = ([sp.edit_id for sp in _iter_del_specs_outer(c)]
+               + [aid for aid, _ in _iter_add_edits(c)])
+        return not ids or obj_needs_stage(c, ids, "s6p", prereq_map or {}, force=force)
+    pending = [c for c in ctx_list if force or _del_obj_pending(c)]
     done_results = [PreviewResult(c.obj_id) for c in ctx_list if c not in set(pending)]
 
     # --- pre-scan: count total pending edits for accurate progress bar ---
@@ -818,7 +843,11 @@ def run_flux(
     log = logger or logging.getLogger("pipeline_v2.s6p_flux")
     log.info("[s6p_flux] CUDA_VISIBLE_DEVICES=%s", os.environ.get("CUDA_VISIBLE_DEVICES"))
     ctx_list = list(ctxs)
-    pending = [c for c in ctx_list if force or not step_done(c, "s6p_flux")]
+    from .specs import iter_flux_specs as _iter_flux_outer
+    def _flux_obj_pending(c):
+        ids = [sp.edit_id for sp in _iter_flux_outer(c)]
+        return not ids or obj_needs_stage(c, ids, "s6p", prereq_map or {}, force=force)
+    pending = [c for c in ctx_list if force or _flux_obj_pending(c)]
     pipeline = None
     if _has_trellis_edits(pending):
         pipeline = _build_pipeline(ckpt, log)
