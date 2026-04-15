@@ -1467,7 +1467,8 @@ def parse_align_gate_output(raw: str) -> dict | None:
         return None
     if not isinstance(d.get("aligned"), bool):
         return None
-    if not isinstance(d.get("best_view"), int):
-        d["best_view"] = 0   # safe default
+    bv = d.get("best_view")
+    if not (type(bv) is int):
+        d["best_view"] = 0   # safe default; also coerces bool true/false from model
     return d
 
