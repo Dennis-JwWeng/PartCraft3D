@@ -116,3 +116,37 @@ pipeline:
     - {name: D2, servers: none, steps: [s5b]}
 """)
     assert dump_stage_batches(cfg_no_group, ["D", "D2"]) == [["D"], ["D2"]]
+
+
+def test_dump_stage_batches_allows_one_server_stage_per_group():
+    """A group may contain one server-backed stage plus non-server stages."""
+    import yaml
+    from partcraft.pipeline_v2.scheduler import dump_stage_batches
+
+    cfg = yaml.safe_load("""
+pipeline:
+  stages:
+    - {name: gate_a, servers: vlm, steps: [s1, sq1]}
+    - {name: flux_branch, servers: flux, steps: [s4], parallel_group: branches}
+    - {name: del_branch, servers: none, steps: [s5b], parallel_group: branches}
+    - {name: gate_e_qc, servers: vlm, steps: [sq3]}
+""")
+
+    result = dump_stage_batches(cfg, ["gate_a", "flux_branch", "del_branch", "gate_e_qc"])
+    assert result == [["gate_a"], ["flux_branch", "del_branch"], ["gate_e_qc"]]
+
+
+def test_dump_stage_batches_splits_when_two_server_stages_share_group():
+    """Two server-backed stages in one group must not run in parallel."""
+    import yaml
+    from partcraft.pipeline_v2.scheduler import dump_stage_batches
+
+    cfg = yaml.safe_load("""
+pipeline:
+  stages:
+    - {name: v1, servers: vlm, steps: [sq1], parallel_group: g}
+    - {name: v2, servers: flux, steps: [s4], parallel_group: g}
+""")
+
+    result = dump_stage_batches(cfg, ["v1", "v2"])
+    assert result == [["v1"], ["v2"]]
