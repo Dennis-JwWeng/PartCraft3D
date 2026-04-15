@@ -54,7 +54,7 @@ This geometry is intrinsic to the cameras, NOT to the object. The object itself
 has an arbitrary world orientation — you must decide which camera happens to
 face the object's front by LOOKING at the photos.
 
-Parts (id, palette color in bottom row, size=surface-area%):
+Parts (id, palette color in bottom row, cluster_size):
 {part_menu}
 
 # CORE LOGIC: THE 3D SPATIAL RULEBOOK
@@ -240,10 +240,9 @@ you reason before you write the prompt):
 
 # HARD RULES (violations drop that edit)
 
-R1. selected_part_ids ⊆ part menu ids; never target parts with size<2%
-    (or cluster_size<30 when size is unavailable)
+R1. selected_part_ids ⊆ part menu ids; never target parts with cluster_size<30
     UNLESS the part has a peer_group or [STRUCTURAL BODY] annotation (those are
-    valid semantic parts regardless of size);
+    valid semantic parts regardless of cluster_size);
     never target parts you cannot see in the bottom row.
 R2. Each edit is distinct: no two with same edit_type AND same
     selected_part_ids.
@@ -268,26 +267,24 @@ def _load_anno_peer_groups(
     anno_obj_dir: "Path | None",
     pids: "list[int]",
     weight_ratio_thr: float = 0.75,
-) -> "tuple[dict[int,list[int]], set[int], dict[int,int], dict[int,float]]":
+) -> "tuple[dict[int,list[int]], set[int], dict[int,int]]":
     """Load _info.json and compute peer groups and structural parts.
 
     Returns:
-        peer_groups:     {pid: [peer_pid, ...]} — empty list if no peers.
+        peer_groups: {pid: [peer_pid, ...]} — empty list if no peers.
         structural_pids: set of pids that are structural body (level=0, high weight).
-        pid_levels:      {pid: level_value}
-        pid_weights:     {pid: surface_area_weight} — empty dict if annotation unavailable.
+        pid_levels: {pid: level_value}
     """
-    _empty: "tuple" = {pid: [] for pid in pids}, set(), {}, {}
     if anno_obj_dir is None or not anno_obj_dir.is_dir():
-        return _empty
+        return {pid: [] for pid in pids}, set(), {}
     obj_id = anno_obj_dir.name
     info_path = anno_obj_dir / f"{obj_id}_info.json"
     if not info_path.is_file():
-        return _empty
+        return {pid: [] for pid in pids}, set(), {}
     try:
         info = json.loads(info_path.read_text())
     except Exception:
-        return _empty
+        return {pid: [] for pid in pids}, set(), {}
 
     levels_list = info.get("ordered_part_level", [])
     weights_list = info.get("weights", [])
@@ -331,7 +328,7 @@ def _load_anno_peer_groups(
             if lv == 0 and pid_weights.get(pid, 0) > 2.0 * med:
                 structural_pids.add(pid)
 
-    return peer_groups, structural_pids, pid_levels, pid_weights
+    return peer_groups, structural_pids, pid_levels
 
 
 def build_part_menu(
@@ -339,16 +336,11 @@ def build_part_menu(
     img_npz: Path,
     anno_obj_dir: "Path | None" = None,
 ) -> tuple[list[int], str]:
-    """Return (part_ids, menu text).
-
-    Each line shows ``part_N  color  size=X%  level=L  [annotations]`` when
-    annotation data (``_info.json``) is available.  ``size`` is the part's
-    surface-area share of the total mesh — a reliable visual-size proxy.
-    Falls back to ``cluster_size=N`` (render mesh-cluster count, not
-    proportional to visual size) when no annotation is present.
+    """Return (part_ids, menu text). cluster_size from split_mesh.json.
 
     If *anno_obj_dir* is given and contains ``{obj_id}_info.json``, the menu
-    is also enriched with ``level=`` and ``peer_group=[...]`` annotations.
+    is enriched with ``level=`` and ``peer_group=[...]`` annotations so the
+    VLM can identify semantically equivalent parts without geometric reasoning.
     """
     z = np.load(img_npz, allow_pickle=True)
     sm = json.loads(bytes(z["split_mesh.json"]).decode())
@@ -367,24 +359,13 @@ def build_part_menu(
         if (pid := _parse_pid(k)) is not None
     )
 
-    peer_groups, structural_pids, pid_levels, pid_weights = _load_anno_peer_groups(anno_obj_dir, pids)
-
-    # Precompute normalised size percentages when annotation weights are available.
-    total_w = sum(pid_weights.values()) if pid_weights else 0.0
-    pid_size_pct: dict[int, float] = (
-        {pid: w / total_w * 100 for pid, w in pid_weights.items()}
-        if total_w > 0 else {}
-    )
+    peer_groups, structural_pids, pid_levels = _load_anno_peer_groups(anno_obj_dir, pids)
 
     lines = []
     for pid in pids:
         cs = clusters.get(f"part_{pid}", {}).get("cluster_size", "?")
         color = _PALETTE_NAMES[pid % len(_PALETTE_NAMES)]
-        if pid in pid_size_pct:
-            # Use annotation-derived surface-area percentage — reliable size proxy.
-            base = f"  part_{pid:<3d} {color:<8s}  size={pid_size_pct[pid]:.0f}%"
-        else:
-            base = f"  part_{pid:<3d} {color:<8s}  cluster_size={cs}"
+        base = f"  part_{pid:<3d} {color:<8s}  cluster_size={cs}"
         if pid in pid_levels:
             lv = pid_levels[pid]
             if pid in structural_pids:
