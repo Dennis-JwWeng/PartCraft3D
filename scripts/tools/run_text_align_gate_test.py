@@ -74,7 +74,9 @@ def _highlight_cell(cell: np.ndarray, selected_part_ids: set[int]) -> np.ndarray
     diffs   = np.linalg.norm(flat[:, None, :] - palette[None, :, :], axis=2)
     nearest = np.argmin(diffs, axis=1)
     is_bg   = np.all(flat > 230, axis=1)
-    is_sel  = np.array([pid in selected_part_ids for pid in nearest])
+    n_pal = len(palette)
+    sel_slots = {pid % n_pal for pid in selected_part_ids}
+    is_sel  = np.array([idx in sel_slots for idx in nearest])
     out_flat = np.empty_like(flat)
     out_flat[is_bg]            = [255, 255, 255]
     out_flat[~is_bg & is_sel]  = list(_RED)
@@ -98,7 +100,6 @@ def build_gate_image(
         top_cells.append(top)
         bot_cells.append(bot)
 
-    sep_v = np.full((top_cells[0].shape[0], _COL_SEP, 3), 255, dtype=np.uint8)
     sep_h = np.full(
         (_ROW_SEP,
          sum(c.shape[1] for c in top_cells) + (_N_VIEWS - 1) * _COL_SEP, 3),
