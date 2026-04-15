@@ -402,3 +402,73 @@ Stage B（s2_highlights）的职责是对每个 edit 用 Blender 渲染高亮图
 - 当 part_id ≥ 16 时调色板循环（`pid % 16`），极少数情况下可能误判；实际对象绝大多数 < 16 个 parts
 - `s2_highlights.py` 和 `sq2_qc_c.py` 文件保留（不删除），仅从 YAML 和调度器中移除
 
+
+---
+
+## 2026-04-14 — mesh NPZ 从 PLY 改为 GLB（延迟 VD 变换）
+
+### 背景与问题
+
+旧 `pack_npz.py` 从 `source/anno_infos/<uuid>/<uuid>_segmented.glb`（粗网格）加载几何体，导出为仅含顶点色的 `.ply` 文件存入 NPZ。这导致：
+- UV 纹理完全丢失（PLY 格式不支持 UV + PBR 材质）
+- `s5b_deletion` 只能通过 KD-tree 近似匹配做部件去除，代码复杂且精度低
+- `partcraft_loader` 需要在加载时将顶点色 bake 为图像纹理，再多一次转换
+
+### 解决方案：GLB 直接拷贝 + 延迟 VD 变换
+
+**核心思路**：pack 阶段不做任何几何变换，直接将原始 Y-up GLB 字节拷贝进 NPZ，把坐标系变换参数（`vd_scale`, `vd_offset`，来自 `transforms.json`）也存入 NPZ，由读取端在运行时懒惰地应用。
+
+**新 mesh NPZ 格式**（`full.glb` 存在时为 GLB 格式）：
+
+| key | 内容 |
+|---|---|
+| `full.glb` | 整体纹理 GLB 原始字节（Y-up，源坐标系） |
+| `part_N.glb` | 第 N 个部件 GLB 原始字节（Y-up） |
+| `vd_scale` | float64 标量，VD 空间均匀缩放因子 |
+| `vd_offset` | float64[3] 向量，VD 空间平移（Y-up 坐标系） |
+
+旧格式（`full.ply`）继续向后兼容。
+
+### 改动模块
+
+| 文件 | 改动 |
+|---|---|
+| `scripts/datasets/partverse/pack_npz.py` | 新增 `_pack_mesh_glb()`：直接拷贝 GLB 字节 + 存 `vd_scale`/`vd_offset`；新增 `--textured-part-glbs-dir`、`--normalized-glb-dir`、`--mesh-out-dir` CLI 参数；修复 multiprocessing pickling（`_pack_worker` 提升为 module-level）|
+| `scripts/datasets/partverse/prerender.py` | 透传新 GLB 路径参数 |
+| `partcraft/io/partcraft_loader.py` | `_mesh_fmt()` 检测格式；`_load_mesh_bytes()` 加载 GLB 并懒惰应用 VD 变换 |
+| `partcraft/render/overview.py` | `extract_parts()` 对新格式 GLB 应用 VD 变换后再写临时文件 |
+| `scripts/blender_render_parts.py` | 支持 `.glb` import（`bpy.ops.import_scene.gltf`），before/after 对象快照模式 |
+| `partcraft/trellis/refiner.py` | `build_part_mask()` 检测 `full.glb`/`full.ply`，对新格式 GLB 懒惰应用 VD 变换 |
+| `partcraft/pipeline_v2/s1_vlm_core.py` | `build_part_menu()` 同时解析 `part_N.glb` 和 `part_N.ply` key |
+| `partcraft/pipeline_v2/s5b_deletion.py` | 新增 `_build_deletion_from_npz()`：直接从 NPZ 拼接非选中部件 GLB，无需 KD-tree；旧路径作为 PLY 格式 fallback |
+| `configs/prerender_partverse_*.yaml` | 新增 `textured_part_glbs_dir`、`normalized_glb_dir` 配置项 |
+| `tests/test_mesh_npz_glb.py` | 7 个 TDD 测试覆盖 pack/load/deletion/refiner/overview 完整路径 |
+
+### 性能收益
+
+pack 阶段消除 `trimesh.load` + `export` 开销，变为纯字节拷贝（I/O bound）。每个对象从 ~2-5s 降至 <0.1s，1203 个对象的单 shard 重 pack 从数小时降至分钟级。
+
+### Repack 指令（各 shard）
+
+```bash
+DATA=/mnt/zsn/data/partverse
+PY=/mnt/zsn/3dobject/envs/trellis2/bin/python
+SCRIPT=/mnt/zsn/zsn_workspace/PartCraft3D/scripts/datasets/partverse/pack_npz.py
+COMMON="--data-root $DATA --num-shards 10 \
+  --textured-part-glbs-dir $DATA/textured_part_glbs \
+  --normalized-glb-dir $DATA/normalized_glbs \
+  --force --workers 8"
+
+$PY $SCRIPT $COMMON --shard 00 --mesh-out-dir $DATA/inputs/mesh/00
+$PY $SCRIPT $COMMON --shard 02 --mesh-out-dir $DATA/inputs/mesh/02
+$PY $SCRIPT $COMMON --shard 06 --mesh-out-dir $DATA/inputs/mesh/06
+$PY $SCRIPT $COMMON --shard 07 --mesh-out-dir $DATA/inputs/mesh/07
+$PY $SCRIPT $COMMON --shard 08 --mesh-out-dir $DATA/inputs/mesh/08
+```
+
+Shard 05 以旧 VD-space GLB 格式重 pack（无 `vd_scale`），代码已向后兼容。
+
+### 注意事项
+- `vd_scale`/`vd_offset` 缺失时（旧 GLB 格式或 PLY 格式），各读取端直接使用原始顶点坐标（旧行为不变）
+- `_pack_mesh_glb` 中 `_is_int_stem` 过滤非整数文件名，防止 `int(p.stem)` 崩溃
+- `s5b_deletion._build_deletion_from_npz` 失败时自动 fallback 到 KD-tree 路径
