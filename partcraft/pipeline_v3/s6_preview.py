@@ -1,0 +1,860 @@
+"""Step s6p — 5-view preview renders for all edit types (pre-VLM-gate).
+
+Renders preview_{0..4}.png for every non-identity edit using the same
+VIEW_INDICES cameras as the phase1 VLM overview.  These previews are
+consumed by sq3 (VLM quality gate) without needing a full 40-view render.
+
+Route by type:
+  deletion   → Blender renders after.ply (after state = object minus parts)
+  addition   → Blender renders source_del's before.ply (after state = original)
+  mod/scl/mat/glb → TRELLIS decode+render from after.npz
+
+Output per edit: edits_3d/<edit_id>/preview_{0..4}.png
+Step key: s6p_preview
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+import numpy as np
+from PIL import Image
+
+_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _encode_asset_script() -> str:
+    """Return absolute path to encode_asset/blender_script/render.py."""
+    p = _ROOT / "third_party" / "encode_asset" / "blender_script" / "render.py"
+    if not p.is_file():
+        raise FileNotFoundError(f"encode_asset render script not found: {p}")
+    return str(p)
+
+
+sys.path.insert(0, str(_ROOT))
+sys.path.insert(0, str(_ROOT / "scripts" / "standalone"))
+sys.path.insert(0, str(_ROOT / "third_party"))
+
+from .paths import ObjectContext
+from .specs import VIEW_INDICES
+from .status import update_step, STATUS_OK, STATUS_FAIL
+from .qc_io import is_gate_a_failed
+from .edit_status_io import edit_needs_step, update_edit_stage, obj_needs_stage
+
+
+@dataclass
+class PreviewResult:
+    obj_id: str
+    n_ok: int = 0
+    n_fail: int = 0
+    n_skip: int = 0
+    error: str | None = None
+
+
+def _build_pipeline(ckpt: str, logger: logging.Logger):
+    """Load TRELLIS pipeline onto GPU."""
+    from trellis.pipelines import TrellisTextTo3DPipeline  # type: ignore
+    logger.info("[s6p] loading TRELLIS %s", ckpt)
+    pipe = TrellisTextTo3DPipeline.from_pretrained(ckpt)
+    pipe.cuda()
+    logger.info("[s6p] pipeline ready")
+    return pipe
+
+
+def _previews_exist(edit_dir: Path, n: int = 5) -> bool:
+    """Return True if all preview_{0..n-1}.png files exist."""
+    return all((edit_dir / f"preview_{i}.png").is_file() for i in range(n))
+
+
+def _save_previews(edit_dir: Path, imgs: list[np.ndarray]) -> None:
+    """Save list of BGR images as preview_{0..}.png.
+
+    Uses cv2.imwrite (not PIL) to preserve BGR channel order correctly.
+    run_blender() returns BGR; PIL.Image.fromarray() would treat it as RGB
+    and silently swap R/B channels in the saved file.
+    """
+    import cv2 as _cv2
+    for i, img in enumerate(imgs):
+        _cv2.imwrite(str(edit_dir / f"preview_{i}.png"), img)
+
+
+def _render_ply_views(
+    ply_path: Path,
+    frames: list[dict],
+    blender: str,
+    resolution: int,
+    samples: int = 32,
+) -> list[np.ndarray]:
+    """Render a single PLY file at the given camera frames using Blender.
+
+    Uses a temporary directory with a copy of the PLY as part_0.ply to satisfy
+    run_blender's expected parts_dir layout (part_*.ply convention).
+
+    ``samples`` controls Cycles sample count.  Default is 32 (GPU, denoising ON)
+    which matches the minimum quality needed for VLM judgment in sq3.
+    The dataset prerender uses 128 samples; 32+denoise gives acceptable sharpness
+    (~15% below original) without excessive render time (~45s vs 14s per edit).
+    """
+    from partcraft.render.overview import run_blender as _run_blender
+    with tempfile.TemporaryDirectory(prefix="pcv2_s6p_ply_") as tmp:
+        tmp_path = Path(tmp)
+        # run_blender expects part_*.ply files in parts_dir
+        shutil.copy2(ply_path, tmp_path / "part_0.ply")
+        imgs = _run_blender(
+            tmp_path, blender, resolution,
+            [[128, 128, 128]],   # palette unused in vertex-color mode
+            frames,
+            use_vertex_colors=True,
+            samples=samples,
+        )
+    return imgs
+
+
+def _extract_yaw_pitch_views(image_npz: Path) -> list[dict]:
+    """Extract yaw/pitch/radius/fov camera params for VIEW_INDICES from image NPZ.
+
+    The NPZ contains 'transforms.json' with camera frames. We extract the
+    matching VIEW_INDICES frames and convert transform_matrix to yaw/pitch/radius/fov
+    for use with encode_asset/blender_script/render.py.
+    """
+    import math
+    npz = np.load(str(image_npz), allow_pickle=True)
+    frames = json.loads(bytes(npz["transforms.json"]))["frames"]
+    views = []
+    for vi in VIEW_INDICES:
+        if vi >= len(frames):
+            continue
+        frame = frames[vi]
+        m = frame["transform_matrix"]
+        # Camera position from c2w matrix (last column, first 3 rows)
+        cx, cy, cz = m[0][3], m[1][3], m[2][3]
+        r = math.sqrt(cx ** 2 + cy ** 2 + cz ** 2)
+        if r < 1e-6:
+            continue
+        views.append({
+            "yaw":    math.atan2(cy, cx),   # atan2(y, x): encode_asset x=r·cos(yaw)·cos(p), y=r·sin(yaw)·cos(p)
+            "pitch":  math.asin(max(-1.0, min(1.0, cz / r))),
+            "radius": r,
+            "fov":    frame.get("camera_angle_x", math.radians(40)),
+        })
+    return views
+
+
+def _read_normalization(image_npz: Path) -> tuple[float, list[float]] | tuple[None, None]:
+    """Read prerender normalization scale+offset from image_npz transforms.json.
+
+    The encode_asset render script saves scale/offset from normalize_scene() into
+    transforms.json so we can replay the *same* normalization on partial meshes
+    (e.g. after deletion) and keep the object at the identical apparent size.
+    Returns (scale, [ox, oy, oz]) or (None, None) if not stored.
+    """
+    try:
+        npz = np.load(str(image_npz), allow_pickle=True)
+        meta = json.loads(bytes(npz["transforms.json"]))
+        scale = meta.get("scale")
+        offset = meta.get("offset")   # [x, y, z]
+        if scale is not None and offset is not None and len(offset) == 3:
+            return float(scale), [float(v) for v in offset]
+    except Exception:
+        pass
+    return None, None
+
+
+def _render_glb_views(
+    glb_path: Path,
+    image_npz: Path,
+    encode_script: str,
+    blender: str,
+    resolution: int,
+    *,
+    force_cpu: bool = False,
+    cuda_device: str | None = None,
+) -> list[np.ndarray]:
+    """Render GLB at VIEW_INDICES cameras using encode_asset Cycles renderer.
+
+    Uses the *same* normalization (scale + offset) that was applied when the
+    original object was pre-rendered, so deleted-part renders appear at the
+    correct apparent size instead of being zoomed-in to the remaining bbox.
+    Returns list of BGR numpy arrays (cv2 convention) composited onto white.
+    """
+    import subprocess
+    import cv2 as _cv2
+
+    views = _extract_yaw_pitch_views(image_npz)
+    if len(views) != len(VIEW_INDICES):
+        raise RuntimeError(
+            f"Expected {len(VIEW_INDICES)} camera views, got {len(views)}"
+        )
+
+    norm_scale, norm_offset = _read_normalization(image_npz)
+
+    with tempfile.TemporaryDirectory(prefix="pcv2_s6p_glb_") as tmp:
+        tmp_path = Path(tmp)
+        cmd = [
+            blender, "-b", "-P", encode_script, "--",
+            "--object",        str(glb_path),
+            "--output_folder", str(tmp_path),
+            "--views",         json.dumps(views),
+            "--resolution",    str(resolution),
+        ]
+        if norm_scale is not None and norm_offset is not None:
+            cmd += ["--normalize_scale", str(norm_scale),
+                    "--normalize_offset", str(norm_offset[0]), str(norm_offset[1]), str(norm_offset[2])]
+        env = dict(os.environ)
+        if force_cpu:
+            env["CUDA_VISIBLE_DEVICES"] = ""  # hide all GPUs → Blender falls back to CPU
+        elif cuda_device is not None:
+            env["CUDA_VISIBLE_DEVICES"] = str(cuda_device)  # pin to specific GPU
+        result = subprocess.run(
+            cmd,
+            capture_output=True, text=True, timeout=600,
+            env=env,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"encode_asset Blender failed:\n{result.stderr[-400:]}"
+            )
+
+        imgs = []
+        for i in range(len(VIEW_INDICES)):
+            png = tmp_path / f"{i:03d}.png"
+            if not png.is_file():
+                raise RuntimeError(f"Missing render output: {png}")
+            arr = np.array(Image.open(str(png)).convert("RGBA"), dtype=np.float32) / 255.0
+            r_ch, g_ch, b_ch, a = arr[..., 0], arr[..., 1], arr[..., 2], arr[..., 3]
+            rgb = np.stack([
+                (r_ch * a + (1 - a)) * 255,
+                (g_ch * a + (1 - a)) * 255,
+                (b_ch * a + (1 - a)) * 255,
+            ], axis=-1).clip(0, 255).astype(np.uint8)
+            imgs.append(_cv2.cvtColor(rgb, _cv2.COLOR_RGB2BGR))
+        return imgs
+
+
+def _render_slat_views(
+    npz_path: Path,
+    pipeline,
+    frames: list[dict],
+    resolution: int,
+) -> list[np.ndarray]:
+    """Render 5 views from a SLAT npz using TRELLIS pipeline.
+
+    render_one_view() returns RGB; convert to BGR so _save_previews()
+    (which calls cv2.imwrite) writes the correct channel order.
+    """
+    import cv2 as _cv2
+    from render_phase1v2_3d_results import render_one_view as _render_one_view, load_slat as _load_slat  # type: ignore
+    slat = _load_slat(npz_path)
+    imgs = []
+    for frame in frames:
+        img = _render_one_view(pipeline, slat, frame, resolution)
+        imgs.append(_cv2.cvtColor(img, _cv2.COLOR_RGB2BGR))
+    return imgs
+
+
+def _iter_add_edits(ctx: ObjectContext):
+    """Yield (edit_id, meta_dict) for addition edits discovered from meta.json on disk."""
+    if not ctx.edits_3d_dir.is_dir():
+        return
+    for add_dir in sorted(ctx.edits_3d_dir.iterdir()):
+        if not add_dir.is_dir():
+            continue
+        meta_path = add_dir / "meta.json"
+        if not meta_path.is_file():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text())
+        except Exception:
+            continue
+        if meta.get("edit_type") == "addition":
+            yield add_dir.name, meta
+
+
+def run_for_object(
+    ctx: ObjectContext,
+    *,
+    pipeline,          # TRELLIS pipeline (None if no SLAT edits present)
+    blender: str,
+    resolution: int = 518,
+    force: bool = False,
+    logger: logging.Logger | None = None,
+) -> PreviewResult:
+    """Render preview_{0..4}.png for every non-identity edit in this object."""
+    log = logger or logging.getLogger("pipeline_v3.s6p")
+    res = PreviewResult(obj_id=ctx.obj_id)
+
+    if ctx.image_npz is None or not ctx.image_npz.is_file():
+        update_step(ctx, "s6p_preview", status=STATUS_FAIL,
+                    error="missing_image_npz")
+        res.error = "missing_image_npz"
+        return res
+
+    from partcraft.render.overview import load_views_from_npz
+    orig_imgs, frames = load_views_from_npz(ctx.image_npz, VIEW_INDICES)  # orig_imgs: BGR, reused for add previews
+
+    if not ctx.edits_3d_dir.is_dir():
+        update_step(ctx, "s6p_preview", status=STATUS_OK, n=0,
+                    reason="no_edits_3d")
+        return res
+
+    t0 = time.time()
+
+    # --- deletion edits ---
+    from .specs import iter_deletion_specs
+    for spec in iter_deletion_specs(ctx):
+        if prereq_map is not None:
+            if not edit_needs_step(ctx, spec.edit_id, "s6p", prereq_map, force=force):
+                res.n_skip += 1
+                continue
+        else:
+            if is_gate_a_failed(ctx, spec.edit_id):
+                res.n_skip += 1
+                continue
+            edit_dir_chk = ctx.edit_3d_dir(spec.edit_id)
+            if _previews_exist(edit_dir_chk) and not force:
+                res.n_skip += 1
+                continue
+        edit_dir = ctx.edit_3d_dir(spec.edit_id)
+        a_ply = edit_dir / "after.ply"
+        after_glb = edit_dir / "after_new.glb"
+        if not a_ply.is_file() and not after_glb.is_file():
+            log.warning("[s6p] del %s: both after.ply and after_new.glb missing", spec.edit_id)
+            res.n_fail += 1
+            continue
+        try:
+            if after_glb.is_file():
+                imgs = _render_glb_views(
+                    after_glb, ctx.image_npz, _encode_asset_script(),
+                    blender, resolution,
+                )
+            else:
+                log.debug("[s6p] del %s: no after_new.glb, PLY fallback", spec.edit_id)
+                imgs = _render_ply_views(a_ply, frames, blender, resolution, samples=32)
+            _save_previews(edit_dir, imgs)
+            res.n_ok += 1
+        except Exception as e:
+            log.warning("[s6p] del %s: %s", spec.edit_id, e)
+            res.n_fail += 1
+
+    # --- addition edits (use source_del's before.ply as after state) ---
+    for add_id, meta in _iter_add_edits(ctx):
+        if prereq_map is not None:
+            if not edit_needs_step(ctx, add_id, "s6p", prereq_map, force=force):
+                res.n_skip += 1
+                continue
+        else:
+            if is_gate_a_failed(ctx, add_id):
+                res.n_skip += 1
+                continue
+            add_dir_chk = ctx.edit_3d_dir(add_id)
+            if _previews_exist(add_dir_chk) and not force:
+                res.n_skip += 1
+                continue
+        add_dir = ctx.edit_3d_dir(add_id)
+        source_del_id = meta.get("source_del_id")
+        if not source_del_id:
+            log.warning("[s6p] add %s: no source_del_id in meta", add_id)
+            res.n_fail += 1
+            continue
+        # add preview = "before-add" state = del's already-rendered preview images.
+        # The del edit already rendered its after mesh (object with part missing) as
+        # preview_*.png; we copy those directly — no Blender call needed.
+        del_dir = ctx.edit_3d_dir(source_del_id)
+        del_previews = sorted(del_dir.glob("preview_*.png"))
+        if not del_previews:
+            log.warning("[s6p] add %s: del %s has no preview_*.png yet", add_id, source_del_id)
+            res.n_fail += 1
+            continue
+        try:
+            for src in del_previews:
+                shutil.copy2(src, add_dir / src.name)
+            res.n_ok += 1
+        except Exception as e:
+            log.warning("[s6p] add %s: %s", add_id, e)
+            res.n_fail += 1
+
+    # --- SLAT-based edits (mod, scl, mat, glb) ---
+    from .specs import iter_all_specs
+    PLY_TYPES = {"deletion", "addition", "identity"}
+    for spec in iter_all_specs(ctx):
+        if spec.edit_type in PLY_TYPES:
+            continue
+        if prereq_map is not None:
+            if not edit_needs_step(ctx, spec.edit_id, "s6p", prereq_map, force=force):
+                res.n_skip += 1
+                continue
+        else:
+            if is_gate_a_failed(ctx, spec.edit_id):
+                res.n_skip += 1
+                continue
+            edit_dir_chk = ctx.edit_3d_dir(spec.edit_id)
+            if _previews_exist(edit_dir_chk) and not force:
+                res.n_skip += 1
+                continue
+        edit_dir = ctx.edit_3d_dir(spec.edit_id)
+        a_npz = edit_dir / "after.npz"
+        if not a_npz.is_file():
+            log.warning("[s6p] %s %s: after.npz missing", spec.edit_type, spec.edit_id)
+            res.n_fail += 1
+            continue
+        if pipeline is None:
+            log.error("[s6p] TRELLIS pipeline not loaded but needed for %s", spec.edit_id)
+            res.n_fail += 1
+            continue
+        try:
+            imgs = _render_slat_views(a_npz, pipeline, frames, resolution)
+            _save_previews(edit_dir, imgs)
+            res.n_ok += 1
+        except Exception as e:
+            log.warning("[s6p] %s %s: %s", spec.edit_type, spec.edit_id, e)
+            res.n_fail += 1
+
+    update_step(
+        ctx, "s6p_preview",
+        status=STATUS_OK if res.n_fail == 0 else STATUS_FAIL,
+        n_ok=res.n_ok, n_fail=res.n_fail, n_skip=res.n_skip,
+        wall_s=round(time.time() - t0, 2),
+    )
+    return res
+
+
+def _has_trellis_edits(ctxs: list[ObjectContext]) -> bool:
+    """Check whether any object has SLAT-based (non-PLY) edits needing TRELLIS."""
+    from .specs import iter_all_specs
+    PLY_TYPES = {"deletion", "addition", "identity"}
+    for ctx in ctxs:
+        for spec in iter_all_specs(ctx):
+            if spec.edit_type not in PLY_TYPES:
+                a_npz = ctx.edit_3d_dir(spec.edit_id) / "after.npz"
+                if a_npz.is_file():
+                    return True
+    return False
+
+
+def run(
+    ctxs: Iterable[ObjectContext],
+    *,
+    ckpt: str = "checkpoints/TRELLIS-text-xlarge",
+    blender: str = "blender",
+    resolution: int = 518,
+    force: bool = False,
+    logger: logging.Logger | None = None,
+) -> list[PreviewResult]:
+    """Batch entry point. Lazily loads TRELLIS only if SLAT edits are present."""
+    log = logger or logging.getLogger("pipeline_v3.s6p")
+    log.info("[s6p] CUDA_VISIBLE_DEVICES=%s",
+             os.environ.get("CUDA_VISIBLE_DEVICES"))
+
+    ctx_list = list(ctxs)
+    # Filter using per-edit status (authoritative)
+    from .specs import iter_flux_specs, iter_deletion_specs
+    def _s6p_obj_pending(c):
+        flux_ids = [sp.edit_id for sp in iter_flux_specs(c)]
+        del_ids  = [sp.edit_id for sp in iter_deletion_specs(c)]
+        add_ids  = [aid for aid, _ in _iter_add_edits(c)]
+        all_ids  = flux_ids + del_ids + add_ids
+        return not all_ids or obj_needs_stage(c, all_ids, "s6p", prereq_map or {}, force=force)
+    pending = [c for c in ctx_list if force or _s6p_obj_pending(c)]
+    pending_set = set(pending)
+    done = [c for c in ctx_list if c not in pending_set]
+
+    pipeline = None
+    if _has_trellis_edits(pending):
+        pipeline = _build_pipeline(ckpt, log)
+
+    results: list[PreviewResult] = [PreviewResult(c.obj_id) for c in done]
+    for ctx in pending:
+        results.append(run_for_object(
+            ctx, pipeline=pipeline, blender=blender,
+            resolution=resolution, force=force, logger=log,
+        ))
+    return results
+
+
+__all__ = [
+    "PreviewResult",
+    "run_for_object", "run",
+    "run_del_for_object", "run_del",
+    "run_flux_for_object", "run_flux",
+]
+
+
+# ─────────────────── split entry points (s6p_del / s6p_flux) ────────────────
+
+def run_del_for_object(
+    ctx: ObjectContext,
+    *,
+    blender: str,
+    resolution: int = 518,
+    prereq_map: dict[str, str | None] | None = None,
+    force: bool = False,
+    cuda_device: str | None = None,
+    progress_bar=None,
+    logger: logging.Logger | None = None,
+) -> PreviewResult:
+    """Render preview_{0..4}.png for deletion and addition edits only.
+
+    Step key: s6p_del.  CPU/Blender only — no TRELLIS pipeline needed.
+    Deletion: renders after_new.glb (or after.ply fallback) via Blender.
+    Addition: copies source deletion's preview_*.png (no Blender call).
+    """
+    log = logger or logging.getLogger("pipeline_v3.s6p_del")
+    res = PreviewResult(obj_id=ctx.obj_id)
+
+    # Per-edit gate check: skip object only if no del/add edits need s6p
+    from .specs import iter_deletion_specs as _iter_del_specs
+    _del_add_ids = (
+        [sp.edit_id for sp in _iter_del_specs(ctx)]
+        + [aid for aid, _ in _iter_add_edits(ctx)]
+    )
+    if _del_add_ids and not force and not obj_needs_stage(
+        ctx, _del_add_ids, "s6p", prereq_map or {}, force=force
+    ):
+        return res
+
+    if ctx.image_npz is None or not ctx.image_npz.is_file():
+        update_step(ctx, "s6p_del", status=STATUS_FAIL, error="missing_image_npz")
+        res.error = "missing_image_npz"
+        return res
+
+    from partcraft.render.overview import load_views_from_npz
+    _, frames = load_views_from_npz(ctx.image_npz, VIEW_INDICES)
+
+    if not ctx.edits_3d_dir.is_dir():
+        update_step(ctx, "s6p_del", status=STATUS_OK, n=0, reason="no_edits_3d")
+        return res
+
+    t0 = time.time()
+
+    # --- deletion edits ---
+    from .specs import iter_deletion_specs
+    for spec in iter_deletion_specs(ctx):
+        if prereq_map is not None:
+            if not edit_needs_step(ctx, spec.edit_id, "s6p", prereq_map, force=force):
+                res.n_skip += 1
+                continue
+        else:
+            if is_gate_a_failed(ctx, spec.edit_id):
+                res.n_skip += 1
+                continue
+            edit_dir_chk = ctx.edit_3d_dir(spec.edit_id)
+            if _previews_exist(edit_dir_chk) and not force:
+                res.n_skip += 1
+                continue
+        edit_dir = ctx.edit_3d_dir(spec.edit_id)
+        a_ply = edit_dir / "after.ply"
+        after_glb = edit_dir / "after_new.glb"
+        if not a_ply.is_file() and not after_glb.is_file():
+            log.warning("[s6p_del] del %s: both after.ply and after_new.glb missing", spec.edit_id)
+            res.n_fail += 1
+            continue
+        try:
+            if after_glb.is_file():
+                imgs = _render_glb_views(
+                    after_glb, ctx.image_npz, _encode_asset_script(),
+                    blender, resolution,
+                    cuda_device=cuda_device,
+                )
+            else:
+                imgs = _render_ply_views(a_ply, frames, blender, resolution, samples=32)
+            _save_previews(edit_dir, imgs)
+            res.n_ok += 1
+            update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s6p", status="done")
+        except Exception as e:
+            log.warning("[s6p_del] del %s: %s", spec.edit_id, e)
+            res.n_fail += 1
+            update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s6p",
+                              status="error", reason=str(e)[:200])
+        finally:
+            if progress_bar is not None:
+                progress_bar.update(1)
+
+    # --- addition edits (copy source del's preview_*.png) ---
+    for add_id, meta in _iter_add_edits(ctx):
+        if prereq_map is not None:
+            if not edit_needs_step(ctx, add_id, "s6p", prereq_map, force=force):
+                res.n_skip += 1
+                continue
+        else:
+            if is_gate_a_failed(ctx, add_id):
+                res.n_skip += 1
+                continue
+            add_dir_chk = ctx.edit_3d_dir(add_id)
+            if _previews_exist(add_dir_chk) and not force:
+                res.n_skip += 1
+                continue
+        add_dir = ctx.edit_3d_dir(add_id)
+        source_del_id = meta.get("source_del_id")
+        if not source_del_id:
+            log.warning("[s6p_del] add %s: no source_del_id in meta", add_id)
+            res.n_fail += 1
+            continue
+        del_dir = ctx.edit_3d_dir(source_del_id)
+        del_previews = sorted(del_dir.glob("preview_*.png"))
+        if not del_previews:
+            log.warning("[s6p_del] add %s: del %s has no preview_*.png yet", add_id, source_del_id)
+            res.n_fail += 1
+            continue
+        try:
+            for src in del_previews:
+                shutil.copy2(src, add_dir / src.name)
+            res.n_ok += 1
+            update_edit_stage(ctx, add_id, "addition", "s6p", status="done")
+        except Exception as e:
+            log.warning("[s6p_del] add %s: %s", add_id, e)
+            res.n_fail += 1
+            update_edit_stage(ctx, add_id, "addition", "s6p",
+                              status="error", reason=str(e)[:200])
+        finally:
+            if progress_bar is not None:
+                progress_bar.update(1)
+
+    update_step(
+        ctx, "s6p_del",
+        status=STATUS_OK if res.n_fail == 0 else STATUS_FAIL,
+        n_ok=res.n_ok, n_fail=res.n_fail, n_skip=res.n_skip,
+        wall_s=round(time.time() - t0, 2),
+    )
+    return res
+
+
+def run_flux_for_object(
+    ctx: ObjectContext,
+    *,
+    pipeline,
+    resolution: int = 518,
+    prereq_map: dict[str, str | None] | None = None,
+    force: bool = False,
+    logger: logging.Logger | None = None,
+) -> PreviewResult:
+    """Render preview_{0..4}.png for TRELLIS-based edits (mod/scl/mat/glb).
+
+    Step key: s6p_flux.  GPU required (TRELLIS decode).
+    """
+    log = logger or logging.getLogger("pipeline_v3.s6p_flux")
+    res = PreviewResult(obj_id=ctx.obj_id)
+
+    # Per-edit gate check: skip object only if no flux edits need s6p
+    from .specs import iter_flux_specs as _iter_flux_specs_inner
+    _flux_ids = [sp.edit_id for sp in _iter_flux_specs_inner(ctx)]
+    if _flux_ids and not force and not obj_needs_stage(
+        ctx, _flux_ids, "s6p", prereq_map or {}, force=force
+    ):
+        return res
+
+    if ctx.image_npz is None or not ctx.image_npz.is_file():
+        update_step(ctx, "s6p_flux", status=STATUS_FAIL, error="missing_image_npz")
+        res.error = "missing_image_npz"
+        return res
+
+    from partcraft.render.overview import load_views_from_npz
+    _, frames = load_views_from_npz(ctx.image_npz, VIEW_INDICES)
+
+    if not ctx.edits_3d_dir.is_dir():
+        update_step(ctx, "s6p_flux", status=STATUS_OK, n=0, reason="no_edits_3d")
+        return res
+
+    t0 = time.time()
+
+    from .specs import iter_all_specs
+    from partcraft.edit_types import FLUX_TYPES
+    for spec in iter_all_specs(ctx):
+        if spec.edit_type not in FLUX_TYPES:
+            continue
+        if prereq_map is not None:
+            if not edit_needs_step(ctx, spec.edit_id, "s6p", prereq_map, force=force):
+                res.n_skip += 1
+                continue
+        else:
+            if is_gate_a_failed(ctx, spec.edit_id):
+                res.n_skip += 1
+                continue
+            edit_dir_chk = ctx.edit_3d_dir(spec.edit_id)
+            if _previews_exist(edit_dir_chk) and not force:
+                res.n_skip += 1
+                continue
+        edit_dir = ctx.edit_3d_dir(spec.edit_id)
+        a_npz = edit_dir / "after.npz"
+        if not a_npz.is_file():
+            log.warning("[s6p_flux] %s %s: after.npz missing", spec.edit_type, spec.edit_id)
+            res.n_fail += 1
+            continue
+        if pipeline is None:
+            log.error("[s6p_flux] TRELLIS pipeline not loaded but needed for %s", spec.edit_id)
+            res.n_fail += 1
+            continue
+        try:
+            imgs = _render_slat_views(a_npz, pipeline, frames, resolution)
+            _save_previews(edit_dir, imgs)
+            res.n_ok += 1
+            update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s6p", status="done")
+        except Exception as e:
+            log.warning("[s6p_flux] %s %s: %s", spec.edit_type, spec.edit_id, e)
+            res.n_fail += 1
+            update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s6p",
+                              status="error", reason=str(e)[:200])
+
+    update_step(
+        ctx, "s6p_flux",
+        status=STATUS_OK if res.n_fail == 0 else STATUS_FAIL,
+        n_ok=res.n_ok, n_fail=res.n_fail, n_skip=res.n_skip,
+        wall_s=round(time.time() - t0, 2),
+    )
+    return res
+
+
+def run_del(
+    ctxs: Iterable[ObjectContext],
+    *,
+    blender: str = "blender",
+    resolution: int = 518,
+    prereq_map: dict[str, str | None] | None = None,
+    force: bool = False,
+    n_workers: int = 8,
+    gpus: list[int] | None = None,
+    logger: logging.Logger | None = None,
+) -> list[PreviewResult]:
+    """Batch entry for s6p_del (deletion + addition preview, GPU/Blender).
+
+    GPU binding strategy (when ``gpus`` is provided):
+    - n_workers is overridden to len(gpus): one worker thread per GPU.
+    - Each thread is initialised with exactly one GPU index via a thread-local,
+      so CUDA_VISIBLE_DEVICES is set once per thread and never shared.
+    - This guarantees at most one Blender process per GPU at any moment.
+    """
+    import concurrent.futures
+    import itertools
+    import threading
+
+    log = logger or logging.getLogger("pipeline_v3.s6p_del")
+
+    # --- GPU affinity setup ---
+    _thread_local = threading.local()
+    if gpus:
+        effective_workers = len(gpus)
+        _gpu_counter = itertools.count()
+
+        def _thread_init():
+            # Called once when the thread is first created.
+            _thread_local.cuda_device = str(gpus[next(_gpu_counter) % len(gpus)])
+
+        pool_kwargs: dict = {"max_workers": effective_workers, "initializer": _thread_init}
+    else:
+        effective_workers = n_workers
+        pool_kwargs = {"max_workers": effective_workers}
+
+    log.info("[s6p_del] n_workers=%d  gpus=%s", effective_workers, gpus)
+
+    ctx_list = list(ctxs)
+    from .specs import iter_deletion_specs as _iter_del_specs_outer
+    def _del_obj_pending(c):
+        ids = ([sp.edit_id for sp in _iter_del_specs_outer(c)]
+               + [aid for aid, _ in _iter_add_edits(c)])
+        return not ids or obj_needs_stage(c, ids, "s6p", prereq_map or {}, force=force)
+    pending = [c for c in ctx_list if force or _del_obj_pending(c)]
+    done_results = [PreviewResult(c.obj_id) for c in ctx_list if c not in set(pending)]
+
+    # --- pre-scan: count total pending edits for accurate progress bar ---
+    def _count_pending_edits(ctx: ObjectContext) -> int:
+        if not ctx.edits_3d_dir.is_dir():
+            return 0
+        from .specs import iter_deletion_specs
+        count = 0
+        for spec in iter_deletion_specs(ctx):
+            if is_gate_a_failed(ctx, spec.edit_id):
+                continue
+            edit_dir = ctx.edit_3d_dir(spec.edit_id)
+            if _previews_exist(edit_dir) and not force:
+                continue
+            count += 1
+        for add_id, _ in _iter_add_edits(ctx):
+            if is_gate_a_failed(ctx, add_id):
+                continue
+            add_dir = ctx.edit_3d_dir(add_id)
+            if _previews_exist(add_dir) and not force:
+                continue
+            count += 1
+        return count
+
+    total_edits = sum(_count_pending_edits(c) for c in pending)
+    log.info("[s6p_del] %d objects  %d edits pending", len(pending), total_edits)
+
+    # --- shared per-edit progress bar (thread-safe tqdm updates) ---
+    try:
+        from tqdm import tqdm as _tqdm
+        _bar = _tqdm(total=total_edits, desc="s6p_del", unit="edit",
+                     dynamic_ncols=True, leave=True)
+    except ImportError:
+        _bar = None
+
+    _n_ok = _n_fail = _n_skip = 0
+    _bar_lock = threading.Lock()
+
+    def _do(ctx):
+        nonlocal _n_ok, _n_fail, _n_skip
+        res = run_del_for_object(
+            ctx, blender=blender, resolution=resolution,
+            cuda_device=getattr(_thread_local, "cuda_device", None),
+            progress_bar=_bar,
+            prereq_map=prereq_map,
+            force=force, logger=log,
+        )
+        with _bar_lock:
+            _n_ok   += res.n_ok
+            _n_fail += res.n_fail
+            _n_skip += res.n_skip
+            if _bar is not None:
+                _bar.set_postfix(ok=_n_ok, fail=_n_fail, skip=_n_skip,
+                                 gpu=getattr(_thread_local, "cuda_device", "?"))
+        return res
+
+    results: list[PreviewResult] = list(done_results)
+
+    with concurrent.futures.ThreadPoolExecutor(**pool_kwargs) as pool:
+        futures = {pool.submit(_do, ctx): ctx for ctx in pending}
+        for fut in concurrent.futures.as_completed(futures):
+            results.append(fut.result())
+
+    if _bar is not None:
+        _bar.close()
+
+    log.info("[s6p_del] done: ok=%d fail=%d skip=%d", _n_ok, _n_fail, _n_skip)
+    return results
+
+
+def run_flux(
+    ctxs: Iterable[ObjectContext],
+    *,
+    ckpt: str = "checkpoints/TRELLIS-text-xlarge",
+    resolution: int = 518,
+    prereq_map: dict[str, str | None] | None = None,
+    force: bool = False,
+    logger: logging.Logger | None = None,
+) -> list[PreviewResult]:
+    """Batch entry for s6p_flux (mod/scl/mat/glb preview, GPU/TRELLIS)."""
+    log = logger or logging.getLogger("pipeline_v3.s6p_flux")
+    log.info("[s6p_flux] CUDA_VISIBLE_DEVICES=%s", os.environ.get("CUDA_VISIBLE_DEVICES"))
+    ctx_list = list(ctxs)
+    from .specs import iter_flux_specs as _iter_flux_outer
+    def _flux_obj_pending(c):
+        ids = [sp.edit_id for sp in _iter_flux_outer(c)]
+        return not ids or obj_needs_stage(c, ids, "s6p", prereq_map or {}, force=force)
+    pending = [c for c in ctx_list if force or _flux_obj_pending(c)]
+    pipeline = None
+    if _has_trellis_edits(pending):
+        pipeline = _build_pipeline(ckpt, log)
+    results: list[PreviewResult] = [PreviewResult(c.obj_id) for c in ctx_list if c not in set(pending)]
+    for ctx in pending:
+        results.append(run_flux_for_object(
+            ctx, pipeline=pipeline, resolution=resolution,
+            prereq_map=prereq_map, force=force, logger=log,
+        ))
+    return results

@@ -60,7 +60,7 @@ class DelMeshResult:
 def _backfill_add(ctx, del_spec, add_seq, *, force=False, logger=None):
     """Create add_*/meta.json. NPZ/PNG links deferred to s6b."""
     import logging as _l
-    log = logger or _l.getLogger("pipeline_v2.s5b")
+    log = logger or _l.getLogger("pipeline_v3.s5b")
     add_id = ctx.edit_id("addition", add_seq)
     add_dir = ctx.edit_3d_dir(add_id)
     meta_path = add_dir / "meta.json"
@@ -105,7 +105,7 @@ def _build_deletion_glb(
     import numpy as np
     import trimesh
     from scipy.spatial import cKDTree
-    log = logger or logging.getLogger("pipeline_v2.s5b")
+    log = logger or logging.getLogger("pipeline_v3.s5b")
 
     norm_path    = normalized_glb_dir / f"{obj_id}.glb"
     anno_obj_dir = anno_dir / obj_id
@@ -203,7 +203,7 @@ def _build_deletion_from_npz(
     import trimesh
     from pathlib import Path as _Path
 
-    log = logger or logging.getLogger("pipeline_v2.s5b")
+    log = logger or logging.getLogger("pipeline_v3.s5b")
     mesh_npz = _Path(mesh_npz)
     pair_dir = _Path(pair_dir)
     out_path = pair_dir / "after_new.glb"
@@ -255,16 +255,13 @@ def _build_deletion_from_npz(
 
     result = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
 
-    # Apply VD-space scale/offset for new-format NPZs.
-    # Do NOT manually apply the Y-up→Z-up axis-swap here: after_new.glb is
-    # imported by Blender (via encode_asset render script) which auto-applies
-    # the same Y-up→Z-up correction.  Doing it twice double-rotates the mesh.
-    # Instead, pre-rotate vd_offset back to Y-up space so it cancels correctly
-    # after Blender's own correction: inv_R(ox, oy, oz) = (ox, oz, -oy).
-    if has_vd_transform:
-        v = np.array(result.vertices)
-        inv_off = np.array([vd_offset[0], vd_offset[2], -vd_offset[1]])
-        result.vertices = (v + inv_off) * vd_scale
+    # NOTE: Do NOT apply vd_scale/vd_offset here.
+    # after_new.glb is passed to Blender's encode_asset renderer which receives
+    # --normalize_scale == transforms.json["scale"] (== vd_scale) and applies it.
+    # If we pre-scale here AND encode_asset re-applies vd_scale, the mesh ends up
+    # at vd_scale^2 ≈ 0.25x the intended size (visually half the expected size).
+    # Keep the GLB in raw Y-up space; Blender normalizes consistently with the
+    # original full-mesh renders.
     pair_dir.mkdir(parents=True, exist_ok=True)
     result.export(str(out_path))
     log.info("[s5b] _build_deletion_from_npz: wrote %s (%d parts kept)", out_path, len(keep_pids))
@@ -281,7 +278,7 @@ def run_mesh_delete_for_object(
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> DelMeshResult:
-    log = logger or logging.getLogger("pipeline_v2.s5b")
+    log = logger or logging.getLogger("pipeline_v3.s5b")
     res = DelMeshResult(obj_id=ctx.obj_id)
 
     specs = list(iter_deletion_specs(ctx))
@@ -359,8 +356,8 @@ def run_mesh_delete_for_object(
                     force=force,
                     logger=log,
                 )
-            # Fallback: KD-tree matching from normalized GLB
-            if not ok:
+            # Fallback: KD-tree matching from normalized GLB (only when dirs configured)
+            if not ok and normalized_glb_dir is not None and anno_dir is not None:
                 ok = _build_deletion_glb(
                     ctx.obj_id, list(spec.selected_part_ids),
                     pair_dir, normalized_glb_dir, anno_dir,
@@ -439,7 +436,7 @@ def run_mesh_delete(
     heavy ``HY3DPartDataset`` is not loaded.  Already-done objects that are
     still missing ``after_new.glb`` are automatically re-processed (backfill).
     """
-    log = logger or logging.getLogger("pipeline_v2.s5b")
+    log = logger or logging.getLogger("pipeline_v3.s5b")
 
     # Probe first available mesh_npz to detect GLB format without requiring
     # the deprecated normalized_glb_dir / anno_dir paths.
@@ -534,7 +531,7 @@ def _link_add_pair(
 ) -> None:
     """Hardlink del/{after,before}.{npz,png} -> add/{before,after}.{npz,png}."""
     import logging as _l
-    log = logger or _l.getLogger("pipeline_v2.s6b")
+    log = logger or _l.getLogger("pipeline_v3.s6b")
     add_id = ctx.edit_id("addition", add_seq)
     add_dir = ctx.edit_3d_dir(add_id)
     if not (add_dir / "meta.json").is_file():
@@ -572,7 +569,7 @@ def run_reencode_for_object(
     import numpy as np
     from migrate_slat_to_npz import _render_and_full_encode  # type: ignore
 
-    log = logger or logging.getLogger("pipeline_v2.s6b")
+    log = logger or logging.getLogger("pipeline_v3.s6b")
     res = DelReencodeResult(obj_id=ctx.obj_id)
     specs = list(iter_deletion_specs(ctx))
     if not specs:
@@ -664,7 +661,7 @@ def run_reencode(
 ) -> list[DelReencodeResult]:
     """Single-GPU entrypoint. Loads only the SS encoder
     (``_render_and_full_encode`` lazily loads the SLAT encoder + DINOv2)."""
-    log = logger or logging.getLogger("pipeline_v2.s6b")
+    log = logger or logging.getLogger("pipeline_v3.s6b")
     log.info("[s6b] CUDA_VISIBLE_DEVICES=%s",
              os.environ.get("CUDA_VISIBLE_DEVICES"))
 

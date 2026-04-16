@@ -27,12 +27,13 @@ SCALE = "scale"                # Anisotropic part scaling — TRELLIS S1+S2 repa
 
 # 1.3 Attribute Decoupling
 MATERIAL = "material"          # Part-level material/texture change — S2 only
+COLOR = "color"                # Part-level colour change (hue/shade only) — S2 only
 GLOBAL = "global"              # Whole-object style/theme — S2 only (full mask)
 
 # 1.5 Identity & Negatives
 IDENTITY = "identity"          # No-op: input=output, irrelevant instruction
 
-ALL_TYPES = {DELETION, ADDITION, MODIFICATION, SCALE, MATERIAL, GLOBAL, IDENTITY}
+ALL_TYPES = {DELETION, ADDITION, MODIFICATION, SCALE, MATERIAL, COLOR, GLOBAL, IDENTITY}
 
 # ---------------------------------------------------------------------------
 # Edit type → TRELLIS execution strategy
@@ -42,7 +43,7 @@ ALL_TYPES = {DELETION, ADDITION, MODIFICATION, SCALE, MATERIAL, GLOBAL, IDENTITY
 S1_S2_TYPES = {MODIFICATION, SCALE}
 
 # Types that use TRELLIS S2 only (appearance changes, preserve geometry)
-S2_ONLY_TYPES = {MATERIAL, GLOBAL}
+S2_ONLY_TYPES = {MATERIAL, COLOR, GLOBAL}
 
 # Types that use GT mesh operations (no TRELLIS generation)
 MESH_ONLY_TYPES = {DELETION}
@@ -51,7 +52,7 @@ MESH_ONLY_TYPES = {DELETION}
 NO_GEN_TYPES = {IDENTITY, ADDITION}
 
 # Types that need a part mask (not full 64³)
-PART_MASK_TYPES = {MODIFICATION, SCALE, MATERIAL, DELETION}
+PART_MASK_TYPES = {MODIFICATION, SCALE, MATERIAL, COLOR, DELETION}
 
 # Types that use full 64³ mask
 FULL_MASK_TYPES = {GLOBAL}
@@ -66,6 +67,7 @@ ID_PREFIX = {
     MODIFICATION: "mod",
     SCALE: "scl",
     MATERIAL: "mat",
+    COLOR: "clr",
     GLOBAL: "glb",
     IDENTITY: "idt",
 }
@@ -82,7 +84,7 @@ def trellis_effective_type(edit_type: str) -> str:
     """
     if edit_type in (MODIFICATION, SCALE):
         return "Modification"
-    if edit_type in (MATERIAL, GLOBAL):
+    if edit_type in (MATERIAL, COLOR, GLOBAL):
         return "TextureOnly"
     if edit_type == DELETION:
         return "Deletion"
@@ -100,7 +102,8 @@ TYPE_ORDER = {
     MODIFICATION: 1,
     SCALE: 2,
     MATERIAL: 3,
-    GLOBAL: 4,
+    COLOR: 4,
+    GLOBAL: 5,
     IDENTITY: 5,
     # addition handled separately (after all deletions)
 }
@@ -111,7 +114,7 @@ TYPE_ORDER = {
 
 # Edit types that require a FLUX 2D edited image as conditioning input.
 # Single source of truth — imported by pipeline_v2.paths.
-FLUX_TYPES: frozenset[str] = frozenset({MODIFICATION, SCALE, MATERIAL, GLOBAL})
+FLUX_TYPES: frozenset[str] = frozenset({MODIFICATION, SCALE, MATERIAL, COLOR, GLOBAL})
 
 # Canonical edit_type → edit_id prefix.
 # Same content as ID_PREFIX; aliased so pipeline_v2.paths has one import point.
@@ -162,6 +165,26 @@ MATERIAL_TEMPLATES = [
      "matte black rubber {part}"),
     ("Make the {part} ceramic and glossy",
      "glossy ceramic {part}"),
+]
+
+# Colour edit templates: (prompt_template, after_part_desc_template)
+COLOR_TEMPLATES = [
+    ("Change the {part} to a deep crimson red",
+     "deep crimson red {part}"),
+    ("Make the {part} matte charcoal black",
+     "matte charcoal black {part}"),
+    ("Change the {part} to a cobalt blue",
+     "cobalt blue {part}"),
+    ("Make the {part} ivory white",
+     "ivory white {part}"),
+    ("Change the {part} to a forest green",
+     "forest green {part}"),
+    ("Make the {part} warm amber orange",
+     "warm amber orange {part}"),
+    ("Change the {part} to a pale lavender",
+     "pale lavender {part}"),
+    ("Make the {part} glossy navy blue",
+     "glossy navy blue {part}"),
 ]
 
 # Identity: irrelevant instructions (object should remain unchanged)

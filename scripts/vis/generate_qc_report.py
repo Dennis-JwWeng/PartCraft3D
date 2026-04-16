@@ -27,9 +27,16 @@ TYPE_COLORS = {
     "deletion":     "#c0392b",
     "modification": "#1565c0",
     "material":     "#6a1b9a",
+    "color":        "#b83db8",
     "scale":        "#e65100",
     "global":       "#2e7d32",
     "addition":     "#00695c",
+}
+# Prefix → canonical edit type name (for TYPE_COLORS lookup)
+_PREFIX_TO_TYPE = {
+    "del": "deletion", "mod": "modification", "scl": "scale",
+    "mat": "material",  "clr": "color",        "glb": "global",
+    "add": "addition",
 }
 GATE_OK   = "✅"
 GATE_FAIL = "❌"
@@ -116,9 +123,9 @@ def load_edit_meta(edit_dir: Path) -> dict:
     return {}
 
 
-_FLUX_TYPES = frozenset({"modification", "scale", "material", "global"})
+_FLUX_TYPES = frozenset({"modification", "scale", "material", "color", "global"})
 _EDIT_PREFIX = {"deletion": "del", "modification": "mod", "scale": "scl",
-                "material": "mat", "global": "glb", "addition": "add"}
+                "material": "mat", "color": "clr", "global": "glb", "addition": "add"}
 
 
 def load_parsed_edits(obj_dir: Path, obj_id: str) -> dict:
@@ -228,7 +235,7 @@ def render_edit_card(
     before_strip_html: str | None,
 ) -> str:
     etype = edit_id.split("_")[0]
-    color = TYPE_COLORS.get(etype, "#555")
+    color = TYPE_COLORS.get(_PREFIX_TO_TYPE.get(etype, etype), "#555")
 
     prompt, part_desc = get_prompt_and_desc(edit_id, edit_dir, parsed_edits, qc_edits)
     qe    = qc_edits.get(edit_id, {})
@@ -242,8 +249,17 @@ def render_edit_card(
 
     # after strip (5 previews)
     preview_paths = [edit_dir / f"preview_{i}.png" for i in range(5)]
-    after_html = _strip_row(preview_paths) or '<span class="miss">previews missing</span>'
-    before_html = before_strip_html or '<span class="miss">before images unavailable</span>'
+    preview_html = _strip_row(preview_paths) or '<span class="miss">previews missing</span>'
+    orig_html    = before_strip_html or '<span class="miss">before images unavailable</span>'
+
+    # For addition edits: preview_*.png = deletion state (BEFORE addition is applied),
+    # original image_npz views = reference target (shown as AFTER / goal).
+    if etype == "add":
+        before_html, after_html = preview_html, orig_html
+        before_label, after_label = "BEFORE (del state)", "ORIGINAL (ref)"
+    else:
+        before_html, after_html = orig_html, preview_html
+        before_label, after_label = "BEFORE", "AFTER"
 
     prompt_html = f'<div class="prompt">"{prompt}"</div>' if prompt else '<div class="miss">(no prompt)</div>'
     part_html   = f'<div class="part-desc">Part: {part_desc}</div>' if part_desc else ""
@@ -262,37 +278,46 @@ def render_edit_card(
     </div>
   </div>
   <div class="edit-views">
-    <div class="view-label">BEFORE</div>{before_html}
-    <div class="view-label" style="margin-top:6px">AFTER</div>{after_html}
+    <div class="view-label">{before_label}</div>{before_html}
+    <div class="view-label" style="margin-top:6px">{after_label}</div>{after_html}
   </div>
 </div>"""
 
 
 # ─── render one object ────────────────────────────────────────────────────────
 
-def render_object(obj_dir: Path, status: dict, qc: dict, image_npz: Path | None) -> str:
-    obj_id = obj_dir.name
-    steps  = status.get("steps", {})
+def render_object(obj_dir: Path, edit_status: dict, image_npz: Path | None) -> str:
+    """Render one object card, reading all state from edit_status (pipeline_v3)."""
+    obj_id   = obj_dir.name
+    edits    = edit_status.get("edits", {})
+    mode     = edit_status.get("mode", "")
 
-    badges = " ".join(
-        step_badge(steps.get(k, {}), k)
-        for k in ["s1_phase1", "sq1_qc_A", "s4_flux_2d", "s5_trellis",
-                  "s5b_del_mesh", "s6p_preview", "sq3_qc_E"]
-    )
+    # ── per-stage aggregate badges (built from edit-level stage dicts) ──────
+    stage_keys = ["gate_a", "s4", "s5_trellis", "s5b", "s6p", "gate_e"]
+    stage_counts: dict = {k: {"ok": 0, "fail": 0, "total": 0} for k in stage_keys}
+    for ei in edits.values():
+        for sk in stage_keys:
+            st = (ei.get("stages") or {}).get(sk, {})
+            if st:
+                stage_counts[sk]["total"] += 1
+                if st.get("status") in ("pass", "done", "ok"):
+                    stage_counts[sk]["ok"] += 1
+                elif st.get("status") in ("fail",):
+                    stage_counts[sk]["fail"] += 1
 
-    overview_html = _b64(obj_dir / "phase1" / "overview.png", max_w=1200) \
-                    or "<em style='color:#aaa'>overview.png missing</em>"
+    def _stage_badge(sk):
+        c = stage_counts[sk]
+        if c["total"] == 0:
+            return f'<span class="badge bn">{sk}:—</span>'
+        ok, tot = c["ok"], c["total"]
+        cls = "bok" if ok == tot else ("bsk" if ok > 0 else "bfl")
+        return f'<span class="badge {cls}">{sk}:{ok}/{tot}</span>'
 
-    qc_edits    = qc.get("edits", {})
-    parsed_edits = load_parsed_edits(obj_dir, obj_id)
+    badges = " ".join(_stage_badge(k) for k in stage_keys)
 
-    # compute before strip once per object (shared across all edits)
-    from partcraft.pipeline_v2.specs import VIEW_INDICES
-    before_html = _before_strip(image_npz, VIEW_INDICES) if image_npz else None
-
-    # compute pass rate
+    # ── Gate-E pass rate ─────────────────────────────────────────────────────
     n_pass = n_fail = 0
-    for eid, ei in qc_edits.items():
+    for ei in edits.values():
         ge = (ei.get("gates") or {}).get("E")
         if ge:
             if (ge.get("vlm") or {}).get("pass"):
@@ -301,8 +326,18 @@ def render_object(obj_dir: Path, status: dict, qc: dict, image_npz: Path | None)
                 n_fail += 1
     rate = f"{n_pass}/{n_pass+n_fail}" if (n_pass + n_fail) else "—"
 
-    # edit cards (sorted: del, mod, scl, mat, glb, add)
-    ORDER = ["del", "mod", "scl", "mat", "glb", "add"]
+    # ── overview (optional — Mode E text-only doesn't render one) ───────────
+    ov_path = obj_dir / "phase1" / "overview.png"
+    overview_html = (_b64(ov_path, max_w=1200)
+                     or f'<em style="color:#aaa">Mode {mode} — no overview image</em>')
+
+    parsed_edits = load_parsed_edits(obj_dir, obj_id)
+
+    from partcraft.pipeline_v3.specs import VIEW_INDICES as _VI3
+    before_html = _before_strip(image_npz, _VI3) if image_npz else None
+
+    # ── edit cards (sorted: del, mod, scl, clr, mat, glb, add) ──────────────
+    ORDER = ["del", "mod", "scl", "clr", "mat", "glb", "add"]
     edits_3d = obj_dir / "edits_3d"
     edit_dirs = sorted(
         (d for d in edits_3d.iterdir() if d.is_dir()),
@@ -310,7 +345,7 @@ def render_object(obj_dir: Path, status: dict, qc: dict, image_npz: Path | None)
     ) if edits_3d.is_dir() else []
 
     cards_html = "".join(
-        render_edit_card(ed.name, ed, qc_edits, parsed_edits, before_html)
+        render_edit_card(ed.name, ed, edits, parsed_edits, before_html)
         for ed in edit_dirs
     )
 
@@ -382,7 +417,7 @@ def main():
     ap.add_argument("--obj-ids", nargs="*", default=None)
     ap.add_argument("--min-stage", default="s6p", choices=["s6p", "sq3"])
     ap.add_argument("--cfg",
-                    default="/mnt/zsn/zsn_workspace/PartCraft3D/configs/pipeline_v2_shard02.yaml",
+                    default="/mnt/zsn/zsn_workspace/PartCraft3D/configs/pipeline_v3_shard08_test20.yaml",
                     type=Path, help="Pipeline config for resolving images.npz paths")
     args = ap.parse_args()
 
@@ -397,14 +432,18 @@ def main():
     else:
         obj_dirs = []
         for d in sorted(base.iterdir()):
-            sp = d / "status.json"
-            if not sp.is_file(): continue
+            # pipeline_v3: single edit_status.json per object at obj root
+            es_path = d / "edit_status.json"
+            if not es_path.is_file():
+                continue
             try:
-                steps = json.loads(sp.read_text()).get("steps", {})
+                es = json.loads(es_path.read_text())
             except Exception:
                 continue
-            key = "sq3_qc_E" if args.min_stage == "sq3" else "s6p_preview"
-            if steps.get(key, {}).get("status") in ("ok", "skip"):
+            edits = es.get("edits", {})
+            min_key = "gate_e" if args.min_stage == "sq3" else "s6p"
+            # include obj if any edit has reached the min stage
+            if any((ei.get("stages") or {}).get(min_key) for ei in edits.values()):
                 obj_dirs.append(d)
 
     print(f"Building report for {len(obj_dirs)} objects…", file=sys.stderr)
@@ -412,25 +451,23 @@ def main():
     np_tot = nf_tot = nobj_sq3 = 0
     cards = []
     for od in obj_dirs:
-        sp = od / "status.json"; qp = od / "qc.json"
-        status = json.loads(sp.read_text()) if sp.is_file() else {}
-        qc     = json.loads(qp.read_text()) if qp.is_file() else {}
+        es_path = od / "edit_status.json"
+        edit_status = json.loads(es_path.read_text()) if es_path.is_file() else {}
         image_npz = resolve_image_npz(od, args.cfg)
 
-        if status.get("steps", {}).get("sq3_qc_E", {}).get("status") == "ok":
-            nobj_sq3 += 1
-            for eid, ei in qc.get("edits", {}).items():
-                ge = (ei.get("gates") or {}).get("E")
-                if ge:
-                    if (ge.get("vlm") or {}).get("pass"): np_tot += 1
-                    else: nf_tot += 1
+        for ei in edit_status.get("edits", {}).values():
+            ge = (ei.get("gates") or {}).get("E")
+            if ge:
+                nobj_sq3 += 1
+                if (ge.get("vlm") or {}).get("pass"): np_tot += 1
+                else: nf_tot += 1
 
-        cards.append(render_object(od, status, qc, image_npz))
+        cards.append(render_object(od, edit_status, image_npz))
 
     tot  = np_tot + nf_tot
     rate = f"{np_tot}/{tot} ({np_tot/tot:.0%})" if tot else "N/A"
     summary = (f"<b>Objects:</b> {len(obj_dirs)} &nbsp;|&nbsp;"
-               f" <b>Gate-E evaluated:</b> {nobj_sq3} &nbsp;|&nbsp;"
+               f" <b>Gate-E edits judged:</b> {nobj_sq3} &nbsp;|&nbsp;"
                f" <b>Gate-E pass rate:</b> {rate}"
                f"<br><small>Run: {args.run_dir}</small>")
 

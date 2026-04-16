@@ -89,22 +89,13 @@ def build_gate_image(
     selected_part_ids: list[int],
     column_map: list[int],
 ) -> bytes:
-    """5×2 gate image: col 0 = highlighted best view, cols 1-4 = normal context."""
-    sel_set = set(selected_part_ids)
-    top_cells, bot_cells = [], []
-    for col_idx, orig_view in enumerate(column_map):
-        top = _extract_cell(ov_img, orig_view, 0)
-        bot = _extract_cell(ov_img, orig_view, 1)
-        if col_idx == 0 and sel_set:
-            bot = _highlight_cell(bot, sel_set)
-        top_cells.append(top)
-        bot_cells.append(bot)
+    """Gate image builder.
 
-    sep_h = np.full(
-        (_ROW_SEP,
-         sum(c.shape[1] for c in top_cells) + (_N_VIEWS - 1) * _COL_SEP, 3),
-        255, dtype=np.uint8,
-    )
+    Non-global (sel non-empty): 5x2 grid — top row = RGB photos,
+      bottom row = red/grey highlight renders (selected parts red, rest grey).
+    Global (sel empty): 5x1 strip — RGB photos only, no bottom row.
+    """
+    sel_set = set(selected_part_ids)
 
     def hstack(cells):
         row = cells[0]
@@ -113,7 +104,21 @@ def build_gate_image(
             row = np.concatenate([row, sv, c], axis=1)
         return row
 
-    full = np.concatenate([hstack(top_cells), sep_h, hstack(bot_cells)], axis=0)
+    top_cells = [_extract_cell(ov_img, v, 0) for v in column_map]
+
+    if not sel_set:
+        # Global edit: RGB-only strip, let VLM pick best view from photos
+        full = hstack(top_cells)
+    else:
+        bot_cells = [_highlight_cell(_extract_cell(ov_img, v, 1), sel_set)
+                     for v in column_map]
+        sep_h = np.full(
+            (_ROW_SEP,
+             sum(c.shape[1] for c in top_cells) + (_N_VIEWS - 1) * _COL_SEP, 3),
+            255, dtype=np.uint8,
+        )
+        full = np.concatenate([hstack(top_cells), sep_h, hstack(bot_cells)], axis=0)
+
     ok, buf = cv2.imencode(".png", full)
     assert ok, "cv2.imencode failed"
     return buf.tobytes()
@@ -241,22 +246,6 @@ async def process_one(
             log.debug("[%s] %s rule_fail: %s", obj_id, eid, rule_fails)
             continue
 
-        # Global edit: auto-pass, no image call
-        if et == "global" or not sel:
-            ts = _ts()
-            edits_status[eid] = {
-                "edit_type": et,
-                "stages": {"gate_a": {"status": "pass", "ts": ts}},
-                "gates": {"A": {**gate_record,
-                                "vlm": {"pass": True, "score": 1.0,
-                                        "reason": "global edit auto-pass",
-                                        "best_view": 0, "best_view_col": 0,
-                                        "pixel_counts": [0]*5,
-                                        "column_map": list(range(5))}}},
-            }
-            n_pass += 1
-            continue
-
         # No overview: auto-pass all with best_view=0
         if ov_img is None:
             ts = _ts()
@@ -274,10 +263,11 @@ async def process_one(
             continue
 
         # Layer 2: compute pixel counts → column_map
+        # col 0 = view with most selected-part pixels (best visibility)
+        # col 1-4 = fixed views 0-3 from the overview (view 4 / bottom not used)
         px = [count_part_pixels_in_overview(ov_img, v, sel) for v in range(_N_VIEWS)]
         best_col_view = int(np.argmax(px))
-        other_views   = [v for v in range(_N_VIEWS) if v != best_col_view]
-        column_map    = [best_col_view] + other_views
+        column_map    = [best_col_view, 0, 1, 2, 3]
 
         # Layer 3: VLM alignment gate
         gate_img = build_gate_image(ov_img, sel, column_map)
@@ -340,10 +330,13 @@ async def process_one(
 # ── main ─────────────────────────────────────────────────────────────────────
 
 async def main(args) -> None:
-    vlm_urls  = [u.strip() for u in args.vlm_urls.split(",") if u.strip()]
+    vlm_urls  = [u.strip().rstrip("/") + "/v1" if not u.strip().rstrip("/").endswith("/v1") else u.strip() for u in args.vlm_urls.split(",") if u.strip()]
     out_base  = Path(args.output_dir)
-    obj_ids   = [l.strip() for l in Path(OBJ_IDS_FILE).read_text().splitlines()
-                 if l.strip() and not l.startswith("#")]
+    if getattr(args, "only", None):
+        obj_ids = [oid.strip() for oid in args.only.split(",") if oid.strip()]
+    else:
+        obj_ids = [l.strip() for l in Path(OBJ_IDS_FILE).read_text().splitlines()
+                   if l.strip() and not l.startswith("#")]
     log.info("Running Mode E on %d objects → %s", len(obj_ids), out_base)
 
     sem = asyncio.Semaphore(args.concurrency)
@@ -413,4 +406,6 @@ if __name__ == "__main__":
                     default=str(REPO_ROOT / "data" / "partverse" / "outputs" /
                                 "partverse" / "bench_shard08" / "mode_e_text_align"))
     ap.add_argument("--concurrency", type=int, default=4)
+    ap.add_argument("--only", default=None,
+                    help="Comma-separated obj_ids to run (skip OBJ_IDS_FILE)")
     asyncio.run(main(ap.parse_args()))

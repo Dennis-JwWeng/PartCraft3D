@@ -1,0 +1,113 @@
+# Pipeline v3 — Mode E test20 (shard 08, 20 objects from bench/inputs)
+#
+# Purpose: full end-to-end pipeline validation on the dedicated 20-object
+#          bench set (c*/d* prefix IDs).  Use this to verify:
+#            input data  →  gen_edits  →  gate_text_align
+#            →  del_mesh / flux_2d (parallel)
+#            →  trellis_3d + preview
+#            →  gate_quality
+#
+# GPU utilization (same pattern as bench100):
+#   text_gen_gate_a : all GPUs → n_gpus VLM servers (ports 8200-8205)
+#   deletion_cpu    : CPU only
+#   flux_2d         : all GPUs → n_gpus FLUX servers (ports 8020-8025)
+#   trellis_preview : all GPUs → n_gpus Trellis workers
+#   gate_quality    : all GPUs → n_gpus VLM servers
+#
+# Typical invocation (full run from scratch):
+#   bash scripts/tools/run_pipeline_v3_bench100.sh \
+#       test20 configs/pipeline_v3_shard08_test20.yaml
+#
+# Or step-by-step:
+#   python -m partcraft.pipeline_v3.run \
+#       --config configs/pipeline_v3_shard08_test20.yaml \
+#       --shard 08 --obj-ids-file configs/shard08_test20_obj_ids.txt \
+#       --steps gen_edits,gate_text_align
+
+blender: /mnt/zsn/data/3DEditVerse/render_package_extracted/render_package/blender-3.5.1-linux-x64/blender
+ckpt_root: /mnt/zsn/zsn_workspace/PartCraft3D/checkpoints
+
+data:
+  output_dir: /mnt/zsn/zsn_workspace/PartCraft3D/outputs/partverse/bench_shard08_test20/mode_e_text_align
+  mesh_root:   /mnt/zsn/data/partverse/bench/inputs/mesh
+  images_root: /mnt/zsn/data/partverse/bench/inputs/images
+  slat_dir:    /mnt/zsn/data/partverse/bench/inputs/slat
+
+pipeline:
+  gpus: [2, 3, 4, 5, 6, 7]
+  vlm_port_base:  8200
+  vlm_port_stride: 1
+  flux_port_base: 8020
+  flux_port_stride: 1
+  prerender_workers: 6
+  s6p_del_workers: 6
+
+  stages:
+  - name: text_gen_gate_a
+    desc: VLM edit generation + text-align gate
+    servers: vlm
+    steps:
+    - gen_edits
+    - gate_text_align
+
+  - name: deletion_cpu
+    desc: deletion mesh masking + Blender 5-view preview (CPU only)
+    servers: none
+    parallel_group: edit_branches
+    steps:
+    - del_mesh
+    - preview_del
+
+  - name: flux_2d
+    desc: FLUX 2D image editing
+    servers: flux
+    parallel_group: edit_branches
+    steps:
+    - flux_2d
+
+  - name: trellis_preview
+    desc: Trellis 3D reconstruction + 5-view preview
+    servers: none
+    use_gpus: true
+    steps:
+    - trellis_3d
+    - preview_flux
+
+  - name: gate_quality
+    desc: VLM visual quality gate
+    servers: vlm
+    steps:
+    - gate_quality
+
+services:
+  vlm:
+    model: /mnt/zsn/ckpts/Qwen3.5-27B
+
+  image_edit:
+    enabled: true
+    trellis_text_ckpt: /mnt/zsn/zsn_workspace/PartCraft3D/checkpoints/TRELLIS-text-xlarge
+    image_edit_backend: local_diffusers
+    workers_per_server: 2
+    export_ply: false
+    export_ply_for_deletion: false
+    large_part_threshold: 0.35
+    repaint_mode: image
+
+qc:
+  thresholds_by_type:
+    deletion:
+      min_visual_quality: 3
+    modification:
+      min_visual_quality: 3
+      require_preserve_other: true
+    scale:
+      min_visual_quality: 3
+      require_preserve_other: true
+    material:
+      min_visual_quality: 3
+    color:
+      min_visual_quality: 3
+    global:
+      min_visual_quality: 3
+    addition:
+      min_visual_quality: 3

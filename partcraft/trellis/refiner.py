@@ -402,10 +402,13 @@ class TrellisRefiner:
 
         Returns:
             (mask, effective_edit_type): The 64³ bool mask and the effective
-            edit type — may differ from input if a large part (>threshold)
-            is automatically promoted to Global.
+            edit type. We keep local edit types as-is and do not auto-promote
+            large part masks to Global.
         """
         device = self.device
+        # Compatibility note:
+        # large_part_threshold / promote_scale_to_global / scale_large_part_threshold
+        # are intentionally kept in the signature for caller/config stability.
 
         # Global: full mask, no part voxelization needed
         if edit_type == "Global":
@@ -550,38 +553,8 @@ class TrellisRefiner:
                 f"(< {MIN_EDIT_VOXELS}). Part may be too small for "
                 f"reliable editing at 64³ resolution.")
 
-        # ---- Large part auto-promotion to Global ----
-        # Modification keeps the historical behavior: very large local edits
-        # are promoted to global to avoid severe artifacts.
-        # Scale is handled separately because auto-promotion often suppresses
-        # part-level resize intent; disabled by default, opt-in via config.
-        n_slat_total = slat.coords.shape[0]
-        if n_slat_total > 0 and edit_type in ("Modification", "Scale"):
-            part_ratio = n_edit_slat / n_slat_total
-            if edit_type == "Modification" and part_ratio > large_part_threshold:
-                logger.warning(
-                    f"Large part detected: edit covers {part_ratio:.1%} of "
-                    f"SLAT voxels (>{large_part_threshold:.0%} threshold). "
-                    f"Promoting {edit_type} → Global to avoid severe artifacts.")
-                edit_type = "Global"
-            elif edit_type == "Scale":
-                scale_threshold = (
-                    scale_large_part_threshold
-                    if scale_large_part_threshold is not None
-                    else max(large_part_threshold, 0.60)
-                )
-                if promote_scale_to_global and part_ratio > scale_threshold:
-                    logger.warning(
-                        f"Large scale region: edit covers {part_ratio:.1%} of "
-                        f"SLAT voxels (>{scale_threshold:.0%} threshold). "
-                        "Promoting Scale → Global by configuration.")
-                    edit_type = "Global"
-                elif (not promote_scale_to_global) and part_ratio > large_part_threshold:
-                    logger.info(
-                        "Large scale region detected (%.1f%% of SLAT voxels) "
-                        "but keeping Scale local (promote_scale_to_global=false).",
-                        part_ratio * 100.0,
-                    )
+        # NOTE: We intentionally do not auto-promote local edits to Global
+        # based on part coverage ratio. Keep strict part-mask behavior.
 
         # ---- Build final mask per edit type ----
         # Strategy: keep the hard mask tight (just the edit part itself),
@@ -596,11 +569,11 @@ class TrellisRefiner:
             # in the exact same footprint, producing near-identical output.
             mask = self._compute_editing_region(
                 slat, edit_parts, preserved_parts, pad=3)
-        elif edit_type == "Material":
-            # Material: S2 only within part mask. Tight mask (no expansion)
-            # since geometry is unchanged — only texture gets repainted.
+        elif edit_type in ("Material", "Color"):
+            # Material / Color: S2 only within part mask. Tight mask (no expansion)
+            # since geometry is unchanged — only texture/hue gets repainted.
             mask = edit_parts.clone()
-            logger.info(f"Material mask: {int(mask.sum())} voxels "
+            logger.info(f"{edit_type} mask: {int(mask.sum())} voxels "
                         f"(S2 texture-only, no geometry change)")
         elif edit_type == "Deletion":
             # Direct deletion: mask = exact edit part, no dilation needed.

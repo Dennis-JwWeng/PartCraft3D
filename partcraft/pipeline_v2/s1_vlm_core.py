@@ -113,6 +113,33 @@ P5. PEER GROUPS → GROUP EDITS. The part menu marks ``peer_group=[i,j,...]``
     Parts marked [STRUCTURAL BODY] must never appear in deletion or
     scale edits (R3 reinforcement). Mix group and single-part edits.
 
+P5b. MANDATORY SEMANTIC GROUPING — applies even when NO peer_group is marked.
+    GROUP AS MUCH AS POSSIBLE. Two categories of parts MUST always be combined
+    into a single edit regardless of peer_group annotations:
+
+    (a) Bilateral / repeated instances — parts whose names differ ONLY by
+        side label ("Left"/"Right"), position, or index share the same
+        functional role and MUST be a single edit:
+          Left Arm + Right Arm → ONE edit   (selected_part_ids = [id_L, id_R])
+          Left Leg + Right Leg → ONE edit
+          Left Ear + Right Ear → ONE edit
+          all four chair legs  → ONE edit
+          both wheels          → ONE edit
+        FORBIDDEN: separate deletion/modification for "Left Arm" and "Right Arm".
+
+    (b) Semantic constituents — distinct parts that together form one coherent
+        sub-object, where removing/changing only a subset produces an incomplete
+        or broken result:
+          face features (eyes + nose + mouth) → ONE deletion
+          hand → fingers + palm → ONE edit
+          engine block + pistons → ONE edit
+        Clue: if you cannot describe the edit without mentioning multiple parts
+        that are always perceived as a single unit, they MUST be grouped.
+
+    SELF-CHECK before writing each edit: "Is this part the bilateral/repeated
+    partner of another part I have already listed or am about to list?" If yes,
+    merge them. NEVER produce N separate edits for N symmetric/repeated parts.
+
 P6. NO PALETTE COLORS. The palette names (red, orange, yellow, lime, green,
     teal, cyan, blue, navy, purple, magenta, pink, brown, tan, black, gray)
     are INTERNAL labels and MUST NOT appear in any output text field. To
@@ -267,22 +294,43 @@ def _load_anno_peer_groups(
     anno_obj_dir: "Path | None",
     pids: "list[int]",
     weight_ratio_thr: float = 0.75,
+    mesh_npz: "Path | None" = None,
 ) -> "tuple[dict[int,list[int]], set[int], dict[int,int]]":
     """Load _info.json and compute peer groups and structural parts.
+
+    Source priority:
+      1. ``anno_obj_dir/{obj_id}_info.json``  (external anno_infos directory)
+      2. ``mesh_npz["anno_info.json"]``        (embedded via repack_mesh_add_anno.py)
 
     Returns:
         peer_groups: {pid: [peer_pid, ...]} — empty list if no peers.
         structural_pids: set of pids that are structural body (level=0, high weight).
         pid_levels: {pid: level_value}
     """
-    if anno_obj_dir is None or not anno_obj_dir.is_dir():
+    info_bytes: bytes | None = None
+
+    if anno_obj_dir is not None and anno_obj_dir.is_dir():
+        obj_id = anno_obj_dir.name
+        info_path = anno_obj_dir / f"{obj_id}_info.json"
+        if info_path.is_file():
+            try:
+                info_bytes = info_path.read_bytes()
+            except Exception:
+                info_bytes = None
+
+    if info_bytes is None and mesh_npz is not None and mesh_npz.is_file():
+        try:
+            z = np.load(str(mesh_npz), allow_pickle=True)
+            if "anno_info.json" in z.files:
+                info_bytes = bytes(z["anno_info.json"])
+        except Exception:
+            info_bytes = None
+
+    if info_bytes is None:
         return {pid: [] for pid in pids}, set(), {}
-    obj_id = anno_obj_dir.name
-    info_path = anno_obj_dir / f"{obj_id}_info.json"
-    if not info_path.is_file():
-        return {pid: [] for pid in pids}, set(), {}
+
     try:
-        info = json.loads(info_path.read_text())
+        info = json.loads(info_bytes.decode())
     except Exception:
         return {pid: [] for pid in pids}, set(), {}
 
@@ -359,7 +407,7 @@ def build_part_menu(
         if (pid := _parse_pid(k)) is not None
     )
 
-    peer_groups, structural_pids, pid_levels = _load_anno_peer_groups(anno_obj_dir, pids)
+    peer_groups, structural_pids, pid_levels = _load_anno_peer_groups(anno_obj_dir, pids, mesh_npz=mesh_npz)
 
     lines = []
     for pid in pids:

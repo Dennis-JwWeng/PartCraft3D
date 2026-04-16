@@ -91,16 +91,20 @@ def extract_parts(npz_path: Path, out_dir: Path) -> list[int]:
         out_path = out_dir / f"part_{pid}{ext}"
         raw = bytes(npz[key])
         if has_vd:
-            # Apply VD transform (Y-up → Z-up + scale) before writing for Blender
+            # Blender's gltf importer automatically applies the Y-up→Z-up correction
+            # (same rotation as the VD axis-swap).  So we must NOT pre-apply the
+            # axis-swap here — doing so would double-rotate the mesh.
+            # Only apply scale and the offset (pre-rotated back to Y-up space so it
+            # lands correctly after Blender's own correction).
+            # inv_R(offset): reverse of (X,Y,Z)→(X,-Z,Y) is (X,Y,Z)→(X,Z,-Y)
             _sc = _tm.load(_io.BytesIO(raw), file_type="glb", force="scene")
             _ms = [g for g in (_sc.geometry.values() if hasattr(_sc, "geometry") else [_sc])
                    if isinstance(g, _tm.Trimesh)]
             if _ms:
                 _m = _tm.util.concatenate(_ms) if len(_ms) > 1 else _ms[0]
                 _v = np.array(_m.vertices)
-                _vd = np.empty_like(_v)
-                _vd[:, 0] = _v[:, 0]; _vd[:, 1] = -_v[:, 2]; _vd[:, 2] = _v[:, 1]
-                _m.vertices = (_vd + _vd_offset) * _vd_scale
+                inv_off = np.array([_vd_offset[0], _vd_offset[2], -_vd_offset[1]])
+                _m.vertices = (_v + inv_off) * _vd_scale
                 _buf = _io.BytesIO(); _m.export(_buf, file_type="glb")
                 raw = _buf.getvalue()
         out_path.write_bytes(raw)

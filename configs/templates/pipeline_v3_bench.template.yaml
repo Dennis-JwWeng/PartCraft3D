@@ -1,0 +1,96 @@
+# Pipeline v3 benchmark template (single shard)
+#
+# Copy this file and fill machine-specific paths + GPU layout.
+# Recommended workflow:
+#   1) Validate inputs with scripts/tools/validate_bench_inputs.sh
+#   2) Run full pipeline with scripts/tools/run_pipeline_v3_bench.sh
+
+blender: /path/to/blender
+ckpt_root: /path/to/checkpoints
+
+data:
+  # Example:
+  # output_dir: /mnt/zsn/zsn_workspace/PartCraft3D/outputs/partverse/bench_shard08_test20/mode_e_text_align
+  output_dir: /path/to/outputs/partverse/<run_name>
+
+  # Bench inputs root split (required):
+  #   <inputs>/mesh/<shard>/<obj_id>.npz
+  #   <inputs>/images/<shard>/<obj_id>.npz
+  #   <inputs>/slat/<shard>/<obj_id>_{coords,feats}.pt
+  mesh_root: /path/to/bench/inputs/mesh
+  images_root: /path/to/bench/inputs/images
+  slat_dir: /path/to/bench/inputs/slat
+
+pipeline:
+  gpus: [0, 1, 2, 3]
+
+  # Service ports (one server per GPU unless overridden).
+  vlm_port_base: 8200
+  vlm_port_stride: 1
+  flux_port_base: 8020
+  flux_port_stride: 1
+
+  prerender_workers: 6
+  s6p_del_workers: 6
+
+  # Scheduler source of truth
+  stages:
+    - name: text_gen_gate_a
+      desc: VLM generation + Gate A
+      servers: vlm
+      steps: [gen_edits, gate_text_align]
+
+    - name: deletion_cpu
+      desc: Deletion branch (CPU)
+      servers: none
+      parallel_group: edit_branches
+      steps: [del_mesh, preview_del]
+
+    - name: flux_2d
+      desc: FLUX branch
+      servers: flux
+      parallel_group: edit_branches
+      steps: [flux_2d]
+
+    - name: trellis_preview
+      desc: Trellis + preview
+      servers: none
+      use_gpus: true
+      steps: [trellis_3d, preview_flux]
+
+    - name: gate_quality
+      desc: Final quality gate
+      servers: vlm
+      steps: [gate_quality]
+
+services:
+  vlm:
+    model: /path/to/vlm/model
+
+  image_edit:
+    enabled: true
+    trellis_text_ckpt: /path/to/TRELLIS-text-xlarge
+    image_edit_backend: local_diffusers
+    workers_per_server: 2
+    export_ply: false
+    export_ply_for_deletion: false
+    repaint_mode: image
+
+qc:
+  thresholds_by_type:
+    deletion:
+      min_visual_quality: 3
+    modification:
+      min_visual_quality: 3
+      require_preserve_other: true
+    scale:
+      min_visual_quality: 3
+      require_preserve_other: true
+    material:
+      min_visual_quality: 3
+    color:
+      min_visual_quality: 3
+    global:
+      min_visual_quality: 3
+    addition:
+      min_visual_quality: 3
