@@ -372,7 +372,11 @@ def main() -> None:
 
     for pf in pfiles:
         obj_id  = pf.parent.parent.name
+        # v3 layout: <obj>/edit_status.json  (sibling of phase1/)
+        # v2 layout: <obj>/phase1/edit_status.json (sibling of parsed.json)
         sf      = pf.parent / "edit_status.json"
+        if not sf.exists():
+            sf = pf.parent.parent / "edit_status.json"
         ov_path = _find_overview(obj_id)
 
         if not sf.exists():

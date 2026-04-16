@@ -99,8 +99,19 @@ fi
 _FORCE_FLAG=()
 [ "${FORCE:-0}" = "1" ] && _FORCE_FLAG=(--force)
 
-# Shard: strip leading "shard" prefix (tag="shard08" → shard="08")
-SHARD="${TAG#shard}"
+# Shard resolution:
+#   1. Explicit SHARD=... env override always wins (recommended when the tag
+#      is arbitrary, e.g. tag="test20_rerun" with data under .../mesh/08/).
+#   2. Otherwise strip leading "shard" prefix (tag="shard08" -> shard="08").
+if [ -n "${SHARD:-}" ]; then
+    : # use caller-provided SHARD
+elif [[ "$TAG" == shard* ]]; then
+    SHARD="${TAG#shard}"
+else
+    echo "[ERROR] TAG='$TAG' does not start with 'shard' and SHARD env is unset."
+    echo "        Either rename the tag (e.g. shard08_rerun) OR set SHARD=08 explicitly."
+    exit 1
+fi
 
 echo "============================================================"
 echo "  pipeline_v3 shard run"

@@ -77,8 +77,9 @@ def prepare_edit_menu(
         return None
     quota = compute_edit_quota(len(pids))
     ctx.phase1_dir.mkdir(parents=True, exist_ok=True)
-    from partcraft.pipeline_v3.vlm_core import _sample_global_note as _sgn
-    _roster = _sgn(hash(ctx.obj_id), quota.get("global", 0))
+    from partcraft.pipeline_v3.vlm_core import _pick_global_edit_note
+    _n_global = quota.get("global", 0)
+    _roster = _pick_global_edit_note(hash(ctx.obj_id), _n_global) if _n_global > 0 else ""
     user_msg = USER_PROMPT_TEXT_SEMANTIC.format(
         part_menu=menu,
         n_total=sum(quota.values()),
@@ -110,9 +111,18 @@ def _halve_edit_quota(quota: dict) -> dict:
 
 
 def _format_retry_prompt(menu: str, quota: dict) -> str:
-    """Rebuild the user prompt with a new quota (used on retry)."""
-    from partcraft.pipeline_v3.vlm_core import _sample_global_note as _sgn
-    _roster = _sgn(hash(menu[:32]), quota.get("global", 0))
+    """Rebuild the user prompt with a new quota (used on retry).
+
+    The roster seed is salted so the second attempt sees a *different* shuffle
+    of the global-style pool, avoiding the VLM re-locking onto the same
+    preferences that caused the first attempt to fail.
+    """
+    from partcraft.pipeline_v3.vlm_core import _pick_global_edit_note
+    _n_global = quota.get("global", 0)
+    _roster = (
+        _pick_global_edit_note(hash(menu[:32]) ^ 0xA11CE, _n_global)
+        if _n_global > 0 else ""
+    )
     return USER_PROMPT_TEXT_SEMANTIC.format(
         part_menu=menu,
         n_total=sum(quota.values()),
@@ -323,7 +333,7 @@ def _prepare_edit_menu_worker(args: tuple) -> tuple | None:
         USER_PROMPT_TEXT_SEMANTIC as _U,
         compute_edit_quota as _qf,
         MAX_PARTS as _MAX,
-        _sample_global_note as _sgn,
+        _pick_global_edit_note,
     )
     mesh_p = _P(mesh_npz); img_p = _P(image_npz)
     _anno_p = _P(anno_obj_dir_str) if anno_obj_dir_str else None
@@ -332,7 +342,8 @@ def _prepare_edit_menu_worker(args: tuple) -> tuple | None:
         return None
     quota = _qf(len(pids))
     _obj_id = _P(mesh_npz).stem
-    _roster = _sgn(hash(_obj_id), quota.get("global", 0))
+    _n_global = quota.get("global", 0)
+    _roster = _pick_global_edit_note(hash(_obj_id), _n_global) if _n_global > 0 else ""
     user_msg = _U.format(
         part_menu=menu,
         n_total=sum(quota.values()),

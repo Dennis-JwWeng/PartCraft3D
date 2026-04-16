@@ -608,7 +608,7 @@ __all__ = [
     "build_semantic_list",
     "call_vlm_text_async",
     "validate_edit_json",
-    "_GLOBAL_STYLE_POOL", "_sample_global_note",
+    "_GLOBAL_STYLE_POOL", "_pick_global_edit_note",
     # ── Mode E: alignment gate ────────────────────────────────────────
     "SYSTEM_PROMPT_ALIGN_GATE",
     "build_text_align_gate_prompt",
@@ -617,15 +617,7 @@ __all__ = [
     "build_text_align_gate_image",
     "run_gate_text_align",
     # ── Quality judge prompts ─────────────────────────────────────────
-    "JUDGE_SYSTEM_PROMPTS",
-    "JUDGE_SYSTEM_PROMPT_DELETION",
-    "JUDGE_SYSTEM_PROMPT_MODIFICATION",
-    "JUDGE_SYSTEM_PROMPT_SCALE",
-    "JUDGE_SYSTEM_PROMPT_MATERIAL",
-    "JUDGE_SYSTEM_PROMPT_COLOR",
-    "JUDGE_SYSTEM_PROMPT_GLOBAL",
-    "JUDGE_SYSTEM_PROMPT_ADDITION",
-    "JUDGE_SYSTEM_PROMPT_GENERIC",
+    "JUDGE_SYSTEM_PROMPT",
     "build_quality_judge_prompt",
     "parse_quality_judge_response",
     "extract_quality_judge_json",
@@ -1744,255 +1736,82 @@ def _iter_unapproved_add_edits(ctx):
 
 
 # ============================================================================
-# ============================================================================
-# Quality judge prompts  (single source of truth for all VLM judge prompts)
+# Quality judge prompt (single source of truth for the Gate E VLM judge)
 #
-# Pattern mirrors the alignment gate:
-#   JUDGE_SYSTEM_PROMPTS[edit_type]  — large, directly readable system prompt
-#   build_quality_judge_prompt(...)     — tiny function, fills per-edit variables
-#   parse_quality_judge_response(raw)          — extracts the JSON response
+# Pattern mirrors the alignment gate: ONE static system prompt for all edit
+# types -> VLM KV-cache is fully reused across the judge batch.  Deletion
+# and addition never reach this judge (they inherit from Gate A via
+# _GATE_A_ONLY in _run_quality_gate_for_object), so this prompt covers only
+# modification / scale / material / color / global.
 # ============================================================================
 
-# Schema appended to every system prompt so the model always sees output rules.
-_JUDGE_OUTPUT_SCHEMA = """
-OUTPUT: ONE valid JSON object only — no prose, no markdown fences.
-First character must be "{" and last must be "}".
+JUDGE_SYSTEM_PROMPT = """You are a 3D-edit quality judge.
 
+INPUT:
+  A single 2x5 collage image of ONE 3D object.
+    TOP row    = BEFORE (5 views)
+    BOTTOM row = AFTER  (5 views, same camera per column)
+  The user message supplies: edit_type, edit_prompt, object description,
+  target part label + description, and one type-specific extra
+  (new_part_desc | factor | target_material | target_color | target_style).
+
+WHAT SHOULD CHANGE vs MUST NOT CHANGE (by edit_type):
+  modification  change: SHAPE / SILHOUETTE of target part
+                keep:   colour, material, position; ALL other parts intact
+  scale         change: SIZE of target part (shrinks by factor; still attached)
+                keep:   shape of target part; ALL other parts intact
+  material      change: SURFACE FINISH of target part (e.g. wood -> steel)
+                keep:   geometry of ALL parts; colour broadly similar
+  color         change: HUE / SHADE of target part
+                keep:   shape + material type of ALL parts; no colour bleed
+  global        change: WHOLE-OBJECT art style / rendering aesthetic
+                keep:   underlying geometry + structure still recognisable
+
+TASK:
+  1. Locate the target region in the TOP row from the part label + description
+     (for global edits the target is the whole object).
+  2. For each column i in [0..4] compare same-camera BEFORE vs AFTER:
+     did "what should change" actually change, and did anything in
+     "must not change" change?
+  3. Apply HARD_FAIL rules (R1); if any triggers, set edit_executed=false
+     and skip straight to scoring.
+  4. Emit ONE JSON object per the OUTPUT schema, no prose, no fences.
+
+OUTPUT: ONE valid JSON object only. First character must be "{" and last "}".
 {
-  "edit_executed":    <true|false>,
-  "correct_region":   <true|false>,
-  "preserve_other":   <true|false>,
-  "visual_quality":   <1-5>,
-  "artifact_free":    <true|false>,
-  "reason":           "<one sentence explaining your verdict>",
-  "prompt_quality":   <1-5>,
-  "improved_prompt":  "<imperative rewrite of the original prompt, always fill>",
-  "improved_after_desc": "<concise description of the AFTER object, always fill>"
+  "edit_executed":      <true|false>,
+  "correct_region":     <true|false>,
+  "preserve_other":     <true|false>,
+  "visual_quality":     <1-5>,
+  "artifact_free":      <true|false>,
+  "reason":             "<one sentence explaining your verdict>",
+  "prompt_quality":     <1-5>,
+  "improved_prompt":    "<imperative rewrite of the original prompt>",
+  "improved_after_desc":"<concise description of the AFTER object>"
 }
 
-Fields:
-  edit_executed    — Did the intended edit visibly happen?
-  correct_region   — Was the change applied to the correct region / part?
-  preserve_other   — Are all other parts / the overall structure intact?
-  visual_quality   — 1=terrible  2=poor  3=acceptable  4=good  5=excellent
-  artifact_free    — No floating blobs, broken geometry, seam artefacts?
-  reason           — One sentence justifying your overall verdict.
-  prompt_quality   — How precisely does the ORIGINAL prompt describe what actually
-                     happened? 1=wrong/missing  2=vague  3=roughly correct
-                                4=accurate  5=precise
-  improved_prompt  — Rewrite the prompt to exactly match what you observe.
-                     Imperative ("Remove the ...", "Change ... to ...").
-  improved_after_desc — Concise description of the complete AFTER object.
+RULES:
+  R1. HARD_FAIL => edit_executed=false:
+        * AFTER is visually identical to BEFORE (any edit_type).
+        * modification: only colour/material changed, shape identical.
+        * scale:        target part unchanged in size OR grown.
+        * material:     geometry altered OR surface finish unchanged.
+        * color:        geometry or material type changed OR hue unchanged.
+        * global:       underlying structure no longer recognisable.
+  R2. correct_region = change is localised to the named target part;
+      for global, applied CONSISTENTLY across all 5 views.
+  R3. preserve_other = every OTHER part intact in shape and position
+      (for global: read as "structure + part count preserved"). Minor
+      lighting/shading shifts are acceptable.
+  R4. visual_quality in [1..5]: 1=terrible, 2=poor, 3=acceptable,
+      4=good, 5=excellent. Penalise broken meshes, floating blobs,
+      seam artefacts, per-view style inconsistency.
+  R5. prompt_quality rates how precisely the ORIGINAL prompt describes
+      what actually happened (1=wrong/missing .. 5=precise).
+      improved_prompt is an imperative rewrite matching the observed
+      AFTER; if BEFORE == AFTER write "No change observed - <diagnosis>".
+  R6. All output fields in English only.
 """
-
-# ── Per-type system prompts ───────────────────────────────────────────────────
-
-JUDGE_SYSTEM_PROMPT_DELETION = """You are a quality judge for 3D object editing.
-
-The image shows two rows of multi-view renders of a 3D object:
-  TOP row    — BEFORE the edit (original object, 5 views)
-  BOTTOM row — AFTER the edit  (edited object,   5 views)
-
-EDIT TYPE: deletion
-A deletion edit removes one or more named parts from the object.
-The AFTER model should have those parts entirely gone, with the remaining
-geometry intact and the removal site clean.
-
-WHAT TO JUDGE:
-  edit_executed   — Is the target part GONE from the AFTER model?
-                    true if the part is absent; false if it is still present.
-  correct_region  — Was the CORRECT part removed (matching the target label
-                    and instruction), not some other part?
-  preserve_other  — Are ALL remaining parts intact? No floating fragments,
-                    no gaps, no broken surfaces left at the removal site?
-  visual_quality  — Overall quality of the AFTER model.
-                    Penalise holes, seam artefacts, distorted remaining parts.
-  artifact_free   — No floating blobs, stray geometry, or jagged seams
-                    at the removal site?
-""" + _JUDGE_OUTPUT_SCHEMA
-
-JUDGE_SYSTEM_PROMPT_MODIFICATION = """You are a quality judge for 3D object editing.
-
-The image shows two rows of multi-view renders of a 3D object:
-  TOP row    — BEFORE the edit (original object, 5 views)
-  BOTTOM row — AFTER the edit  (edited object,   5 views)
-
-EDIT TYPE: modification
-A modification edit changes the SHAPE, SILHOUETTE, or FUNCTIONAL ROLE of a
-specific part — NOT its colour or surface material.
-The AFTER model should show a visibly different form for that part while all
-other parts remain geometrically unchanged.
-
-WHAT TO JUDGE:
-  edit_executed   — Is the target part's SHAPE or FORM visibly different in AFTER?
-                    Return false if only colour/texture changed, or if no change
-                    is visible at all.
-  correct_region  — Was the shape change applied to the correct part (as named
-                    in the instruction), not to some neighbouring part?
-  preserve_other  — Are all OTHER parts unchanged in shape and position?
-                    Minor shading differences due to lighting are acceptable;
-                    geometry must be intact.
-  visual_quality  — Quality of the modified AFTER model.
-                    Penalise implausible geometry, broken meshes, or shape
-                    changes that contradict the instruction.
-  artifact_free   — No floating blobs, intersecting geometry, or broken normals?
-""" + _JUDGE_OUTPUT_SCHEMA
-
-JUDGE_SYSTEM_PROMPT_SCALE = """You are a quality judge for 3D object editing.
-
-The image shows two rows of multi-view renders of a 3D object:
-  TOP row    — BEFORE the edit (original object, 5 views)
-  BOTTOM row — AFTER the edit  (edited object,   5 views)
-
-EDIT TYPE: scale
-A scale edit SHRINKS a specific part while keeping all other geometry unchanged.
-The AFTER model should show the target part noticeably smaller, still attached
-and positioned correctly, with no floating connectors.
-
-WHAT TO JUDGE:
-  edit_executed   — Is the target part visibly SMALLER in AFTER than in BEFORE?
-                    Return false if the size is unchanged or the part grew.
-  correct_region  — Was the CORRECT part scaled, not a neighbouring part?
-  preserve_other  — Are all OTHER parts at their original size and position?
-  visual_quality  — Quality of the scaled AFTER model.
-                    Penalise disproportionate scaling, floating connectors,
-                    or visible seams where the part was detached.
-  artifact_free   — No floating or disconnected geometry after scaling?
-""" + _JUDGE_OUTPUT_SCHEMA
-
-JUDGE_SYSTEM_PROMPT_MATERIAL = """You are a quality judge for 3D object editing.
-
-The image shows two rows of multi-view renders of a 3D object:
-  TOP row    — BEFORE the edit (original object, 5 views)
-  BOTTOM row — AFTER the edit  (edited object,   5 views)
-
-EDIT TYPE: material
-A material edit changes the SURFACE MATERIAL or FINISH of a specific part
-(e.g. wood → steel, plastic → glass) while leaving the geometry entirely
-unchanged. Only texture/shading should differ between BEFORE and AFTER.
-
-WHAT TO JUDGE:
-  edit_executed   — Is the surface material / texture of the target part
-                    visibly different in AFTER?
-  correct_region  — Did the material change happen on the CORRECT part only,
-                    with no spillover onto adjacent parts?
-  preserve_other  — Is the geometry of ALL parts intact — no shape changes,
-                    no new holes, no parts removed?
-  visual_quality  — Quality of the material change.
-                    Does it look like the expected material? Is the
-                    shading / texture plausible and consistent?
-  artifact_free   — No UV seams, tiling artefacts, or broken surfaces?
-""" + _JUDGE_OUTPUT_SCHEMA
-
-JUDGE_SYSTEM_PROMPT_COLOR = """You are a quality judge for 3D object editing.
-
-The image shows two rows of multi-view renders of a 3D object:
-  TOP row    — BEFORE the edit (original object, 5 views)
-  BOTTOM row — AFTER the edit  (edited object,   5 views)
-
-EDIT TYPE: color
-A colour edit changes the HUE or SHADE of a specific part while leaving its
-shape and material type unchanged. Only the colour should differ between BEFORE
-and AFTER.
-
-WHAT TO JUDGE:
-  edit_executed   — Is the target part's colour visibly different in AFTER —
-                    a clear hue or tonal shift from BEFORE?
-                    Return false if the part looks the same colour.
-  correct_region  — Did the colour change apply to the CORRECT part only?
-                    Return false if the wrong part changed colour, or if colour
-                    bled noticeably onto neighbouring parts.
-  preserve_other  — Is the GEOMETRY of ALL parts intact — no shape changes,
-                    no holes, no parts added or removed?
-                    Minor lighting/shading differences from the colour change
-                    are acceptable.
-  visual_quality  — Quality of the colour change.
-                    Does the new colour look natural on the part? Is it
-                    consistent across all visible faces in all 5 views?
-  artifact_free   — No colour bleeding, hard colour edges, or rendering seams
-                    at the boundary of the recoloured region?
-""" + _JUDGE_OUTPUT_SCHEMA
-
-JUDGE_SYSTEM_PROMPT_GLOBAL = """You are a quality judge for 3D object editing.
-
-The image shows two rows of multi-view renders of a 3D object:
-  TOP row    — BEFORE the edit (original object, 5 views)
-  BOTTOM row — AFTER the edit  (edited object,   5 views)
-
-EDIT TYPE: global
-A global edit changes the ENTIRE OBJECT's artistic or rendering aesthetic
-(e.g. cel-shading, Art Deco, weathered metal, low-poly) — NOT a material or
-colour change to individual parts. The overall form and part structure should
-remain recognisable while the visual style changes uniformly.
-
-WHAT TO JUDGE:
-  edit_executed   — Is the overall rendering / art style of the object visibly
-                    changed in AFTER? Return false if the object looks identical
-                    to BEFORE.
-  correct_region  — Is the style applied CONSISTENTLY across the ENTIRE object,
-                    with no partial areas remaining in the original style?
-  preserve_other  — Is the object's underlying GEOMETRY and STRUCTURE still
-                    recognisable — same number of parts, overall form preserved?
-                    Return false if geometry was destroyed or heavily distorted.
-  visual_quality  — How well does the style transfer look?
-                    Penalise inconsistent style application, artefacts, or a
-                    style that does not match the target description.
-  artifact_free   — No floating geometry, broken normals, or severe rendering
-                    artefacts introduced by the style transfer?
-""" + _JUDGE_OUTPUT_SCHEMA
-
-JUDGE_SYSTEM_PROMPT_ADDITION = """You are a quality judge for 3D object editing.
-
-The image shows two rows of multi-view renders of a 3D object:
-  TOP row    — BEFORE the edit (original object, 5 views)
-  BOTTOM row — AFTER the edit  (edited object,   5 views)
-
-EDIT TYPE: addition
-An addition edit ADDS a new physical element to the object. The AFTER model
-should contain a new part that was not present in BEFORE, placed in a
-reasonable position and blending naturally with the original object.
-
-WHAT TO JUDGE:
-  edit_executed   — Is there a NEW element in AFTER that was NOT present in
-                    BEFORE?
-  correct_region  — Is the new element placed in a REASONABLE position —
-                    attached or adjacent to the correct existing part, not
-                    floating arbitrarily in space?
-  preserve_other  — Are all ORIGINAL parts still present and intact?
-  visual_quality  — Quality of the addition.
-                    Does it blend naturally with the original object's style
-                    and scale? Does it match the description in the instruction?
-  artifact_free   — No interpenetrating geometry, floating blobs, or broken
-                    surfaces at the attachment point?
-""" + _JUDGE_OUTPUT_SCHEMA
-
-# Fallback for unknown / future edit types
-JUDGE_SYSTEM_PROMPT_GENERIC = """You are a quality judge for 3D object editing.
-
-The image shows two rows of multi-view renders of a 3D object:
-  TOP row    — BEFORE the edit (original object, 5 views)
-  BOTTOM row — AFTER the edit  (edited object,   5 views)
-
-Judge whether the described edit was executed correctly and cleanly.
-
-WHAT TO JUDGE:
-  edit_executed   — Did the described edit visibly happen?
-  correct_region  — Was the change applied to the correct region / part?
-  preserve_other  — Are all other parts preserved and intact?
-  visual_quality  — Overall quality of the AFTER model (1–5).
-  artifact_free   — No floating blobs or broken surfaces?
-""" + _JUDGE_OUTPUT_SCHEMA
-
-# Lookup table: edit_type (lowercase) → system prompt string
-JUDGE_SYSTEM_PROMPTS: dict = {
-    "deletion":     JUDGE_SYSTEM_PROMPT_DELETION,
-    "modification": JUDGE_SYSTEM_PROMPT_MODIFICATION,
-    "scale":        JUDGE_SYSTEM_PROMPT_SCALE,
-    "material":     JUDGE_SYSTEM_PROMPT_MATERIAL,
-    "color":        JUDGE_SYSTEM_PROMPT_COLOR,
-    "global":       JUDGE_SYSTEM_PROMPT_GLOBAL,
-    "addition":     JUDGE_SYSTEM_PROMPT_ADDITION,
-}
 
 
 def build_quality_judge_prompt(
@@ -2003,14 +1822,15 @@ def build_quality_judge_prompt(
     target_part_desc: str = "",
     edit_params: "dict | None" = None,
 ) -> str:
-    """Build the per-edit USER message for the quality judge VLM call.
+    """Build the minimal per-edit USER message for the quality judge.
 
-    The system message is looked up from ``JUDGE_SYSTEM_PROMPTS[edit_type]``
-    (or the generic fallback).  This function only assembles the small
-    per-edit context: object description, instruction, target info.
+    The system prompt (``JUDGE_SYSTEM_PROMPT``) already encodes the task,
+    the per-type change-vs-keep table, and the output schema, so the user
+    message only supplies the per-edit context fields.  The system prefix
+    never changes, keeping the VLM KV cache hot across a batch.
 
     Args:
-        edit_type:        PartCraft canonical type string.
+        edit_type:        PartCraft canonical type string (lowercased).
         edit_prompt:      Original phase-1 generation prompt.
         object_desc:      Full object description from parsed.json.
         part_label:       Human-readable label(s) of the target part(s).
@@ -2021,13 +1841,13 @@ def build_quality_judge_prompt(
     ep = edit_params or {}
     et = edit_type.lower()
     lines = [
+        f"edit_type: {et}",
         f"Object: {object_desc}",
         f'Edit instruction: "{edit_prompt}"',
         f"Target part: {part_label}",
     ]
     if target_part_desc:
         lines.append(f'Target part description (before): "{target_part_desc}"')
-    # Type-specific extra context
     if et == "modification" and ep.get("new_part_desc"):
         lines.append(f'Expected shape after: "{ep["new_part_desc"]}"')
     elif et == "scale" and ep.get("factor"):
@@ -2127,14 +1947,14 @@ async def _call_quality_judge_vlm(
 ) -> "dict | None":
     """Async VLM judge call with retry.
 
-    Uses ``JUDGE_SYSTEM_PROMPTS[edit_type]`` as the system message and
-    ``build_quality_judge_prompt(...)`` to build the per-edit user message,
-    mirroring the alignment-gate pattern.
+    Uses the single unified ``JUDGE_SYSTEM_PROMPT`` as the system message
+    and ``build_quality_judge_prompt(...)`` to build the per-edit user
+    message, mirroring the alignment-gate pattern.
     """
     b64 = _base64.b64encode(img_bytes).decode("utf-8")
-    system_prompt = JUDGE_SYSTEM_PROMPTS.get(
-        edit_type.lower(), JUDGE_SYSTEM_PROMPT_GENERIC
-    )
+    # Single unified system prompt for every edit type → the VLM reuses
+    # its KV cache across consecutive judge calls.
+    system_prompt = JUDGE_SYSTEM_PROMPT
     user_text = build_quality_judge_prompt(
         edit_type, edit_prompt, object_desc, part_label,
         target_part_desc=target_part_desc,
@@ -2277,9 +2097,32 @@ async def _run_quality_gate_for_object(
     from openai import AsyncOpenAI
     client = AsyncOpenAI(base_url=vlm_url, api_key="EMPTY")
 
+    # Deletion + addition edits are already validated by Alignment Gate A
+    # (Mode E text-image alignment) — their Gate E verdict is inherited from
+    # Gate A (pass or fail propagates via final_pass since absent gates are
+    # treated as passed).  We write an explicit "inherited" marker so the
+    # skip is observable in edit_status.json rather than silently absent.
+    from .qc_io import update_edit_gate as _update_edit_gate
+    from .edit_status_io import update_edit_stage as _update_edit_stage
+    _GATE_A_ONLY = {"deletion", "addition"}
+
+    def _inherit_gate_e(edit_id: str, edit_type: str) -> None:
+        _update_edit_gate(
+            ctx, edit_id, edit_type, "E",
+            vlm_result={"pass": True, "score": 1.0,
+                        "reason": "inherited_from_gate_a"},
+        )
+        _update_edit_stage(ctx, edit_id, edit_type, "gate_e",
+                           status="pass", reason="inherited_from_gate_a")
+
     for spec in _iter_all_specs(ctx):
         if not force and _is_edit_qc_failed(ctx, spec.edit_id):
             n_skip += 1
+            continue
+        if spec.edit_type in _GATE_A_ONLY:
+            _inherit_gate_e(spec.edit_id, spec.edit_type)
+            n_skip += 1
+            n_pass += 1
             continue
         edit_dir = ctx.edit_3d_dir(spec.edit_id)
         _, dp, df = await _judge_edit_quality(
@@ -2293,22 +2136,14 @@ async def _run_quality_gate_for_object(
         )
         n_pass += dp; n_fail += df
 
+    # Addition-only edits (sourced from backfill) — also inherit from Gate A.
     for add_id, meta in _iter_unapproved_add_edits(ctx):
         if not force and _is_edit_qc_failed(ctx, add_id):
             n_skip += 1
             continue
-        _, dp, df = await _judge_edit_quality(
-            client, vlm_model,
-            add_id, "addition",
-            meta.get("prompt", ""),
-            meta.get("object_desc", ""),
-            ", ".join(meta.get("part_labels", [])),
-            before_imgs, ctx.edit_3d_dir(add_id), thresholds, ctx,
-            target_part_desc=meta.get("target_part_desc", ""),
-            edit_params=meta.get("edit_params", {}),
-            swap_collage=True,
-        )
-        n_pass += dp; n_fail += df
+        _inherit_gate_e(add_id, "addition")
+        n_skip += 1
+        n_pass += 1
 
     _update_step(ctx, "sq3_qc_E", status=_STATUS_OK,
                  n_pass=n_pass, n_fail=n_fail, n_skip=n_skip)
@@ -2623,7 +2458,17 @@ async def _run_text_align_gate_for_object(
         if gate_out is None:
             gate_out = {"aligned": False, "reason": "vlm_error", "best_view": 0}
 
-        aligned       = bool(gate_out.get("aligned", False))
+        # Deletion (GLB mesh-edit path) is never rejected by the VLM: once
+        # rule checks + pixel-visibility prefilter have passed, trust them.
+        # The VLM response is used only to pick best_view.  For every other
+        # edit type the VLM's aligned/reason decision still gates pass/fail.
+        if et == "deletion":
+            aligned  = True
+            reason   = "auto_pass_deletion"
+        else:
+            aligned  = bool(gate_out.get("aligned", False))
+            reason   = gate_out.get("reason", "")
+
         bv_col        = gate_out.get("best_view", 0)
         if not (type(bv_col) is int and 0 <= bv_col < 5):
             bv_col = 0
@@ -2634,7 +2479,7 @@ async def _run_text_align_gate_for_object(
                          vlm_result={
                              "pass":         aligned,
                              "score":        1.0 if aligned else 0.0,
-                             "reason":       gate_out.get("reason", ""),
+                             "reason":       reason,
                              "best_view":    best_view_abs,
                              "best_view_col": bv_col,
                              "pixel_counts": px,
