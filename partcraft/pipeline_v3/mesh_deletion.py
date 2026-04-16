@@ -3,7 +3,7 @@
 Two halves of the deletion path, kept in one module because they share
 the same per-object loop and ``edits_3d/<edit_id>/`` output dir:
 
-* :func:`run_mesh_delete` (s5b) — CPU only. For every deletion spec,
+* :func:`run_deletion_batch` (s5b) — CPU only. For every deletion spec,
   builds ``after_new.glb`` by KD-tree face-centroid matching from the
   normalized source GLB (UV-textured, high quality). Also writes
   ``add_*/meta.json`` for the inverse addition backfill.
@@ -11,7 +11,7 @@ the same per-object loop and ``edits_3d/<edit_id>/`` output dir:
   Legacy PLY path (``TrellisRefiner.direct_delete_mesh``) is retained
   as fallback when those dirs are not configured.
 
-* :func:`run_reencode` (s6b) — GPU. Runs after VLM filtering. For
+* :func:`link_slat_assets_batch` (s6b) — GPU. Runs after VLM filtering. For
   every surviving deletion edit, re-encodes ``after.ply`` (or GLB)
   via Blender 40-view render → DINOv2 → SLAT encoder → SS encoder →
   ``after.npz``. Also writes ``before.npz`` and hardlinks NPZ/PNG to
@@ -57,10 +57,10 @@ class DelMeshResult:
     n_skip: int = 0
 
 
-def _backfill_add(ctx, del_spec, add_seq, *, force=False, logger=None):
+def _write_addition_meta(ctx, del_spec, add_seq, *, force=False, logger=None):
     """Create add_*/meta.json. NPZ/PNG links deferred to s6b."""
     import logging as _l
-    log = logger or _l.getLogger("pipeline_v3.s5b")
+    log = logger or _l.getLogger("pipeline_v3.mesh_del")
     add_id = ctx.edit_id("addition", add_seq)
     add_dir = ctx.edit_3d_dir(add_id)
     meta_path = add_dir / "meta.json"
@@ -87,7 +87,7 @@ def _backfill_add(ctx, del_spec, add_seq, *, force=False, logger=None):
 
 
 
-def _build_deletion_glb(
+def _delete_parts_from_glbs(
     obj_id: str,
     selected_part_ids: list,
     pair_dir: "Path",
@@ -105,7 +105,7 @@ def _build_deletion_glb(
     import numpy as np
     import trimesh
     from scipy.spatial import cKDTree
-    log = logger or logging.getLogger("pipeline_v3.s5b")
+    log = logger or logging.getLogger("pipeline_v3.mesh_del")
 
     norm_path    = normalized_glb_dir / f"{obj_id}.glb"
     anno_obj_dir = anno_dir / obj_id
@@ -184,7 +184,7 @@ def _build_deletion_glb(
         return False
 
 
-def _build_deletion_from_npz(
+def _merge_surviving_parts_from_npz(
     mesh_npz: "Path",
     selected_part_ids: "list[int]",
     pair_dir: "Path",
@@ -203,7 +203,7 @@ def _build_deletion_from_npz(
     import trimesh
     from pathlib import Path as _Path
 
-    log = logger or logging.getLogger("pipeline_v3.s5b")
+    log = logger or logging.getLogger("pipeline_v3.mesh_del")
     mesh_npz = _Path(mesh_npz)
     pair_dir = _Path(pair_dir)
     out_path = pair_dir / "after_new.glb"
@@ -228,7 +228,7 @@ def _build_deletion_from_npz(
     keep_pids = [pid for pid in all_pids if pid not in selected_part_ids]
 
     if not keep_pids:
-        log.warning("[s5b] _build_deletion_from_npz: all parts selected for deletion")
+        log.warning("[s5b] _merge_surviving_parts_from_npz: all parts selected for deletion")
         return False
 
     # Detect if NPZ stores raw Y-up GLBs (new format) needing VD transform
@@ -264,11 +264,11 @@ def _build_deletion_from_npz(
     # original full-mesh renders.
     pair_dir.mkdir(parents=True, exist_ok=True)
     result.export(str(out_path))
-    log.info("[s5b] _build_deletion_from_npz: wrote %s (%d parts kept)", out_path, len(keep_pids))
+    log.info("[s5b] _merge_surviving_parts_from_npz: wrote %s (%d parts kept)", out_path, len(keep_pids))
     return True
 
 
-def run_mesh_delete_for_object(
+def run_deletion_for_object(
     ctx: ObjectContext,
     *,
     dataset=None,          # only used in legacy PLY path (normalized_glb_dir not set)
@@ -278,7 +278,7 @@ def run_mesh_delete_for_object(
     force: bool = False,
     logger: logging.Logger | None = None,
 ) -> DelMeshResult:
-    log = logger or logging.getLogger("pipeline_v3.s5b")
+    log = logger or logging.getLogger("pipeline_v3.mesh_del")
     res = DelMeshResult(obj_id=ctx.obj_id)
 
     specs = list(iter_deletion_specs(ctx))
@@ -341,7 +341,7 @@ def run_mesh_delete_for_object(
             # ── GLB path (primary) ─────────────────────────────────────
             after_glb = pair_dir / "after_new.glb"
             if after_glb.is_file() and not force:
-                _backfill_add(ctx, spec, add_seq, force=False, logger=log)
+                _write_addition_meta(ctx, spec, add_seq, force=False, logger=log)
                 res.n_skip += 1
                 add_seq += 1
                 continue
@@ -349,7 +349,7 @@ def run_mesh_delete_for_object(
             # Primary: NPZ-based deletion (no KD-tree needed)
             ok = False
             if ctx.mesh_npz is not None:
-                ok = _build_deletion_from_npz(
+                ok = _merge_surviving_parts_from_npz(
                     ctx.mesh_npz,
                     list(spec.selected_part_ids),
                     pair_dir,
@@ -358,13 +358,13 @@ def run_mesh_delete_for_object(
                 )
             # Fallback: KD-tree matching from normalized GLB (only when dirs configured)
             if not ok and normalized_glb_dir is not None and anno_dir is not None:
-                ok = _build_deletion_glb(
+                ok = _delete_parts_from_glbs(
                     ctx.obj_id, list(spec.selected_part_ids),
                     pair_dir, normalized_glb_dir, anno_dir,
                     force=force, logger=log,
                 )
             if ok:
-                _backfill_add(ctx, spec, add_seq, force=force, logger=log)
+                _write_addition_meta(ctx, spec, add_seq, force=force, logger=log)
                 res.n_ok += 1
                 update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s5b", status="done")
             else:
@@ -375,7 +375,7 @@ def run_mesh_delete_for_object(
             # ── Legacy PLY path (fallback when GLB dirs not configured) ─
             a_ply = pair_dir / "after.ply"
             if a_ply.is_file() and not force:
-                _backfill_add(ctx, spec, add_seq, force=False, logger=log)
+                _write_addition_meta(ctx, spec, add_seq, force=False, logger=log)
                 res.n_skip += 1
                 add_seq += 1
                 continue
@@ -384,7 +384,7 @@ def run_mesh_delete_for_object(
                 TrellisRefiner.direct_delete_mesh(
                     obj_record, spec.selected_part_ids, pair_dir, export_ply=True,
                 )
-                _backfill_add(ctx, spec, add_seq, force=force, logger=log)
+                _write_addition_meta(ctx, spec, add_seq, force=force, logger=log)
                 res.n_ok += 1
                 update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s5b", status="done")
             except Exception as e:
@@ -405,7 +405,7 @@ def run_mesh_delete_for_object(
     return res
 
 
-def _needs_glb_backfill(ctx: ObjectContext) -> bool:
+def _needs_addition_meta(ctx: ObjectContext) -> bool:
     """Return True if any deletion edit is missing after_new.glb."""
     from .specs import iter_deletion_specs as _iter_del
     from .qc_io import is_gate_a_failed as _gate_a_fail
@@ -417,7 +417,7 @@ def _needs_glb_backfill(ctx: ObjectContext) -> bool:
     return False
 
 
-def run_mesh_delete(
+def run_deletion_batch(
     ctxs: Iterable[ObjectContext],
     *,
     cfg: dict,
@@ -436,7 +436,7 @@ def run_mesh_delete(
     heavy ``HY3DPartDataset`` is not loaded.  Already-done objects that are
     still missing ``after_new.glb`` are automatically re-processed (backfill).
     """
-    log = logger or logging.getLogger("pipeline_v3.s5b")
+    log = logger or logging.getLogger("pipeline_v3.mesh_del")
 
     # Probe first available mesh_npz to detect GLB format without requiring
     # the deprecated normalized_glb_dir / anno_dir paths.
@@ -470,12 +470,12 @@ def run_mesh_delete(
                      and not obj_needs_stage(ctx, del_ids, "s5b", prereq_map or {}, force=force))
         if _all_done:
             # For GLB path: still run if any edit is missing its GLB (backfill).
-            if use_glb and _needs_glb_backfill(ctx):
+            if use_glb and _needs_addition_meta(ctx):
                 pass  # fall through to run_mesh_delete_for_object
             else:
                 out.append(DelMeshResult(ctx.obj_id))
                 continue
-        out.append(run_mesh_delete_for_object(
+        out.append(run_deletion_for_object(
             ctx, dataset=dataset,
             normalized_glb_dir=normalized_glb_dir,
             anno_dir=anno_dir,
@@ -513,7 +513,7 @@ def _hardlink(src: Path, dst: Path) -> None:
             raise
 
 
-def _write_before_npz(ctx, slat_dir: Path, before_npz: Path) -> None:
+def _link_slat_before_npz(ctx, slat_dir: Path, before_npz: Path) -> None:
     """Load original SLAT .pt files and save as before.npz."""
     import torch
     import numpy as np
@@ -526,7 +526,7 @@ def _write_before_npz(ctx, slat_dir: Path, before_npz: Path) -> None:
     np.savez(str(before_npz), slat_coords=coords, slat_feats=feats)
 
 
-def _link_add_pair(
+def _link_slat_add_pair(
     ctx, spec, add_seq: int, pair_dir: Path, *, logger=None
 ) -> None:
     """Hardlink del/{after,before}.{npz,png} -> add/{before,after}.{npz,png}."""
@@ -548,7 +548,7 @@ def _link_add_pair(
             _hardlink(src, add_dir / add_name)
 
 
-def run_reencode_for_object(
+def link_slat_assets_for_object(
     ctx: ObjectContext,
     *,
     ss_encoder,
@@ -628,8 +628,8 @@ def run_reencode_for_object(
             np.savez(a_npz, **payload)
             before_npz = pair_dir / "before.npz"
             if not before_npz.is_file() or force:
-                _write_before_npz(ctx, slat_dir, before_npz)
-            _link_add_pair(ctx, spec, add_seq, pair_dir, logger=log)
+                _link_slat_before_npz(ctx, slat_dir, before_npz)
+            _link_slat_add_pair(ctx, spec, add_seq, pair_dir, logger=log)
             res.n_ok += 1
             update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s6b", status="done")
         except Exception as e:
@@ -648,7 +648,7 @@ def run_reencode_for_object(
     return res
 
 
-def run_reencode(
+def link_slat_assets_batch(
     ctxs: Iterable[ObjectContext],
     *,
     cfg: dict,
@@ -683,7 +683,7 @@ def run_reencode(
         ):
             out.append(DelReencodeResult(ctx.obj_id))
             continue
-        out.append(run_reencode_for_object(
+        out.append(link_slat_assets_for_object(
             ctx, ss_encoder=ss_encoder, blender_path=blender_path,
             slat_dir=slat_dir, work_dir=work_dir,
             num_views=num_views, prereq_map=prereq_map,
@@ -694,7 +694,7 @@ def run_reencode(
 
 __all__ = [
     "DelMeshResult", "DelReencodeResult",
-    "_build_deletion_from_npz",
-    "run_mesh_delete", "run_mesh_delete_for_object",
-    "run_reencode", "run_reencode_for_object",
+    "_merge_surviving_parts_from_npz",
+    "run_deletion_batch", "run_deletion_for_object",
+    "link_slat_assets_batch", "link_slat_assets_for_object",
 ]

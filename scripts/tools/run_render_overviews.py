@@ -19,7 +19,7 @@ import yaml
 def _render_one(args: tuple) -> tuple[str, str]:
     """Worker: renders one overview and returns (obj_id, status)."""
     mesh_npz, image_npz, blender, out_png, force = args
-    import sys; sys.path.insert(0, "/mnt/zsn/zsn_workspace/PartCraft3D"); from partcraft.pipeline_v3.s1_vlm_core import render_overview_png  # pipeline code
+    import sys; sys.path.insert(0, "/mnt/zsn/zsn_workspace/PartCraft3D"); from partcraft.pipeline_v3.vlm_core import render_overview_png  # pipeline code
     out_p = Path(out_png)
     if not force and out_p.is_file() and out_p.stat().st_size > 1000:
         return Path(mesh_npz).stem, "skip"

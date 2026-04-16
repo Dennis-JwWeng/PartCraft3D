@@ -1,4 +1,4 @@
-"""Step s1 — Phase 1 v3 VLM edit generator (text-semantic mode).
+"""Step s1 — Generate edit instructions via VLM (text-semantic mode).
 
 Uses pipeline_v3 text-semantic mode (Mode B): part captions feed SYSTEM_PROMPT_B.
 No Blender image rendering — the VLM reasons purely from text descriptions.
@@ -11,9 +11,9 @@ Writes into ``ObjectContext.phase1_dir``:
 
 Three entrypoints:
 
-* :func:`run_one` — synchronous, single object (best for debug / tests).
-* :func:`run_many_async` — async multi-server fan-out (kept for compat).
-* :func:`run_many_streaming` — producer-consumer pipeline: a process
+* :func:`gen_edits_for_one` — synchronous, single object (best for debug / tests).
+* :func:`gen_edits_async` — async multi-server fan-out (kept for compat).
+* :func:`gen_edits_streaming` — producer-consumer pipeline: a process
   pool builds semantic lists in parallel and feeds an asyncio queue
   consumed by N VLM clients (one per server, semaphore=1 each).
 
@@ -33,10 +33,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from partcraft.pipeline_v3.s1_vlm_core import (  # noqa: E402
+from partcraft.pipeline_v3.vlm_core import (  # noqa: E402
     SYSTEM_PROMPT_B, USER_PROMPT_TEXT_SEMANTIC,
     build_semantic_list,
-    call_vlm_text_async, extract_json_object, validate_simple, quota_for,
+    call_vlm_text_async, extract_json_object, validate_edit_json, compute_edit_quota,
     MAX_PARTS,
 )
 
@@ -56,7 +56,7 @@ class Phase1Result:
 
 # ─────────────────── build prompt (text-only, no image) ──────────────────────
 
-def prerender(
+def prepare_edit_menu(
     ctx: ObjectContext,
     blender: str,  # kept for API compat — not used in text-semantic mode
     anno_dir: "Path | None" = None,
@@ -75,9 +75,9 @@ def prerender(
     pids, menu = build_semantic_list(ctx.mesh_npz, ctx.image_npz, anno_obj_dir=_anno)
     if len(pids) > MAX_PARTS:
         return None
-    quota = quota_for(len(pids))
+    quota = compute_edit_quota(len(pids))
     ctx.phase1_dir.mkdir(parents=True, exist_ok=True)
-    from partcraft.pipeline_v3.s1_vlm_core import _sample_global_note as _sgn
+    from partcraft.pipeline_v3.vlm_core import _sample_global_note as _sgn
     _roster = _sgn(hash(ctx.obj_id), quota.get("global", 0))
     user_msg = USER_PROMPT_TEXT_SEMANTIC.format(
         part_menu=menu,
@@ -95,7 +95,7 @@ def prerender(
 
 # ─────────────────── VLM quota halving for retry ──────────────────────
 
-def _halve_quota(quota: dict) -> dict:
+def _halve_edit_quota(quota: dict) -> dict:
     """Return a reduced quota for the retry attempt.
 
     Halving produces a shorter response (less truncation risk) while still
@@ -109,9 +109,9 @@ def _halve_quota(quota: dict) -> dict:
     return out
 
 
-def _rebuild_user_msg(menu: str, quota: dict) -> str:
+def _format_retry_prompt(menu: str, quota: dict) -> str:
     """Rebuild the user prompt with a new quota (used on retry)."""
-    from partcraft.pipeline_v3.s1_vlm_core import _sample_global_note as _sgn
+    from partcraft.pipeline_v3.vlm_core import _sample_global_note as _sgn
     _roster = _sgn(hash(menu[:32]), quota.get("global", 0))
     return USER_PROMPT_TEXT_SEMANTIC.format(
         part_menu=menu,
@@ -128,7 +128,7 @@ def _rebuild_user_msg(menu: str, quota: dict) -> str:
 
 # ─────────────────── single-object VLM call ───────────────────────────
 
-async def _call_one(client, ctx: ObjectContext, user_msg: str,
+async def _call_vlm_for_one(client, ctx: ObjectContext, user_msg: str,
                     valid_pids: list[int], quota: dict, model: str,
                     sem: asyncio.Semaphore,
                     part_menu: str = "") -> Phase1Result:
@@ -146,8 +146,8 @@ async def _call_one(client, ctx: ObjectContext, user_msg: str,
         last_error: str = ""
 
         for attempt in range(2):
-            eff_quota = quota if attempt == 0 else _halve_quota(quota)
-            eff_msg = user_msg if attempt == 0 else _rebuild_user_msg(part_menu, eff_quota)
+            eff_quota = quota if attempt == 0 else _halve_edit_quota(quota)
+            eff_msg = user_msg if attempt == 0 else _format_retry_prompt(part_menu, eff_quota)
 
             try:
                 raw = await call_vlm_text_async(
@@ -180,7 +180,7 @@ async def _call_one(client, ctx: ObjectContext, user_msg: str,
 
             # Parsed successfully — save result regardless of validation score.
             dt = time.time() - t0
-            rep = validate_simple(parsed, set(valid_pids), quota=eff_quota)
+            rep = validate_edit_json(parsed, set(valid_pids), quota=eff_quota)
             out = {
                 "obj_id": ctx.obj_id,
                 "shard": ctx.shard,
@@ -211,7 +211,7 @@ async def _call_one(client, ctx: ObjectContext, user_msg: str,
 
 # ─────────────────── public entrypoints ────────────────────────────
 
-def run_one(
+def gen_edits_for_one(
     ctx: ObjectContext,
     *,
     blender: str,
@@ -221,7 +221,7 @@ def run_one(
     """Synchronous one-object run (single VLM server)."""
     from openai import AsyncOpenAI
 
-    pre = prerender(ctx, blender)
+    pre = prepare_edit_menu(ctx, blender)
     if pre is None:
         update_step(ctx, "s1_phase1", status=STATUS_SKIP, reason="too_many_parts")
         return Phase1Result(ctx.obj_id, ok=False, error="too_many_parts")
@@ -230,13 +230,13 @@ def run_one(
     async def _go():
         client = AsyncOpenAI(base_url=vlm_url, api_key="EMPTY")
         sem = asyncio.Semaphore(1)
-        return await _call_one(client, ctx, user_msg, pids, quota,
+        return await _call_vlm_for_one(client, ctx, user_msg, pids, quota,
                                vlm_model, sem, part_menu=menu)
 
     return asyncio.run(_go())
 
 
-async def run_many_async(
+async def gen_edits_async(
     ctxs: Iterable[ObjectContext],
     *,
     blender: str,
@@ -278,7 +278,7 @@ async def run_many_async(
             results.append(Phase1Result(ctx.obj_id, ok=True))
             continue
         try:
-            pre = prerender(ctx, blender)
+            pre = prepare_edit_menu(ctx, blender)
         except Exception as e:
             update_step(ctx, "s1_phase1", status=STATUS_FAIL, error=str(e))
             results.append(Phase1Result(ctx.obj_id, ok=False, error=str(e)))
@@ -309,7 +309,7 @@ async def run_many_async(
 
 # ─────────────────── streaming pipeline (mp pool + N VLM consumers) ──
 
-def _prerender_worker(args: tuple) -> tuple | None:
+def _prepare_edit_menu_worker(args: tuple) -> tuple | None:
     """Top-level pickleable worker for ProcessPoolExecutor.
 
     Builds a text semantic list for one object using v3 build_semantic_list.
@@ -318,10 +318,10 @@ def _prerender_worker(args: tuple) -> tuple | None:
     """
     mesh_npz, image_npz, _blender, _unused, anno_obj_dir_str = args
     from pathlib import Path as _P
-    from partcraft.pipeline_v3.s1_vlm_core import (  # noqa: E402
+    from partcraft.pipeline_v3.vlm_core import (  # noqa: E402
         build_semantic_list as _bsl,
         USER_PROMPT_TEXT_SEMANTIC as _U,
-        quota_for as _qf,
+        compute_edit_quota as _qf,
         MAX_PARTS as _MAX,
         _sample_global_note as _sgn,
     )
@@ -347,7 +347,7 @@ def _prerender_worker(args: tuple) -> tuple | None:
     return user_msg, pids, quota, menu
 
 
-async def run_many_streaming(
+async def gen_edits_streaming(
     ctxs: Iterable[ObjectContext],
     *,
     blender: str,
@@ -423,7 +423,7 @@ async def run_many_streaming(
         try:
             _anno_dir = (anno_dir / ctx.obj_id) if anno_dir else None
             pre = await loop.run_in_executor(
-                pool, _prerender_worker,
+                pool, _prepare_edit_menu_worker,
                 (str(ctx.mesh_npz), str(ctx.image_npz),
                  blender, "",  # unused slot kept for worker signature compat
                  str(_anno_dir) if _anno_dir else ""),
@@ -460,7 +460,7 @@ async def run_many_streaming(
                 return
             ctx, pre = item
             user_msg, pids, quota, menu = pre
-            res = await _call_one(client, ctx, user_msg, pids, quota,
+            res = await _call_vlm_for_one(client, ctx, user_msg, pids, quota,
                                   vlm_model, sem, part_menu=menu)
             results.append(res)
             n_done += 1
@@ -483,6 +483,6 @@ async def run_many_streaming(
 
 
 __all__ = [
-    "Phase1Result", "prerender", "run_one",
-    "run_many_async", "run_many_streaming",
+    "Phase1Result", "prepare_edit_menu", "gen_edits_for_one",
+    "gen_edits_async", "gen_edits_streaming",
 ]

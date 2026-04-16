@@ -40,7 +40,7 @@ from typing import Iterable
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT))
 
-from partcraft.pipeline_v3.s5_3d_utils import resolve_2d_conditioning  # noqa: E402
+from partcraft.pipeline_v3.trellis_utils import resolve_2d_conditioning  # noqa: E402
 from .paths import ObjectContext
 from . import services_cfg as psvc
 
@@ -102,7 +102,7 @@ def run_for_object(
     """Edit all GPU specs for one object using a pre-loaded ``refiner``."""
     from partcraft.trellis.refiner import build_prompts_from_spec
 
-    log = logger or logging.getLogger("pipeline_v3.s5")
+    log = logger or logging.getLogger("pipeline_v3.trellis")
     res = Trellis3DResult(obj_id=ctx.obj_id)
 
     all_specs = []
@@ -257,7 +257,7 @@ def run(
     The orchestrator (step 12) calls this once per GPU subprocess with
     a sliced list of contexts and a per-process ``CUDA_VISIBLE_DEVICES``.
     """
-    log = logger or logging.getLogger("pipeline_v3.s5")
+    log = logger or logging.getLogger("pipeline_v3.trellis")
     log.info("[s5] CUDA_VISIBLE_DEVICES=%s", os.environ.get("CUDA_VISIBLE_DEVICES"))
 
     p25_cfg = psvc.trellis_image_edit_flat(cfg)

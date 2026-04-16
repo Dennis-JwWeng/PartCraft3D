@@ -29,17 +29,17 @@ SHARD          = "08"
 
 import sys
 sys.path.insert(0, str(REPO_ROOT))
-from partcraft.pipeline_v3.s1_vlm_core import (
+from partcraft.pipeline_v3.vlm_core import (
     SYSTEM_PROMPT_S1, SYSTEM_PROMPT_S2,
     build_image_only_menu,     # Stage 1 uses colour-only menu
     build_s1_user_prompt,
     build_s2_user_prompt,
     parse_s1_output,
-    call_vlm_async,            # Stage 1: image call
+    call_vlm_image_async,            # Stage 1: image call
     call_vlm_text_async,       # Stage 2: text-only call
     extract_json_object,
-    validate_simple,
-    quota_for,
+    validate_edit_json,
+    compute_edit_quota,
 )
 
 
@@ -114,7 +114,7 @@ async def process_one(
     client = AsyncOpenAI(base_url=url, api_key="EMPTY")
 
     try:
-        s1_raw = await call_vlm_async(client, overview_bytes,
+        s1_raw = await call_vlm_image_async(client, overview_bytes,
                                        SYSTEM_PROMPT_S1, s1_user,
                                        vlm_model, max_tokens=1024)
     except Exception as e:
@@ -144,7 +144,7 @@ async def process_one(
              f"({n_vis} visible, {n_hid} null/hidden)")
 
     # ── Stage 2: text → edits (visible parts only) ───────────────────────────
-    quota   = quota_for(n_vis)   # quota based on visible parts count
+    quota   = compute_edit_quota(n_vis)   # quota based on visible parts count
     s2_user = build_s2_user_prompt(
         s1_parsed["parts_visible"],
         s1_parsed.get("object_desc", ""),
@@ -166,7 +166,7 @@ async def process_one(
     s2_parsed = extract_json_object(s2_raw)  # already returns dict | None
     validation = {"ok": False, "errors": ["no_json"]}
     if s2_parsed is not None:
-        validation = validate_simple(s2_parsed, set(pids), quota)
+        validation = validate_edit_json(s2_parsed, set(pids), quota)
 
     # Merge s1 part names back into the parsed object for provenance
     all_parts = s1_parsed["parts_visible"] + s1_parsed["parts_hidden"]

@@ -22,7 +22,7 @@ sys.path.insert(0, str(_ROOT))
 from partcraft.pipeline_v2.paths import PipelineRoot, ObjectContext
 from partcraft.pipeline_v2.specs import iter_deletion_specs
 from partcraft.pipeline_v2.qc_io import is_gate_a_failed
-from partcraft.pipeline_v2.s5b_deletion import _backfill_add
+from partcraft.pipeline_v3.mesh_deletion import _write_addition_meta as _backfill_add
 
 
 def main() -> None:

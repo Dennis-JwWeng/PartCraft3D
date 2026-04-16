@@ -65,9 +65,9 @@ def _prerender(obj_id: str, mode: str) -> tuple | None:
     """Build menu + quota + formatted prompts for one object. Returns None on skip."""
     import sys
     sys.path.insert(0, str(REPO_ROOT))
-    from partcraft.pipeline_v3.s1_vlm_core import (
+    from partcraft.pipeline_v3.vlm_core import (
         build_image_semantic_menu, build_image_only_menu, build_semantic_list,
-        build_prompt_for_mode, quota_for,
+        build_prompt_for_mode, compute_edit_quota,
     )
     mnpz = MESH_ROOT   / SHARD / f"{obj_id}.npz"
     inpz = IMAGES_ROOT / SHARD / f"{obj_id}.npz"
@@ -82,7 +82,7 @@ def _prerender(obj_id: str, mode: str) -> tuple | None:
     else:
         pids, menu = build_semantic_list(mnpz, inpz)
 
-    quota = quota_for(len(pids))
+    quota = compute_edit_quota(len(pids))
     sys_p, usr_p = build_prompt_for_mode(mode, pids, menu, quota, variety_seed=hash(obj_id))
     return ov.read_bytes(), sys_p, usr_p, pids, quota
 
@@ -93,8 +93,8 @@ async def _call_one(client, sem, obj_id, mode, png, sys_p, usr_p,
                     pids, quota, vlm_model, out_dir) -> dict:
     import sys
     sys.path.insert(0, str(REPO_ROOT))
-    from partcraft.pipeline_v3.s1_vlm_core import (
-        call_vlm_async, call_vlm_text_async, extract_json_object, validate_simple,
+    from partcraft.pipeline_v3.vlm_core import (
+        call_vlm_image_async, call_vlm_text_async, extract_json_object, validate_edit_json,
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     ov_link = out_dir / "overview.png"
@@ -110,7 +110,7 @@ async def _call_one(client, sem, obj_id, mode, png, sys_p, usr_p,
             if mode == "text_semantic":
                 raw = await call_vlm_text_async(client, sys_p, usr_p, vlm_model, max_tokens=8192)
             else:
-                raw = await call_vlm_async(client, png, sys_p, usr_p, vlm_model, max_tokens=8192)
+                raw = await call_vlm_image_async(client, png, sys_p, usr_p, vlm_model, max_tokens=8192)
         except Exception as e:
             log.warning("%s [%s] VLM error: %s", obj_id[:12], mode, e)
             return {"obj_id": obj_id, "mode": mode, "ok": False, "error": str(e)}
@@ -126,7 +126,7 @@ async def _call_one(client, sem, obj_id, mode, png, sys_p, usr_p,
             (out_dir / "parsed.json").write_text(json.dumps(rec, indent=2))
             return rec
 
-        rep = validate_simple(parsed, set(pids), quota=quota)
+        rep = validate_edit_json(parsed, set(pids), quota=quota)
         out = {"obj_id": obj_id, "mode": mode, "validation": rep, "parsed": parsed}
         (out_dir / "parsed.json").write_text(json.dumps(out, indent=2, ensure_ascii=False))
         log.info("%s [%s] %s  kept=%d/%d  %.1fs",

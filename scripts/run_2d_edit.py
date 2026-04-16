@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Standalone 2D edit utility.
 
-This module is imported by ``partcraft.pipeline_v2.s4_flux_2d`` (Step 4)
-and ``partcraft.pipeline_v2.s5_3d_utils`` to provide 2D image editing helpers.
+This module provides 2D image editing helpers for the FLUX service.
 
 Phase 2D: Batch 2D image editing for TRELLIS-bound edit specs.
 

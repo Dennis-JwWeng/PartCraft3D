@@ -2,7 +2,7 @@
 """Mode E: Text-only edit generation (Mode B) + per-edit VLM alignment gate.
 
 Phase 1 (text): build_semantic_list -> call_vlm_text_async(SYSTEM_PROMPT_B)
-Phase 2 (image): for each edit, build 5x2 gate image -> call_vlm_async(SYSTEM_PROMPT_ALIGN_GATE)
+Phase 2 (image): for each edit, build 5x2 gate image -> call_vlm_image_async(SYSTEM_PROMPT_ALIGN_GATE)
 
 Usage:
     python scripts/tools/run_text_align_gate_test.py \
@@ -35,17 +35,17 @@ SHARD          = "08"
 import sys
 sys.path.insert(0, str(REPO_ROOT))
 
-from partcraft.pipeline_v3.s1_vlm_core import (
+from partcraft.pipeline_v3.vlm_core import (
     SYSTEM_PROMPT_B,
     SYSTEM_PROMPT_ALIGN_GATE,
     build_semantic_list,
-    build_align_gate_user_prompt,
-    parse_align_gate_output,
-    call_vlm_async,
+    build_text_align_gate_prompt,
+    parse_text_align_response,
+    call_vlm_image_async,
     call_vlm_text_async,
     extract_json_object,
-    validate_simple,
-    quota_for,
+    validate_edit_json,
+    compute_edit_quota,
 )
 from partcraft.pipeline_v3.qc_rules import (
     check_rules,
@@ -171,7 +171,7 @@ async def process_one(
         log.warning("[%s] build_semantic_list failed: %s", obj_id, e)
         return {"obj_id": obj_id, "status": "p1_fail", "error": f"sem_list: {e}"}
 
-    quota   = quota_for(len(pids))
+    quota   = compute_edit_quota(len(pids))
     n_total = sum(quota.values())
     quota_line = (
         f"Generate EXACTLY {n_total} edits — "
@@ -193,7 +193,7 @@ async def process_one(
     p1_parsed = extract_json_object(p1_raw)
     validation = {"ok": False, "errors": ["no_json"]}
     if p1_parsed is not None:
-        validation = validate_simple(p1_parsed, set(pids), quota)
+        validation = validate_edit_json(p1_parsed, set(pids), quota)
 
     (out_dir / "parsed.json").write_text(
         json.dumps({"obj_id": obj_id, "mode": "text_align",
@@ -271,13 +271,13 @@ async def process_one(
 
         # Layer 3: VLM alignment gate
         gate_img = build_gate_image(ov_img, sel, column_map)
-        gate_user = build_align_gate_user_prompt(et, prompt, sel)
+        gate_user = build_text_align_gate_prompt(et, prompt, sel)
 
         try:
-            gate_raw = await call_vlm_async(
+            gate_raw = await call_vlm_image_async(
                 client, gate_img, SYSTEM_PROMPT_ALIGN_GATE, gate_user,
                 vlm_model, max_tokens=256)
-            gate_out = parse_align_gate_output(gate_raw)
+            gate_out = parse_text_align_response(gate_raw)
         except Exception as e:
             log.warning("[%s] %s gate VLM error: %s", obj_id, eid, e)
             gate_out = None

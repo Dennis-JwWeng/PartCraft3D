@@ -7,19 +7,19 @@ Mode B (text_semantic)  — text-only edit generation from part captions
   call_vlm_text_async
 
 Mode E alignment gate   — per-edit VLM image+text judge (gate_text_align step)
-  SYSTEM_PROMPT_ALIGN_GATE, build_align_gate_user_prompt, parse_align_gate_output,
-  call_vlm_async
+  SYSTEM_PROMPT_ALIGN_GATE, build_text_align_gate_prompt, parse_text_align_response,
+  call_vlm_image_async
 
 Shared utilities
-  VIEW_INDICES, extract_json_object, quota_for, validate_simple,
-  render_overview_png, _sample_global_note, _GLOBAL_STYLE_POOL
+  VIEW_INDICES, extract_json_object, compute_edit_quota, validate_edit_json,
+  render_overview_png, _pick_global_edit_note, _GLOBAL_STYLE_POOL
 
 Commented-out sections (preserved for reference)
-  Legacy v2-era SYSTEM_PROMPT / USER_PROMPT_TEMPLATE  (live in pipeline_v2.s1_vlm_core)
+  Legacy v2-era SYSTEM_PROMPT / USER_PROMPT_TEMPLATE  (deleted with pipeline_v2)
   Mode A "image_semantic" — build_image_semantic_menu, SYSTEM_PROMPT_A
   Mode C "image_only"    — build_image_only_menu, SYSTEM_PROMPT_C
   Mode D "two-stage"     — SYSTEM_PROMPT_S1/S2, build_s1/s2_user_prompt, parse_s1_output
-  validate()             — legacy validator (imported from pipeline_v2.s1_vlm_core)
+  validate()             — legacy validator (removed with pipeline_v2)
 """
 from __future__ import annotations
 
@@ -414,7 +414,7 @@ def render_overview_png(mesh_npz: Path, img_npz: Path, blender: str) -> bytes:
 #     return resp.choices[0].message.content or ""
 #
 
-async def call_vlm_async(client, image_png, system, user, model, max_tokens=4096):
+async def call_vlm_image_async(client, image_png, system, user, model, max_tokens=4096):
     b64 = base64.b64encode(image_png).decode()
     resp = await client.chat.completions.create(
         model=model,
@@ -487,7 +487,7 @@ N_VIEWS = 5  # must match len(VIEW_INDICES) in render_part_overview
 MAX_PARTS = 16  # objects with more parts are skipped
 
 
-def quota_for(n_parts: int) -> dict:
+def compute_edit_quota(n_parts: int) -> dict:
     """Per-edit-type quotas based on number of (valid) parts.
 
     Deletion and modification use semantic-group ceilings: parts sharing the
@@ -601,20 +601,20 @@ __all__ = [
     # ── shared utilities ──────────────────────────────────────────────
     "VIEW_INDICES", "MAX_PARTS", "EDIT_TYPES", "N_VIEWS",
     "render_overview_png",
-    "call_vlm_async",
-    "extract_json_object", "quota_for",
+    "call_vlm_image_async",
+    "extract_json_object", "compute_edit_quota",
     # ── Mode B: text_semantic (edit generation, no image) ─────────────
     "SYSTEM_PROMPT_B", "USER_PROMPT_TEXT_SEMANTIC",
     "build_semantic_list",
     "call_vlm_text_async",
-    "validate_simple",
+    "validate_edit_json",
     "_GLOBAL_STYLE_POOL", "_sample_global_note",
     # ── Mode E: alignment gate ────────────────────────────────────────
     "SYSTEM_PROMPT_ALIGN_GATE",
-    "build_align_gate_user_prompt",
-    "parse_align_gate_output",
+    "build_text_align_gate_prompt",
+    "parse_text_align_response",
     "run_gate_quality",
-    "build_gate_image",
+    "build_text_align_gate_image",
     "run_gate_text_align",
     # ── Quality judge prompts ─────────────────────────────────────────
     "JUDGE_SYSTEM_PROMPTS",
@@ -626,9 +626,9 @@ __all__ = [
     "JUDGE_SYSTEM_PROMPT_GLOBAL",
     "JUDGE_SYSTEM_PROMPT_ADDITION",
     "JUDGE_SYSTEM_PROMPT_GENERIC",
-    "build_judge_user_prompt",
-    "parse_judge_output",
-    "extract_judge_json",
+    "build_quality_judge_prompt",
+    "parse_quality_judge_response",
+    "extract_quality_judge_json",
 ]
 
 
@@ -1125,7 +1125,7 @@ async def call_vlm_text_async(
 # ═══════════════════════════════════════════════════════════════════════
 
 # Full pool by category.  NEVER use bare items from this list in prompts;
-# always go through _sample_global_note() so each object sees a shuffled
+# always go through _pick_global_edit_note() so each object sees a shuffled
 # subset — this breaks the position-bias that makes Qwen pick cel-shading
 # and LEGO every time.
 _GLOBAL_STYLE_POOL: dict[str, list[str]] = {
@@ -1178,7 +1178,7 @@ _GLOBAL_STYLE_POOL: dict[str, list[str]] = {
 _POOL_CATS = list(_GLOBAL_STYLE_POOL.keys())  # ["Rendering", "Historical", "Genre"]
 
 
-def _sample_global_note(variety_seed: int, n_global: int) -> str:
+def _pick_global_edit_note(variety_seed: int, n_global: int) -> str:
     """Return a per-object mandatory style roster injected into the user prompt.
 
     Shows 2-3 randomly-ordered choices per category (seeded by variety_seed).
@@ -1237,7 +1237,7 @@ def _sample_global_note(variety_seed: int, n_global: int) -> str:
 #                           "image_only"     — image + colour-only menu (Mode C)
 #         pids:           list of valid part IDs
 #         part_menu:      pre-built menu string from the matching builder
-#         quota:          output of quota_for()
+#         quota:          output of compute_edit_quota()
 #         variety_seed:   integer seed for per-object style randomisation.
 #                         Pass hash(obj_id) or any per-object integer. When
 #                         None, falls back to a seed derived from pids (less
@@ -1248,7 +1248,7 @@ def _sample_global_note(variety_seed: int, n_global: int) -> str:
 #
 #     n_global = quota.get("global", 0)
 #     seed = variety_seed if variety_seed is not None else hash(tuple(sorted(pids)))
-#     global_note = _sample_global_note(seed, n_global) if n_global > 0 else ""
+#     global_note = _pick_global_edit_note(seed, n_global) if n_global > 0 else ""
 #
 #     n_total = sum(quota.values())
 #     fmt = dict(
@@ -1279,10 +1279,10 @@ def _sample_global_note(variety_seed: int, n_global: int) -> str:
 #
 #
 # ═══════════════════════════════════════════════════════════════════════
-#  validate_simple — lighter validator for the simplified output schema
+#  validate_edit_json — lighter validator for the simplified output schema
 # ═══════════════════════════════════════════════════════════════════════
 
-def validate_simple(parsed: dict, valid_pids: set[int], quota: dict | None = None) -> dict:
+def validate_edit_json(parsed: dict, valid_pids: set[int], quota: dict | None = None) -> dict:
     """Validator for the simplified schema (no stage1/2 fields required).
 
     Required per edit: edit_type, selected_part_ids, prompt, view_index.
@@ -1379,7 +1379,7 @@ def validate_simple(parsed: dict, valid_pids: set[int], quota: dict | None = Non
 # # ═══════════════════════════════════════════════════════════════════════
 # #  TWO-STAGE PIPELINE  (Mode D — image→semantics then text→edits)
 # #
-# #  Stage 1  call_vlm_async(image + colour menu)  → s1_parts JSON
+# #  Stage 1  call_vlm_image_async(image + colour menu)  → s1_parts JSON
 # #  Stage 2  call_vlm_text_async(s1_parts text)   → edit JSON   (no image)
 # #
 # #  Key invariant: the image is ONLY seen in Stage 1. Stage 2 is fully
@@ -1466,7 +1466,7 @@ def validate_simple(parsed: dict, valid_pids: set[int], quota: dict | None = Non
 #     pids = [p["part_id"] for p in s1_parts]
 #     n_global = quota.get("global", 0)
 #     seed = variety_seed if variety_seed is not None else hash(tuple(sorted(pids)))
-#     global_note = _sample_global_note(seed, n_global) if n_global > 0 else ""
+#     global_note = _pick_global_edit_note(seed, n_global) if n_global > 0 else ""
 #
 #     part_lines = []
 #     for p in sorted(s1_parts, key=lambda x: x["part_id"]):
@@ -1589,7 +1589,7 @@ RULES:
       Choose best_view from the RGB photos based on overall object visibility.
 """
 
-def build_align_gate_user_prompt(
+def build_text_align_gate_prompt(
     edit_type: str,
     prompt: str,
     selected_part_ids: list[int],
@@ -1603,7 +1603,7 @@ def build_align_gate_user_prompt(
     )
 
 
-def parse_align_gate_output(raw: str) -> dict | None:
+def parse_text_align_response(raw: str) -> dict | None:
     """Parse alignment gate VLM response.
 
     Returns dict with at least {"aligned": bool, "reason": str, "best_view": int}
@@ -1635,7 +1635,7 @@ import logging
 # cv2 imported lazily inside _qe_* functions to avoid hard dep at module load
 
 # Pipeline submodule imports for gate_quality are done lazily inside
-# each function to avoid the specs.py -> s1_vlm_core.py circular import.
+# each function to avoid the specs.py -> vlm_core.py circular import.
 
 _QE_DEFS = {
     # edit_type → default thresholds (overridden by qc.thresholds_by_type in config)
@@ -1653,7 +1653,7 @@ _QE_DEFS = {
 _LOG_QE = logging.getLogger("pipeline_v3.gate_quality")
 
 
-def _qe_passes(judge_json: dict, edit_type: str, thresholds: dict) -> bool:
+def _passes_quality_thresholds(judge_json: dict, edit_type: str, thresholds: dict) -> bool:
     """Return True if the judge result meets the QC thresholds for *edit_type*."""
     t = {**_QE_DEFS.get(edit_type, {}), **(thresholds.get(edit_type) or {})}
     if not judge_json.get("edit_executed", False):
@@ -1671,7 +1671,7 @@ def _qe_passes(judge_json: dict, edit_type: str, thresholds: dict) -> bool:
     return True
 
 
-def _qe_load_before_imgs(ctx) -> "list | None":
+def _load_before_view_images(ctx) -> "list | None":
     """Load 5 before-state BGR images from the images NPZ at VIEW_INDICES."""
     from .specs import VIEW_INDICES  # lazy — avoid circular import at module level
     if ctx.image_npz is None or not ctx.image_npz.is_file():
@@ -1684,7 +1684,7 @@ def _qe_load_before_imgs(ctx) -> "list | None":
         return None
 
 
-def _qe_load_after_previews(edit_dir: "Path") -> "list | None":
+def _load_after_preview_images(edit_dir: "Path") -> "list | None":
     """Load preview_0.png … preview_4.png from *edit_dir*. Returns None on any missing file."""
     import numpy as np
     import cv2 as _cv2
@@ -1700,7 +1700,7 @@ def _qe_load_after_previews(edit_dir: "Path") -> "list | None":
     return imgs
 
 
-def _qe_make_collage(before_imgs: list, after_imgs: list) -> "bytes | None":
+def _make_before_after_collage(before_imgs: list, after_imgs: list) -> "bytes | None":
     """Build a 2-row × 5-col PNG collage (top = before, bottom = after)."""
     import cv2 as _cv2
     import numpy as np
@@ -1724,7 +1724,7 @@ def _qe_make_collage(before_imgs: list, after_imgs: list) -> "bytes | None":
         return None
 
 
-def _qe_iter_add_edits(ctx):
+def _iter_unapproved_add_edits(ctx):
     """Yield (edit_id, meta_dict) for addition edits from edits_3d/*/meta.json."""
     if not ctx.edits_3d_dir.is_dir():
         return
@@ -1749,8 +1749,8 @@ def _qe_iter_add_edits(ctx):
 #
 # Pattern mirrors the alignment gate:
 #   JUDGE_SYSTEM_PROMPTS[edit_type]  — large, directly readable system prompt
-#   build_judge_user_prompt(...)     — tiny function, fills per-edit variables
-#   parse_judge_output(raw)          — extracts the JSON response
+#   build_quality_judge_prompt(...)     — tiny function, fills per-edit variables
+#   parse_quality_judge_response(raw)          — extracts the JSON response
 # ============================================================================
 
 # Schema appended to every system prompt so the model always sees output rules.
@@ -1995,7 +1995,7 @@ JUDGE_SYSTEM_PROMPTS: dict = {
 }
 
 
-def build_judge_user_prompt(
+def build_quality_judge_prompt(
     edit_type: str,
     edit_prompt: str,
     object_desc: str,
@@ -2041,13 +2041,13 @@ def build_judge_user_prompt(
     return "\n".join(lines)
 
 
-def parse_judge_output(raw: str) -> "dict | None":
+def parse_quality_judge_response(raw: str) -> "dict | None":
     """Extract the quality judge JSON from a VLM response string.
 
     Returns a dict with at least the required fields, or None on failure.
     """
     required = {"edit_executed", "visual_quality", "reason"}
-    result = extract_judge_json(raw)
+    result = extract_quality_judge_json(raw)
     if result is None:
         return None
     if not required.issubset(result.keys()):
@@ -2059,7 +2059,7 @@ def parse_judge_output(raw: str) -> "dict | None":
 # JSON extractor (self-contained — no vlm_filter dependency)
 # ---------------------------------------------------------------------------
 
-def _judge_balanced_brace(s: str, start: int) -> "str | None":
+def _find_balanced_brace(s: str, start: int) -> "str | None":
     """Return the balanced JSON-object substring starting at s[start], or None."""
     if start < 0 or start >= len(s) or s[start] != "{":
         return None
@@ -2081,14 +2081,14 @@ def _judge_balanced_brace(s: str, start: int) -> "str | None":
     return None
 
 
-def extract_judge_json(content: str) -> "dict | None":
+def extract_quality_judge_json(content: str) -> "dict | None":
     """Extract the first valid JSON object from a VLM response string."""
     import json as _json
     required = {"edit_executed", "visual_quality", "reason"}
     candidates = []
     for i, c in enumerate(content):
         if c == "{":
-            sub = _judge_balanced_brace(content, i)
+            sub = _find_balanced_brace(content, i)
             if sub:
                 candidates.append(sub)
     for blob in candidates:
@@ -2101,7 +2101,7 @@ def extract_judge_json(content: str) -> "dict | None":
     # last-resort: grab last {...} in content
     last = content.rfind("{")
     if last >= 0:
-        sub = _judge_balanced_brace(content, last)
+        sub = _find_balanced_brace(content, last)
         if sub:
             try:
                 obj = _json.loads(sub)
@@ -2112,7 +2112,7 @@ def extract_judge_json(content: str) -> "dict | None":
     return None
 
 
-async def _qe_call_vlm_judge(
+async def _call_quality_judge_vlm(
     client,
     model: str,
     img_bytes: bytes,
@@ -2128,14 +2128,14 @@ async def _qe_call_vlm_judge(
     """Async VLM judge call with retry.
 
     Uses ``JUDGE_SYSTEM_PROMPTS[edit_type]`` as the system message and
-    ``build_judge_user_prompt(...)`` to build the per-edit user message,
+    ``build_quality_judge_prompt(...)`` to build the per-edit user message,
     mirroring the alignment-gate pattern.
     """
     b64 = _base64.b64encode(img_bytes).decode("utf-8")
     system_prompt = JUDGE_SYSTEM_PROMPTS.get(
         edit_type.lower(), JUDGE_SYSTEM_PROMPT_GENERIC
     )
-    user_text = build_judge_user_prompt(
+    user_text = build_quality_judge_prompt(
         edit_type, edit_prompt, object_desc, part_label,
         target_part_desc=target_part_desc,
         edit_params=edit_params or {},
@@ -2175,7 +2175,7 @@ async def _qe_call_vlm_judge(
                 if attempt < max_retries:
                     await _asyncio.sleep(2 * (attempt + 1))
                 continue
-            result = extract_judge_json(content)
+            result = extract_quality_judge_json(content)
             if result is not None:
                 return result
         except Exception as e:
@@ -2186,7 +2186,7 @@ async def _qe_call_vlm_judge(
     return None
 
 
-async def _qe_judge_one(
+async def _judge_edit_quality(
     client,
     vlm_model: str,
     edit_id: str,
@@ -2210,7 +2210,7 @@ async def _qe_judge_one(
     """
     from .qc_io import update_edit_gate as _update_edit_gate
     from .edit_status_io import update_edit_stage as _update_edit_stage
-    after_imgs = _qe_load_after_previews(edit_dir)
+    after_imgs = _load_after_preview_images(edit_dir)
     if after_imgs is None:
         _update_edit_gate(ctx, edit_id, edit_type, "E",
                           vlm_result={"pass": False, "score": 0.0,
@@ -2218,7 +2218,7 @@ async def _qe_judge_one(
         _update_edit_stage(ctx, edit_id, edit_type, "gate_e", status="fail")
         return False, 0, 1
 
-    coll = _qe_make_collage(after_imgs, before_imgs) if swap_collage else            _qe_make_collage(before_imgs, after_imgs)
+    coll = _make_before_after_collage(after_imgs, before_imgs) if swap_collage else            _make_before_after_collage(before_imgs, after_imgs)
     if coll is None:
         _update_edit_gate(ctx, edit_id, edit_type, "E",
                           vlm_result={"pass": False, "score": 0.0,
@@ -2226,7 +2226,7 @@ async def _qe_judge_one(
         _update_edit_stage(ctx, edit_id, edit_type, "gate_e", status="fail")
         return False, 0, 1
 
-    j = await _qe_call_vlm_judge(
+    j = await _call_quality_judge_vlm(
         client, vlm_model, coll,
         edit_prompt=prompt, edit_type=edit_type,
         object_desc=obj_desc, part_label=part_label,
@@ -2239,7 +2239,7 @@ async def _qe_judge_one(
         _update_edit_stage(ctx, edit_id, edit_type, "gate_e", status="fail")
         return False, 0, 1
 
-    ok = _qe_passes(j, edit_type, thresholds)
+    ok = _passes_quality_thresholds(j, edit_type, thresholds)
     _update_edit_gate(ctx, edit_id, edit_type, "E",
                       vlm_result={"pass": ok,
                                   "score": round(j.get("visual_quality", 0) / 5.0, 2),
@@ -2249,7 +2249,7 @@ async def _qe_judge_one(
     return ok, (1 if ok else 0), (0 if ok else 1)
 
 
-async def _qe_process_one(
+async def _run_quality_gate_for_object(
     ctx,
     vlm_url: str,
     vlm_model: str,
@@ -2265,7 +2265,7 @@ async def _qe_process_one(
         return {"obj_id": ctx.obj_id, "skipped": True}
 
     n_pass = n_fail = n_skip = 0
-    before_imgs = _qe_load_before_imgs(ctx)
+    before_imgs = _load_before_view_images(ctx)
     if before_imgs is None:
         log.warning("[gate_quality] %s: cannot load before images from image_npz",
                     ctx.obj_id)
@@ -2282,7 +2282,7 @@ async def _qe_process_one(
             n_skip += 1
             continue
         edit_dir = ctx.edit_3d_dir(spec.edit_id)
-        _, dp, df = await _qe_judge_one(
+        _, dp, df = await _judge_edit_quality(
             client, vlm_model,
             spec.edit_id, spec.edit_type,
             spec.prompt, spec.object_desc,
@@ -2293,11 +2293,11 @@ async def _qe_process_one(
         )
         n_pass += dp; n_fail += df
 
-    for add_id, meta in _qe_iter_add_edits(ctx):
+    for add_id, meta in _iter_unapproved_add_edits(ctx):
         if not force and _is_edit_qc_failed(ctx, add_id):
             n_skip += 1
             continue
-        _, dp, df = await _qe_judge_one(
+        _, dp, df = await _judge_edit_quality(
             client, vlm_model,
             add_id, "addition",
             meta.get("prompt", ""),
@@ -2350,7 +2350,7 @@ async def run_gate_quality(
 
     async def _run_one(i: int, ctx: "_ObjectContext") -> dict:
         async with sem:
-            return await _qe_process_one(
+            return await _run_quality_gate_for_object(
                 ctx, vlm_urls[i % len(vlm_urls)], vlm_model, thresholds, force, log
             )
 
@@ -2377,7 +2377,7 @@ _GREY_BGR = (65, 65, 65)    # non-selected parts colour in gate image
 _LOG_GTA = logging.getLogger("pipeline_v3.gate_text_align")
 
 
-def _gta_extract_cell(
+def _extract_view_cell(
     img: "np.ndarray", col: int, row: int,
     n_views: int, col_sep: int, row_sep: int,
 ) -> "np.ndarray":
@@ -2390,7 +2390,7 @@ def _gta_extract_cell(
     return img[y0: y0 + H_cell, x0: x0 + W_cell].copy()
 
 
-def _gta_highlight_cell(
+def _highlight_view_cell(
     cell: "np.ndarray",
     selected_part_ids: "set[int]",
     palette_bgr: list,
@@ -2412,7 +2412,7 @@ def _gta_highlight_cell(
     return out.reshape(cell.shape).astype(np.uint8)
 
 
-def build_gate_image(
+def build_text_align_gate_image(
     ov_img: "np.ndarray",
     selected_part_ids: "list[int]",
     column_map: "list[int]",
@@ -2449,7 +2449,7 @@ def build_gate_image(
         return row
 
     top_cells = [
-        _gta_extract_cell(ov_img, v, 0, _N_VIEWS, _COL_SEP, _ROW_SEP)
+        _extract_view_cell(ov_img, v, 0, _N_VIEWS, _COL_SEP, _ROW_SEP)
         for v in column_map
     ]
 
@@ -2457,8 +2457,8 @@ def build_gate_image(
         full = _hstack(top_cells)
     else:
         bot_cells = [
-            _gta_highlight_cell(
-                _gta_extract_cell(ov_img, v, 1, _N_VIEWS, _COL_SEP, _ROW_SEP),
+            _highlight_view_cell(
+                _extract_view_cell(ov_img, v, 1, _N_VIEWS, _COL_SEP, _ROW_SEP),
                 sel_set, _PALETTE_BGR,
             )
             for v in column_map
@@ -2472,7 +2472,7 @@ def build_gate_image(
     return buf.tobytes()
 
 
-async def _gta_process_one(
+async def _run_text_align_gate_for_object(
     ctx,
     vlm_url: str,
     vlm_model: str,
@@ -2607,14 +2607,14 @@ async def _gta_process_one(
 
         # ── Layer 3: VLM alignment gate ───────────────────────────────
         try:
-            gate_img  = build_gate_image(ov_img, sel, column_map)
-            gate_user = build_align_gate_user_prompt(et, prompt, sel)
-            gate_raw  = await call_vlm_async(
+            gate_img  = build_text_align_gate_image(ov_img, sel, column_map)
+            gate_user = build_text_align_gate_prompt(et, prompt, sel)
+            gate_raw  = await call_vlm_image_async(
                 client, gate_img,
                 SYSTEM_PROMPT_ALIGN_GATE, gate_user,
                 vlm_model, max_tokens=256,
             )
-            gate_out = parse_align_gate_output(gate_raw)
+            gate_out = parse_text_align_response(gate_raw)
         except Exception as exc:
             log.warning("[gate_text_align] %s edit %d VLM error: %s",
                         ctx.obj_id, idx, exc)
@@ -2683,7 +2683,7 @@ async def run_gate_text_align(
 
     async def _run_one(i: int, ctx) -> dict:
         async with sem:
-            return await _gta_process_one(
+            return await _run_text_align_gate_for_object(
                 ctx, vlm_urls[i % len(vlm_urls)], vlm_model, force, log
             )
 

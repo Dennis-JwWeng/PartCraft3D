@@ -257,7 +257,7 @@ def run_step(
 
     Each branch is self-contained: it imports its runner, resolves its
     service URLs / paths from cfg, and delegates to the runner's ``run()``
-    or ``run_many_streaming()`` function.
+    or ``gen_edits_streaming()`` function.
 
     The ``post_object_fn`` hook (only used by ``gen_edits``) allows
     ``gate_text_align`` to run inline immediately after each object's
@@ -281,7 +281,7 @@ def run_step(
     # of edit instructions (deletion / modification / material / etc.).
     # Output: phase1/parsed.json + phase1/overview.png per object.
     if step == "gen_edits":
-        from .s1_phase1_vlm import run_many_streaming
+        from .gen_edits import gen_edits_streaming
         import asyncio
         urls = ([u.strip() for u in args.vlm_url.split(",") if u.strip()]
                 if getattr(args, "vlm_url", None)
@@ -289,7 +289,7 @@ def run_step(
         model = psvc.vlm_model_name(cfg)
         blender = resolve_blender_executable(cfg)
         n_pre = int((cfg.get("pipeline") or {}).get("prerender_workers", 8))
-        asyncio.run(run_many_streaming(
+        asyncio.run(gen_edits_streaming(
             ctxs, blender=blender, vlm_urls=urls,
             vlm_model=model, n_prerender_workers=n_pre,
             force=args.force,
@@ -303,7 +303,7 @@ def run_step(
     # image, and the edit type is consistent with the prompt.
     # Writes gate_a: pass/fail to edit_status.json for every edit.
     elif step == "gate_text_align":
-        from .s1_vlm_core import run_gate_text_align
+        from .vlm_core import run_gate_text_align
         import asyncio
         urls = ([u.strip() for u in args.vlm_url.split(",") if u.strip()]
                 if getattr(args, "vlm_url", None) else sched.vlm_urls_for(cfg))
@@ -320,8 +320,8 @@ def run_step(
     # face-centroid matching.  Produces edits_3d/<edit_id>/after_new.glb.
     # Also backfills a paired add_* meta.json for the inverse addition.
     elif step == "del_mesh":
-        from .s5b_deletion import run_mesh_delete
-        run_mesh_delete(ctxs, cfg=cfg, images_root=images_root,
+        from .mesh_deletion import run_deletion_batch
+        run_deletion_batch(ctxs, cfg=cfg, images_root=images_root,
                         mesh_root=mesh_root, shard=shard,
                         normalized_glb_dir=roots.normalized_glb_dir,
                         anno_dir=roots.anno_dir,
@@ -333,7 +333,7 @@ def run_step(
     # every deletion edit.  Output: edits_3d/<edit_id>/preview_{0..4}.png.
     # These previews are the "after" row of the Gate E collage.
     elif step == "preview_del":
-        from .s6_preview import run_del as s6p_del_run
+        from .preview_render import render_del_previews_batch as s6p_del_run
         blender = resolve_blender_executable(cfg)
         try:
             _gpus = sched.gpus_for(cfg)
@@ -351,7 +351,7 @@ def run_step(
     # edit_executed / visual_quality / correct_region / preserve_other.
     # Writes gate_e: pass/fail to edit_status.json.
     elif step == "gate_quality":
-        from .s1_vlm_core import run_gate_quality as sq3_run
+        from .vlm_core import run_gate_quality as sq3_run
         import asyncio
         urls = ([u.strip() for u in args.vlm_url.split(",") if u.strip()]
                 if getattr(args, "vlm_url", None) else sched.vlm_urls_for(cfg))
@@ -367,7 +367,7 @@ def run_step(
     # edits_2d/<edit_id>_input.png + edits_2d/<edit_id>_edited.png.
     # Requires gate_a == pass. Use --flux-url or services.image_edit.base_urls.
     elif step == "flux_2d":
-        from .s4_flux_2d import run as s4_run
+        from .flux_2d import run as s4_run
         urls = ([u.strip() for u in args.flux_url.split(",") if u.strip()]
                 if getattr(args, "flux_url", None)
                 else sched.flux_urls_for(cfg))
@@ -383,7 +383,7 @@ def run_step(
     # the original mesh.npz SLAT to produce edits_3d/<edit_id>/after.npz.
     # Multi-GPU via dispatch_gpus(). Requires gate_a == pass.
     elif step == "trellis_3d":
-        from .s5_trellis_3d import run as s5_run
+        from .trellis_3d import run as s5_run
         s5_run(ctxs, cfg=cfg, images_root=images_root, mesh_root=mesh_root,
                shard=shard, prereq_map=prereq_map, force=args.force, logger=log)
 
@@ -392,7 +392,7 @@ def run_step(
     # Output: edits_3d/<edit_id>/preview_{0..4}.png for flux edits.
     # Consumed by gate_quality as the "after" collage row.
     elif step == "preview_flux":
-        from .s6_preview import run_flux as s6p_flux_run
+        from .preview_render import render_flux_previews_batch as s6p_flux_run
         ckpt = psvc.image_edit_service(cfg).get(
             "trellis_text_ckpt", "checkpoints/TRELLIS-text-xlarge")
         s6p_flux_run(ctxs, ckpt=ckpt, prereq_map=prereq_map,
@@ -403,7 +403,7 @@ def run_step(
     # Requires gate_e == pass. Optional for Mode E; can be omitted if
     # only the 5-view preview is needed.
     elif step == "render_3d":
-        from .s6_render_3d import run as s6_run
+        from .render_3d import run as s6_run
         ckpt = psvc.image_edit_service(cfg).get(
             "trellis_text_ckpt", "checkpoints/TRELLIS-text-xlarge")
         s6_run(ctxs, ckpt=ckpt, prereq_map=prereq_map,
@@ -414,9 +414,9 @@ def run_step(
     # SLAT encoder → SS encoder → after.npz.
     # Requires gate_e == pass. Not yet in default flow; uncomment to enable.
     # elif step == "reencode_del":
-    #     from .s5b_deletion import run_reencode
+    #     from .mesh_deletion import link_slat_assets_batch
     #     blender = resolve_blender_executable(cfg)
-    #     run_reencode(ctxs, cfg=cfg, blender_path=blender,
+    #     link_slat_assets_batch(ctxs, cfg=cfg, blender_path=blender,
     #                  num_views=psvc.step_params_for(cfg, "s5").get("num_views", 40),
     #                  prereq_map=prereq_map, force=args.force, logger=log)
 
@@ -626,7 +626,7 @@ def main():
         # attach gate_text_align as a per-object callback so it fires
         # immediately after each object's Phase 1 VLM call completes.
         if step == "gen_edits" and "gate_text_align" in steps:
-            from .s1_vlm_core import run_gate_text_align as _run_gta
+            from .vlm_core import run_gate_text_align as _run_gta
             _vlm_model = psvc.vlm_model_name(cfg)
             _force = args.force
             _gta_urls = sched.vlm_urls_for(cfg)

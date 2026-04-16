@@ -59,7 +59,7 @@ class PreviewResult:
     error: str | None = None
 
 
-def _build_pipeline(ckpt: str, logger: logging.Logger):
+def _load_trellis_pipeline(ckpt: str, logger: logging.Logger):
     """Load TRELLIS pipeline onto GPU."""
     from trellis.pipelines import TrellisTextTo3DPipeline  # type: ignore
     logger.info("[s6p] loading TRELLIS %s", ckpt)
@@ -69,12 +69,12 @@ def _build_pipeline(ckpt: str, logger: logging.Logger):
     return pipe
 
 
-def _previews_exist(edit_dir: Path, n: int = 5) -> bool:
+def _all_all_previews_exist(edit_dir: Path, n: int = 5) -> bool:
     """Return True if all preview_{0..n-1}.png files exist."""
     return all((edit_dir / f"preview_{i}.png").is_file() for i in range(n))
 
 
-def _save_previews(edit_dir: Path, imgs: list[np.ndarray]) -> None:
+def _write_preview_images(edit_dir: Path, imgs: list[np.ndarray]) -> None:
     """Save list of BGR images as preview_{0..}.png.
 
     Uses cv2.imwrite (not PIL) to preserve BGR channel order correctly.
@@ -118,7 +118,7 @@ def _render_ply_views(
     return imgs
 
 
-def _extract_yaw_pitch_views(image_npz: Path) -> list[dict]:
+def _read_camera_views_from_npz(image_npz: Path) -> list[dict]:
     """Extract yaw/pitch/radius/fov camera params for VIEW_INDICES from image NPZ.
 
     The NPZ contains 'transforms.json' with camera frames. We extract the
@@ -148,7 +148,7 @@ def _extract_yaw_pitch_views(image_npz: Path) -> list[dict]:
     return views
 
 
-def _read_normalization(image_npz: Path) -> tuple[float, list[float]] | tuple[None, None]:
+def _read_scene_normalization(image_npz: Path) -> tuple[float, list[float]] | tuple[None, None]:
     """Read prerender normalization scale+offset from image_npz transforms.json.
 
     The encode_asset render script saves scale/offset from normalize_scene() into
@@ -168,7 +168,7 @@ def _read_normalization(image_npz: Path) -> tuple[float, list[float]] | tuple[No
     return None, None
 
 
-def _render_glb_views(
+def _render_glb_five_views(
     glb_path: Path,
     image_npz: Path,
     encode_script: str,
@@ -188,13 +188,13 @@ def _render_glb_views(
     import subprocess
     import cv2 as _cv2
 
-    views = _extract_yaw_pitch_views(image_npz)
+    views = _read_camera_views_from_npz(image_npz)
     if len(views) != len(VIEW_INDICES):
         raise RuntimeError(
             f"Expected {len(VIEW_INDICES)} camera views, got {len(views)}"
         )
 
-    norm_scale, norm_offset = _read_normalization(image_npz)
+    norm_scale, norm_offset = _read_scene_normalization(image_npz)
 
     with tempfile.TemporaryDirectory(prefix="pcv2_s6p_glb_") as tmp:
         tmp_path = Path(tmp)
@@ -239,7 +239,7 @@ def _render_glb_views(
         return imgs
 
 
-def _render_slat_views(
+def _render_trellis_five_views(
     npz_path: Path,
     pipeline,
     frames: list[dict],
@@ -247,7 +247,7 @@ def _render_slat_views(
 ) -> list[np.ndarray]:
     """Render 5 views from a SLAT npz using TRELLIS pipeline.
 
-    render_one_view() returns RGB; convert to BGR so _save_previews()
+    render_one_view() returns RGB; convert to BGR so _write_preview_images()
     (which calls cv2.imwrite) writes the correct channel order.
     """
     import cv2 as _cv2
@@ -260,7 +260,7 @@ def _render_slat_views(
     return imgs
 
 
-def _iter_add_edits(ctx: ObjectContext):
+def _iter_addition_edits(ctx: ObjectContext):
     """Yield (edit_id, meta_dict) for addition edits discovered from meta.json on disk."""
     if not ctx.edits_3d_dir.is_dir():
         return
@@ -278,7 +278,7 @@ def _iter_add_edits(ctx: ObjectContext):
             yield add_dir.name, meta
 
 
-def run_for_object(
+def render_trellis_previews_for_object(
     ctx: ObjectContext,
     *,
     pipeline,          # TRELLIS pipeline (None if no SLAT edits present)
@@ -319,7 +319,7 @@ def run_for_object(
                 res.n_skip += 1
                 continue
             edit_dir_chk = ctx.edit_3d_dir(spec.edit_id)
-            if _previews_exist(edit_dir_chk) and not force:
+            if _all_previews_exist(edit_dir_chk) and not force:
                 res.n_skip += 1
                 continue
         edit_dir = ctx.edit_3d_dir(spec.edit_id)
@@ -331,21 +331,21 @@ def run_for_object(
             continue
         try:
             if after_glb.is_file():
-                imgs = _render_glb_views(
+                imgs = _render_glb_five_views(
                     after_glb, ctx.image_npz, _encode_asset_script(),
                     blender, resolution,
                 )
             else:
                 log.debug("[s6p] del %s: no after_new.glb, PLY fallback", spec.edit_id)
                 imgs = _render_ply_views(a_ply, frames, blender, resolution, samples=32)
-            _save_previews(edit_dir, imgs)
+            _write_preview_images(edit_dir, imgs)
             res.n_ok += 1
         except Exception as e:
             log.warning("[s6p] del %s: %s", spec.edit_id, e)
             res.n_fail += 1
 
     # --- addition edits (use source_del's before.ply as after state) ---
-    for add_id, meta in _iter_add_edits(ctx):
+    for add_id, meta in _iter_addition_edits(ctx):
         if prereq_map is not None:
             if not edit_needs_step(ctx, add_id, "s6p", prereq_map, force=force):
                 res.n_skip += 1
@@ -355,7 +355,7 @@ def run_for_object(
                 res.n_skip += 1
                 continue
             add_dir_chk = ctx.edit_3d_dir(add_id)
-            if _previews_exist(add_dir_chk) and not force:
+            if _all_previews_exist(add_dir_chk) and not force:
                 res.n_skip += 1
                 continue
         add_dir = ctx.edit_3d_dir(add_id)
@@ -396,7 +396,7 @@ def run_for_object(
                 res.n_skip += 1
                 continue
             edit_dir_chk = ctx.edit_3d_dir(spec.edit_id)
-            if _previews_exist(edit_dir_chk) and not force:
+            if _all_previews_exist(edit_dir_chk) and not force:
                 res.n_skip += 1
                 continue
         edit_dir = ctx.edit_3d_dir(spec.edit_id)
@@ -410,8 +410,8 @@ def run_for_object(
             res.n_fail += 1
             continue
         try:
-            imgs = _render_slat_views(a_npz, pipeline, frames, resolution)
-            _save_previews(edit_dir, imgs)
+            imgs = _render_trellis_five_views(a_npz, pipeline, frames, resolution)
+            _write_preview_images(edit_dir, imgs)
             res.n_ok += 1
         except Exception as e:
             log.warning("[s6p] %s %s: %s", spec.edit_type, spec.edit_id, e)
@@ -426,7 +426,7 @@ def run_for_object(
     return res
 
 
-def _has_trellis_edits(ctxs: list[ObjectContext]) -> bool:
+def _has_flux_or_trellis_edits(ctxs: list[ObjectContext]) -> bool:
     """Check whether any object has SLAT-based (non-PLY) edits needing TRELLIS."""
     from .specs import iter_all_specs
     PLY_TYPES = {"deletion", "addition", "identity"}
@@ -439,7 +439,7 @@ def _has_trellis_edits(ctxs: list[ObjectContext]) -> bool:
     return False
 
 
-def run(
+def render_trellis_previews_batch(
     ctxs: Iterable[ObjectContext],
     *,
     ckpt: str = "checkpoints/TRELLIS-text-xlarge",
@@ -459,7 +459,7 @@ def run(
     def _s6p_obj_pending(c):
         flux_ids = [sp.edit_id for sp in iter_flux_specs(c)]
         del_ids  = [sp.edit_id for sp in iter_deletion_specs(c)]
-        add_ids  = [aid for aid, _ in _iter_add_edits(c)]
+        add_ids  = [aid for aid, _ in _iter_addition_edits(c)]
         all_ids  = flux_ids + del_ids + add_ids
         return not all_ids or obj_needs_stage(c, all_ids, "s6p", prereq_map or {}, force=force)
     pending = [c for c in ctx_list if force or _s6p_obj_pending(c)]
@@ -467,12 +467,12 @@ def run(
     done = [c for c in ctx_list if c not in pending_set]
 
     pipeline = None
-    if _has_trellis_edits(pending):
-        pipeline = _build_pipeline(ckpt, log)
+    if _has_flux_or_trellis_edits(pending):
+        pipeline = _load_trellis_pipeline(ckpt, log)
 
     results: list[PreviewResult] = [PreviewResult(c.obj_id) for c in done]
     for ctx in pending:
-        results.append(run_for_object(
+        results.append(render_trellis_previews_for_object(
             ctx, pipeline=pipeline, blender=blender,
             resolution=resolution, force=force, logger=log,
         ))
@@ -481,15 +481,15 @@ def run(
 
 __all__ = [
     "PreviewResult",
-    "run_for_object", "run",
-    "run_del_for_object", "run_del",
-    "run_flux_for_object", "run_flux",
+    "render_trellis_previews_for_object", "render_trellis_previews_batch",
+    "render_del_previews_for_object", "render_del_previews_batch",
+    "render_flux_previews_for_object", "render_flux_previews_batch",
 ]
 
 
 # ─────────────────── split entry points (s6p_del / s6p_flux) ────────────────
 
-def run_del_for_object(
+def render_del_previews_for_object(
     ctx: ObjectContext,
     *,
     blender: str,
@@ -513,7 +513,7 @@ def run_del_for_object(
     from .specs import iter_deletion_specs as _iter_del_specs
     _del_add_ids = (
         [sp.edit_id for sp in _iter_del_specs(ctx)]
-        + [aid for aid, _ in _iter_add_edits(ctx)]
+        + [aid for aid, _ in _iter_addition_edits(ctx)]
     )
     if _del_add_ids and not force and not obj_needs_stage(
         ctx, _del_add_ids, "s6p", prereq_map or {}, force=force
@@ -546,7 +546,7 @@ def run_del_for_object(
                 res.n_skip += 1
                 continue
             edit_dir_chk = ctx.edit_3d_dir(spec.edit_id)
-            if _previews_exist(edit_dir_chk) and not force:
+            if _all_previews_exist(edit_dir_chk) and not force:
                 res.n_skip += 1
                 continue
         edit_dir = ctx.edit_3d_dir(spec.edit_id)
@@ -558,14 +558,14 @@ def run_del_for_object(
             continue
         try:
             if after_glb.is_file():
-                imgs = _render_glb_views(
+                imgs = _render_glb_five_views(
                     after_glb, ctx.image_npz, _encode_asset_script(),
                     blender, resolution,
                     cuda_device=cuda_device,
                 )
             else:
                 imgs = _render_ply_views(a_ply, frames, blender, resolution, samples=32)
-            _save_previews(edit_dir, imgs)
+            _write_preview_images(edit_dir, imgs)
             res.n_ok += 1
             update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s6p", status="done")
         except Exception as e:
@@ -578,7 +578,7 @@ def run_del_for_object(
                 progress_bar.update(1)
 
     # --- addition edits (copy source del's preview_*.png) ---
-    for add_id, meta in _iter_add_edits(ctx):
+    for add_id, meta in _iter_addition_edits(ctx):
         if prereq_map is not None:
             if not edit_needs_step(ctx, add_id, "s6p", prereq_map, force=force):
                 res.n_skip += 1
@@ -588,7 +588,7 @@ def run_del_for_object(
                 res.n_skip += 1
                 continue
             add_dir_chk = ctx.edit_3d_dir(add_id)
-            if _previews_exist(add_dir_chk) and not force:
+            if _all_previews_exist(add_dir_chk) and not force:
                 res.n_skip += 1
                 continue
         add_dir = ctx.edit_3d_dir(add_id)
@@ -626,7 +626,7 @@ def run_del_for_object(
     return res
 
 
-def run_flux_for_object(
+def render_flux_previews_for_object(
     ctx: ObjectContext,
     *,
     pipeline,
@@ -678,7 +678,7 @@ def run_flux_for_object(
                 res.n_skip += 1
                 continue
             edit_dir_chk = ctx.edit_3d_dir(spec.edit_id)
-            if _previews_exist(edit_dir_chk) and not force:
+            if _all_previews_exist(edit_dir_chk) and not force:
                 res.n_skip += 1
                 continue
         edit_dir = ctx.edit_3d_dir(spec.edit_id)
@@ -692,8 +692,8 @@ def run_flux_for_object(
             res.n_fail += 1
             continue
         try:
-            imgs = _render_slat_views(a_npz, pipeline, frames, resolution)
-            _save_previews(edit_dir, imgs)
+            imgs = _render_trellis_five_views(a_npz, pipeline, frames, resolution)
+            _write_preview_images(edit_dir, imgs)
             res.n_ok += 1
             update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s6p", status="done")
         except Exception as e:
@@ -711,7 +711,7 @@ def run_flux_for_object(
     return res
 
 
-def run_del(
+def render_del_previews_batch(
     ctxs: Iterable[ObjectContext],
     *,
     blender: str = "blender",
@@ -757,7 +757,7 @@ def run_del(
     from .specs import iter_deletion_specs as _iter_del_specs_outer
     def _del_obj_pending(c):
         ids = ([sp.edit_id for sp in _iter_del_specs_outer(c)]
-               + [aid for aid, _ in _iter_add_edits(c)])
+               + [aid for aid, _ in _iter_addition_edits(c)])
         return not ids or obj_needs_stage(c, ids, "s6p", prereq_map or {}, force=force)
     pending = [c for c in ctx_list if force or _del_obj_pending(c)]
     done_results = [PreviewResult(c.obj_id) for c in ctx_list if c not in set(pending)]
@@ -772,14 +772,14 @@ def run_del(
             if is_gate_a_failed(ctx, spec.edit_id):
                 continue
             edit_dir = ctx.edit_3d_dir(spec.edit_id)
-            if _previews_exist(edit_dir) and not force:
+            if _all_previews_exist(edit_dir) and not force:
                 continue
             count += 1
-        for add_id, _ in _iter_add_edits(ctx):
+        for add_id, _ in _iter_addition_edits(ctx):
             if is_gate_a_failed(ctx, add_id):
                 continue
             add_dir = ctx.edit_3d_dir(add_id)
-            if _previews_exist(add_dir) and not force:
+            if _all_previews_exist(add_dir) and not force:
                 continue
             count += 1
         return count
@@ -800,7 +800,7 @@ def run_del(
 
     def _do(ctx):
         nonlocal _n_ok, _n_fail, _n_skip
-        res = run_del_for_object(
+        res = render_del_previews_for_object(
             ctx, blender=blender, resolution=resolution,
             cuda_device=getattr(_thread_local, "cuda_device", None),
             progress_bar=_bar,
@@ -830,7 +830,7 @@ def run_del(
     return results
 
 
-def run_flux(
+def render_flux_previews_batch(
     ctxs: Iterable[ObjectContext],
     *,
     ckpt: str = "checkpoints/TRELLIS-text-xlarge",
@@ -849,11 +849,11 @@ def run_flux(
         return not ids or obj_needs_stage(c, ids, "s6p", prereq_map or {}, force=force)
     pending = [c for c in ctx_list if force or _flux_obj_pending(c)]
     pipeline = None
-    if _has_trellis_edits(pending):
-        pipeline = _build_pipeline(ckpt, log)
+    if _has_flux_or_trellis_edits(pending):
+        pipeline = _load_trellis_pipeline(ckpt, log)
     results: list[PreviewResult] = [PreviewResult(c.obj_id) for c in ctx_list if c not in set(pending)]
     for ctx in pending:
-        results.append(run_flux_for_object(
+        results.append(render_flux_previews_for_object(
             ctx, pipeline=pipeline, resolution=resolution,
             prereq_map=prereq_map, force=force, logger=log,
         ))

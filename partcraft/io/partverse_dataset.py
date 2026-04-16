@@ -606,7 +606,7 @@ class PartVerseRecord:
             return best_view
 
         # --- Path 2: VIEW_INDICES preference order ---
-        from partcraft.pipeline_v3.s1_vlm_core import VIEW_INDICES as _VI
+        from partcraft.pipeline_v3.vlm_core import VIEW_INDICES as _VI
         view_set = set(self.view_indices)
         for vi in _VI:
             if vi in view_set:

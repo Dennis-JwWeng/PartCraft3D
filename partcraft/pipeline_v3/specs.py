@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from .paths import EDIT_TYPE_PREFIX, FLUX_TYPES, ObjectContext
-from .s1_vlm_core import VIEW_INDICES  # single source of truth; defined in s1_vlm_core.py
+from .vlm_core import VIEW_INDICES  # single source of truth; defined in vlm_core.py
 
 
 @dataclass

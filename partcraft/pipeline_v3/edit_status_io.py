@@ -267,16 +267,16 @@ def build_prereq_map(cfg: dict) -> dict[str, str | None]:
     # Keys here are the INTERNAL stage keys used by step runners when they
     # call edit_needs_step(ctx, edit_id, stage_key, prereq_map).
     # Do NOT change these to functional/CLI names — the step runner code
-    # (s5b_deletion.py, s6_preview.py, etc.) passes these strings directly.
+    # (mesh_deletion.py, preview_render.py, etc.) passes these strings directly.
     return {
         # Internal stage keys used by step runners in edit_needs_step() calls.
         # These MUST match the strings passed in s4/s5/s5b/s6/s6p/*.py code.
-        "s4":  prereq_a,   # flux_2d step runner (s4_flux_2d.py)
-        "s5":  prereq_a,   # trellis_3d step runner (s5_trellis_3d.py)
-        "s5b": prereq_a,   # del_mesh step runner (s5b_deletion.py)
-        "s6p": prereq_a,   # preview_del / preview_flux step runner (s6_preview.py)
-        "s6":  prereq_e,   # render_3d step runner (s6_render_3d.py)
-        "s6b": prereq_e,   # reencode_del step runner (s5b_deletion.py run_reencode)
+        "s4":  prereq_a,   # flux_2d step runner (flux_2d.py)
+        "s5":  prereq_a,   # trellis_3d step runner (trellis_3d.py)
+        "s5b": prereq_a,   # del_mesh step runner (mesh_deletion.py)
+        "s6p": prereq_a,   # preview_del / preview_flux step runner (preview_render.py)
+        "s6":  prereq_e,   # render_3d step runner (render_3d.py)
+        "s6b": prereq_e,   # slat-asset linker (mesh_deletion.py link_slat_assets_batch)
     }
 
 

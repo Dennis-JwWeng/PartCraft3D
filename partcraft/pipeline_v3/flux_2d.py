@@ -64,7 +64,7 @@ edit_status.json  (via :func:`edit_status_io.update_edit_stage`)::
           s4: {status: "done"|"error", ts: "...", [reason: "..."]}
 
 Object-level summary (via ``status.update_step``):
-  ``steps.s4_flux_2d: {status: "ok"|"fail", n_ok, n_fail, n_skip}``
+  ``steps.flux_2d: {status: "ok"|"fail", n_ok, n_fail, n_skip}``
   This is a per-run counter written after processing completes.
   The authoritative per-edit state is in ``edits.<edit_id>.stages.s4``.
 
