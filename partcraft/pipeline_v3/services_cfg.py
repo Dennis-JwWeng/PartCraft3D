@@ -52,6 +52,32 @@ def trellis_image_edit_flat(cfg: dict) -> dict[str, Any]:
     return out
 
 
+def trellis_workers_per_gpu(cfg: dict, *, default: int = 1) -> int:
+    """Number of Trellis 3D worker subprocesses per physical GPU.
+
+    Resolution order:
+      1. ``TRELLIS_WORKERS_PER_GPU`` env var (ad-hoc override)
+      2. ``services.image_edit.trellis_workers_per_gpu`` in YAML
+      3. ``default`` (= 1, current behavior)
+
+    Always clamped to >= 1.
+    """
+    import os
+    raw = os.environ.get("TRELLIS_WORKERS_PER_GPU", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    ie = image_edit_service(cfg)
+    v = ie.get("trellis_workers_per_gpu", default)
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        v = default
+    return max(1, v)
+
+
 def vlm_model_name(cfg: dict, *, default: str = "Qwen3.5-27B") -> str:
     v = vlm_service(cfg)
     m = v.get("model", v.get("vlm_model", default))
@@ -81,6 +107,7 @@ __all__ = [
     "vlm_service",
     "image_edit_service",
     "trellis_image_edit_flat",
+    "trellis_workers_per_gpu",
     "vlm_model_name",
     "step_params_for",
     "pipeline_stages_raw",
