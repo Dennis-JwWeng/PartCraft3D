@@ -1,0 +1,100 @@
+# Pipeline v3 — aibox (4× A800-80GB), shard 04
+#
+# Entrypoint:
+#   bash scripts/tools/run_pipeline_v3_shard.sh shard04 \
+#     configs/pipeline_v3_shard04.yaml
+#
+# Machine env: configs/machine/aibox-rd3996bf91f9-68f4cd496c-nsm56.env
+#   CONDA_ENV_SERVER   = qwen_test       (sglang VLM + FLUX server)
+#   CONDA_ENV_PIPELINE = vinedresser3d   (pipeline_v3 driver)
+
+blender: /usr/local/bin/blender
+ckpt_root: /mnt/cfs/vffey4/omni3d/ckpt
+
+data:
+  output_dir:  /mnt/cfs/vffey4/omni3d/partverse/outputs/partverse/pipeline_v3_shard04
+  mesh_root:   /mnt/cfs/vffey4/omni3d/partverse/mesh
+  images_root: /mnt/cfs/vffey4/omni3d/partverse/images
+  slat_dir:    /mnt/cfs/vffey4/omni3d/partverse/slat
+
+pipeline:
+  gpus: [0, 1, 2, 3]
+
+  # One VLM / FLUX server per GPU (stride=1 matches v3 template convention).
+  vlm_port_base:  8200
+  vlm_port_stride: 1
+  flux_port_base: 8020
+  flux_port_stride: 1
+
+  prerender_workers: 8
+  s6p_del_workers: 8
+
+  stages:
+  - name: text_gen_gate_a
+    desc: VLM edit generation + text-align gate
+    servers: vlm
+    steps:
+    - gen_edits
+    - gate_text_align
+
+  - name: deletion_cpu
+    desc: deletion mesh masking + Blender 5-view preview (CPU only)
+    servers: none
+    parallel_group: edit_branches
+    steps:
+    - del_mesh
+    - preview_del
+
+  - name: flux_2d
+    desc: FLUX 2D image editing
+    servers: flux
+    parallel_group: edit_branches
+    steps:
+    - flux_2d
+
+  - name: trellis_preview
+    desc: Trellis 3D reconstruction + 5-view preview
+    servers: none
+    use_gpus: true
+    steps:
+    - trellis_3d
+    - preview_flux
+
+  - name: gate_quality
+    desc: VLM visual quality gate
+    servers: vlm
+    steps:
+    - gate_quality
+
+services:
+  vlm:
+    model: /mnt/cfs/vffey4/omni3d/ckpt/Qwen3.5-27B
+
+  image_edit:
+    enabled: true
+    trellis_text_ckpt: /mnt/cfs/vffey4/omni3d/ckpt/TRELLIS-text-xlarge
+    image_edit_backend: local_diffusers
+    workers_per_server: 2
+    export_ply: false
+    export_ply_for_deletion: true
+    large_part_threshold: 0.35
+    repaint_mode: image
+
+qc:
+  thresholds_by_type:
+    deletion:
+      min_visual_quality: 3
+    modification:
+      min_visual_quality: 3
+      require_preserve_other: true
+    scale:
+      min_visual_quality: 3
+      require_preserve_other: true
+    material:
+      min_visual_quality: 3
+    color:
+      min_visual_quality: 3
+    global:
+      min_visual_quality: 3
+    addition:
+      min_visual_quality: 3
