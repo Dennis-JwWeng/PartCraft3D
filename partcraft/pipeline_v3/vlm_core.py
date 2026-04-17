@@ -2380,8 +2380,16 @@ async def _run_text_align_gate_for_object(
     flux_seq = 0
     del_seq  = 0
 
+    # Pre-pass (synchronous): run rule check + pixel-visibility for every
+    # edit; write immediate pass/fail for ones that don't need a VLM call;
+    # collect a task tuple for ones that do.  Each VLM round-trip is ~1.5s
+    # and dominates per-object wall time, so we then dispatch every
+    # eligible edit's call concurrently via asyncio.gather instead of
+    # awaiting them one by one (the original loop was strictly sequential
+    # and left the VLM servers ~15% utilized).
+    vlm_tasks: list = []
     for idx, edit in enumerate(edits):
-        et     = edit.get("edit_type", "unknown")
+        et = edit.get("edit_type", "unknown")
 
         # Mirror iter_all_specs: skip identity and addition edits; assign seq.
         if et in _FLUX_TYPES:
@@ -2440,11 +2448,27 @@ async def _run_text_align_gate_for_object(
             n_fail += 1
             continue
 
-        # ── Layer 3: VLM alignment gate ───────────────────────────────
+        # Defer the cv2 mosaic + prompt build to _judge_one; we want to
+        # run them off the event loop (asyncio.to_thread) so that pending
+        # VLM responses for *other* objects don't get starved while we
+        # compose the gate image for this one.
+        vlm_tasks.append((idx, edit_id, et, prompt, sel, rule_result,
+                          px, column_map))
+
+    # ── Layer 3: parallel VLM alignment gate ──────────────────────────
+    async def _judge_one(task: tuple) -> bool:
+        (idx, edit_id, et, prompt, sel, rule_result,
+         px, column_map) = task
+        # Build the 5-column gate mosaic + user prompt off the event
+        # loop.  cv2 image stitching is ~100 ms per call; running it
+        # synchronously in this coroutine starves all other in-flight
+        # objects' VLM responses, which leaves the SGLang servers idle.
         try:
-            gate_img  = build_text_align_gate_image(ov_img, sel, column_map)
+            gate_img = await _asyncio.to_thread(
+                build_text_align_gate_image, ov_img, sel, column_map
+            )
             gate_user = build_text_align_gate_prompt(et, prompt, sel)
-            gate_raw  = await call_vlm_image_async(
+            gate_raw = await call_vlm_image_async(
                 client, gate_img,
                 SYSTEM_PROMPT_ALIGN_GATE, gate_user,
                 vlm_model, max_tokens=256,
@@ -2463,13 +2487,13 @@ async def _run_text_align_gate_for_object(
         # The VLM response is used only to pick best_view.  For every other
         # edit type the VLM's aligned/reason decision still gates pass/fail.
         if et == "deletion":
-            aligned  = True
-            reason   = "auto_pass_deletion"
+            aligned = True
+            reason  = "auto_pass_deletion"
         else:
-            aligned  = bool(gate_out.get("aligned", False))
-            reason   = gate_out.get("reason", "")
+            aligned = bool(gate_out.get("aligned", False))
+            reason  = gate_out.get("reason", "")
 
-        bv_col        = gate_out.get("best_view", 0)
+        bv_col = gate_out.get("best_view", 0)
         if not (type(bv_col) is int and 0 <= bv_col < 5):
             bv_col = 0
         best_view_abs = column_map[bv_col]
@@ -2487,10 +2511,17 @@ async def _run_text_align_gate_for_object(
                          })
         update_edit_stage(ctx, edit_id, et,
                           "gate_a", status="pass" if aligned else "fail")
-        if aligned:
-            n_pass += 1
-        else:
-            n_fail += 1
+        return aligned
+
+    if vlm_tasks:
+        aligned_results = await _asyncio.gather(
+            *(_judge_one(t) for t in vlm_tasks)
+        )
+        for aligned in aligned_results:
+            if aligned:
+                n_pass += 1
+            else:
+                n_fail += 1
 
     update_step(ctx, "sq1_qc_A", status=STATUS_OK,
                 n_pass=n_pass, n_fail=n_fail)
