@@ -205,6 +205,16 @@ bash scripts/tools/setup_pipeline_env.sh --check
 - Phase D（s5 TRELLIS）：子进程加载 TRELLIS → 3D 编辑 → 子进程退出
 - Phase D2（s5b deletion）、E（s6 rerender）、F（s7 backfill）：CPU 为主或短 GPU burst
 
+### Trellis 单卡多 worker（`trellis_workers_per_gpu`，pipeline_v3）
+
+`trellis_3d` 在采样阶段是 GPU 密集，但每个编辑前后还有 DINOv2 conditioning、scipy 体素 mask、NFS 读写等 CPU/IO 步骤。为了让 GPU 在一个 worker 做 CPU 准备时不空转，pipeline_v3 的 `dispatch_gpus`（`partcraft/pipeline_v3/run.py`）支持在每张物理 GPU 上 fork K 个 worker 子进程。
+
+- **配置**：`services.image_edit.trellis_workers_per_gpu`（YAML，默认 `1`）；`TRELLIS_WORKERS_PER_GPU=<n>`（环境变量，临时覆盖）。
+- **生效范围**：仅 `trellis_3d`。`preview_flux` / `render_3d` 是纯 GPU 计算，强行多开只会 OOM，所以代码里硬编码 K=1。
+- **切片**：每个子进程仍然只 pin 一张 `CUDA_VISIBLE_DEVICES`，但 `--gpu-shard` 从 `i/N` 扩成 `shard_id/(K*N)`，其中 `shard_id = gpu_idx*K + w`。`slice_for_gpu` 的 mod-N 轮询天然兼容更宽的分母，编辑列表不重不漏。
+- **显存预算**：每个 Trellis worker 约占 22-43 GB（text + image flow model + S1/S2 编解码 + DINOv2 + 中间 SLAT）。80 GB 卡建议 K=2，144 GB H800 才考虑 K=3。
+- **行为不变性**：K=1（默认）等价于改之前的逐 GPU 单进程行为，包括 `n=0`（无 `--gpus`）和 `n=1, K=1`（单卡）两条早返回路径。
+
 ### machine env 必填字段
 
 ```
