@@ -431,42 +431,70 @@ def dispatch_gpus(
     cfg_path: Path,
     args: argparse.Namespace,
 ) -> int:
-    """Spawn one child per GPU. Each child re-invokes this CLI with
-    ``--single-gpu --gpu-shard i/n`` and a single-step ``--steps``."""
+    """Spawn ``K * N`` children where ``N = #GPUs`` and ``K`` is the
+    per-GPU worker count for this step.
+
+    K is read from ``services.image_edit.trellis_workers_per_gpu`` (env
+    override ``TRELLIS_WORKERS_PER_GPU``). Only ``trellis_3d`` honors
+    K > 1 — the other GPU steps (``preview_flux``, ``render_3d``) keep
+    K = 1 because they are compute-bound, not I/O-bound.
+
+    Each child receives ``CUDA_VISIBLE_DEVICES=<gpu>`` and a global
+    ``--gpu-shard k/(K*N)`` so ``slice_for_gpu`` partitions the edit
+    list across all workers without overlap.
+    """
     gpus = [g.strip() for g in (args.gpus or "").split(",") if g.strip()]
     n = len(gpus)
-    if n <= 1:
+    if n == 0:
         return run_single_gpu(step, cfg_path, args)
 
-    LOG.info("[%s] dispatching across GPUs %s", step, gpus)
-    procs = []
-    for i, gpu in enumerate(gpus):
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = gpu
-        env.setdefault("ATTN_BACKEND", "flash_attn")
-        cmd = [
-            sys.executable, "-m", "partcraft.pipeline_v3.run",
-            "--config", str(cfg_path),
-            "--shard", args.shard,
-            "--steps", step,
-            "--single-gpu",
-            "--gpu-shard", f"{i}/{n}",
-        ]
-        if args.obj_ids:
-            cmd += ["--obj-ids", *args.obj_ids]
-        elif getattr(args, "obj_ids_file", None) and args.obj_ids_file:
-            cmd += ["--obj-ids-file", str(args.obj_ids_file)]
-        if args.all:
-            cmd += ["--all"]
-        if args.force:
-            cmd += ["--force"]
-        LOG.info("  GPU %s: %s", gpu, " ".join(cmd[-6:]))
-        procs.append((gpu, subprocess.Popen(cmd, env=env)))
+    k = 1
+    if step == "trellis_3d":
+        cfg = load_config(cfg_path)
+        k = psvc.trellis_workers_per_gpu(cfg)
+
+    if n == 1 and k == 1:
+        return run_single_gpu(step, cfg_path, args)
+
+    total = n * k
+    LOG.info(
+        "[%s] dispatching: gpus=%s workers_per_gpu=%d total_workers=%d",
+        step, gpus, k, total,
+    )
+
+    procs: list[tuple[str, int, subprocess.Popen]] = []
+    for gpu_idx, gpu in enumerate(gpus):
+        for w in range(k):
+            shard_id = gpu_idx * k + w
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = gpu
+            env.setdefault("ATTN_BACKEND", "flash_attn")
+            cmd = [
+                sys.executable, "-m", "partcraft.pipeline_v3.run",
+                "--config", str(cfg_path),
+                "--shard", args.shard,
+                "--steps", step,
+                "--single-gpu",
+                "--gpu-shard", f"{shard_id}/{total}",
+            ]
+            if args.obj_ids:
+                cmd += ["--obj-ids", *args.obj_ids]
+            elif getattr(args, "obj_ids_file", None) and args.obj_ids_file:
+                cmd += ["--obj-ids-file", str(args.obj_ids_file)]
+            if args.all:
+                cmd += ["--all"]
+            if args.force:
+                cmd += ["--force"]
+            LOG.info(
+                "  GPU %s worker %d/%d (shard %d/%d): %s",
+                gpu, w + 1, k, shard_id, total, " ".join(cmd[-6:]),
+            )
+            procs.append((gpu, w, subprocess.Popen(cmd, env=env)))
 
     rc = 0
-    for gpu, p in procs:
+    for gpu, w, p in procs:
         r = p.wait()
-        LOG.info("[%s] GPU %s exit=%d", step, gpu, r)
+        LOG.info("[%s] GPU %s worker %d exit=%d", step, gpu, w, r)
         if r != 0:
             rc = r
     return rc
