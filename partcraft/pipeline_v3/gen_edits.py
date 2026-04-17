@@ -317,6 +317,113 @@ async def gen_edits_async(
     return results
 
 
+# ─────────────────── overview.png backfill (CPU/Blender pool) ─────────
+#
+# Gate A (`gate_text_align`) needs the 5×2 overview PNG to:
+#   1. compute pixel-visibility per view → pick best_view (npz_view)
+#   2. crop a 5×2 sub-image to feed the VLM image+text judge
+# When overview.png is absent the gate falls back to "no_overview_auto_pass"
+# and `best_view=0`, which silently passes every edit and forces the FLUX
+# stage to use the wrong frame.  v3 text-semantic mode skipped Blender for
+# speed but never wired the render back in — this restores the documented
+# `gen_edits` contract: parsed.json + overview.png per object.
+
+
+def _render_overview_worker(args: tuple) -> tuple[str, str, str]:
+    """Top-level pickleable worker: render one overview.png to disk.
+
+    args = (obj_id, mesh_npz, image_npz, blender, out_path, force)
+    Returns (obj_id, status, error)
+        status ∈ {"ok", "skip", "err"}
+    """
+    obj_id, mesh_npz, image_npz, blender, out_path, force = args
+    from pathlib import Path as _P
+    out_p = _P(out_path)
+    if not force and out_p.is_file() and out_p.stat().st_size > 1000:
+        return obj_id, "skip", ""
+    try:
+        from partcraft.pipeline_v3.vlm_core import render_overview_png  # noqa: E402
+        png = render_overview_png(_P(mesh_npz), _P(image_npz), blender)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        # write atomically so a crash mid-Blender never leaves a torn file
+        tmp = out_p.with_suffix(".png.tmp")
+        tmp.write_bytes(png)
+        tmp.replace(out_p)
+        return obj_id, "ok", ""
+    except Exception as e:
+        return obj_id, "err", str(e)
+
+
+def backfill_overviews(
+    ctxs: Iterable[ObjectContext],
+    *,
+    blender: str,
+    n_workers: int = 8,
+    force: bool = False,
+    log_every: int = 50,
+    log: "object | None" = None,
+) -> dict:
+    """Render `phase1/overview.png` for every ctx that is missing it.
+
+    Idempotent: skips objects whose overview.png already exists and is
+    >1 KB unless ``force=True``.  Designed to run as a synchronous
+    pre-pass to ``gen_edits_streaming`` (and as a standalone CLI step).
+
+    Returns ``{"ok": int, "skip": int, "err": int, "errors": [..]}``.
+    """
+    import logging
+    log = log or logging.getLogger("pipeline_v3.s1.overview")
+
+    tasks: list[tuple] = []
+    for ctx in ctxs:
+        if ctx.mesh_npz is None or ctx.image_npz is None:
+            continue
+        if not ctx.mesh_npz.is_file() or not ctx.image_npz.is_file():
+            continue
+        ctx.phase1_dir.mkdir(parents=True, exist_ok=True)
+        tasks.append((
+            ctx.obj_id, str(ctx.mesh_npz), str(ctx.image_npz),
+            blender, str(ctx.overview_path), force,
+        ))
+
+    n_total = len(tasks)
+    if n_total == 0:
+        return {"ok": 0, "skip": 0, "err": 0, "errors": []}
+
+    log.info("overview backfill: total=%d  workers=%d  force=%s",
+             n_total, n_workers, force)
+
+    n_ok = n_skip = n_err = n_done = 0
+    errors: list[tuple[str, str]] = []
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futs = [pool.submit(_render_overview_worker, t) for t in tasks]
+        for fut in futs:
+            try:
+                oid, status, err = fut.result()
+            except Exception as e:
+                n_err += 1
+                errors.append(("?", str(e)))
+                oid, status = "?", "err"
+            if status == "ok":
+                n_ok += 1
+            elif status == "skip":
+                n_skip += 1
+            else:
+                n_err += 1
+                errors.append((oid, err))
+            n_done += 1
+            if n_done % log_every == 0 or n_done == n_total:
+                log.info("overview backfill: %d/%d  ok=%d skip=%d err=%d",
+                         n_done, n_total, n_ok, n_skip, n_err)
+
+    if errors:
+        log.warning("overview backfill: %d errors (showing first 5):", len(errors))
+        for oid, err in errors[:5]:
+            log.warning("  [%s] %s", oid[:12], err[:200])
+
+    return {"ok": n_ok, "skip": n_skip, "err": n_err, "errors": errors}
+
+
 # ─────────────────── streaming pipeline (mp pool + N VLM consumers) ──
 
 def _prepare_edit_menu_worker(args: tuple) -> tuple | None:
@@ -417,6 +524,24 @@ async def gen_edits_streaming(
     log.info("s1 streaming: todo=%d resume=%d  vlm_servers=%d  workers=%d",
              len(todo), len(results), len(vlm_urls), n_prerender_workers)
 
+    # ── Overview backfill pre-pass ────────────────────────────────────
+    # Render phase1/overview.png for *every* ctx (resume + todo) before
+    # any VLM call fires.  This guarantees that the per-object Gate A
+    # hook (post_object_fn → run_gate_text_align) can read overview.png
+    # and do real pixel-visibility + image judging instead of falling
+    # back to "no_overview_auto_pass".  Idempotent: skips files that
+    # already exist on disk.  Runs synchronously since Gate A correctness
+    # depends on overviews being present before the consumer fires.
+    try:
+        ov_stats = backfill_overviews(
+            ctxs, blender=blender, n_workers=n_prerender_workers,
+            force=False, log=log,
+        )
+        log.info("s1 streaming: overview backfill done — ok=%d skip=%d err=%d",
+                 ov_stats["ok"], ov_stats["skip"], ov_stats["err"])
+    except Exception as exc:
+        log.warning("overview backfill failed: %s — Gate A will auto-pass", exc)
+
     if not todo:
         return results
 
@@ -496,4 +621,5 @@ async def gen_edits_streaming(
 __all__ = [
     "Phase1Result", "prepare_edit_menu", "gen_edits_for_one",
     "gen_edits_async", "gen_edits_streaming",
+    "backfill_overviews",
 ]

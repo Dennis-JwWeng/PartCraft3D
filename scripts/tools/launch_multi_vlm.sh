@@ -15,9 +15,8 @@
 #
 # Usage:
 #   GPUS=2,3,4,5,6,7 bash scripts/tools/launch_multi_vlm.sh
-#   # then in another shell:
-#   python scripts/standalone/run_phase1_v2_score.py \
-#       --vlm-url http://localhost:8002/v1,...,http://localhost:8007/v1 ...
+#   # then point any VLM consumer (e.g. partcraft.pipeline_v3.run) at the
+#   # printed VLM_URLS line.
 #
 # Stop:
 #   pkill -f sglang.launch_server

@@ -46,7 +46,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from partcraft.utils.config import load_config
 from partcraft.utils.logging import setup_logging
 from partcraft.io.hy3d_loader import HY3DPartDataset
-from partcraft.pipeline_v2.specs import EditSpec
+from partcraft.pipeline_v3.specs import EditSpec
 
 
 def select_best_view(obj_record, edit_part_ids: list[int]) -> int:

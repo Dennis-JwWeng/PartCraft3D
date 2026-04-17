@@ -41,10 +41,13 @@ pipeline:
       steps: [gen_edits, gate_text_align]
 
     - name: deletion_cpu
-      desc: Deletion branch (CPU)
+      desc: Deletion branch (CPU). preview_del is intentionally omitted —
+        del/add are validated by the mask op + Gate A; no Blender preview
+        is required in the deliverable. Add `preview_del` here if a 5-view
+        preview is needed for inspection / downstream tools.
       servers: none
       parallel_group: edit_branches
-      steps: [del_mesh, preview_del]
+      steps: [del_mesh]
 
     - name: flux_2d
       desc: FLUX branch

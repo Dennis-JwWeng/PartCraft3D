@@ -1,11 +1,13 @@
 """Render overview.png for a list of objects using the pipeline's render_overview_png.
 
 Usage:
-    python scripts/tools/run_render_overviews.py \
-        --config configs/pipeline_v2_shard08_test.yaml \
-        --ids    configs/shard08_test_obj_ids.txt \
-        --shard  08 \
-        --out    /mnt/zsn/data/partverse/outputs/partverse/pipeline_v2_shard05_test
+    python -m scripts.tools.run_render_overviews \
+        --config configs/pipeline_v3_shard09.yaml \
+        --ids    configs/shard09_all_obj_ids.txt \
+        --shard  09 \
+        --out    /mnt/cfs/vffey4/omni3d/partverse/outputs/partverse/pipeline_v3_shard09
+
+(Or invoke as a script from the repo root with PYTHONPATH=. .)
 """
 
 import argparse
@@ -15,17 +17,32 @@ from pathlib import Path
 
 import yaml
 
+# Make ``partcraft`` importable when this file is run as a script from the
+# repo root (``python scripts/tools/run_render_overviews.py``).  No hard-
+# coded /mnt path — works on any host.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 
 def _render_one(args: tuple) -> tuple[str, str]:
     """Worker: renders one overview and returns (obj_id, status)."""
     mesh_npz, image_npz, blender, out_png, force = args
-    import sys; sys.path.insert(0, "/mnt/zsn/zsn_workspace/PartCraft3D"); from partcraft.pipeline_v3.vlm_core import render_overview_png  # pipeline code
+    # Re-add repo root in the worker process (ProcessPoolExecutor spawns
+    # fresh interpreters that don't inherit the parent's sys.path mods).
+    import sys as _s, os as _os
+    _root = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    if _root not in _s.path:
+        _s.path.insert(0, _root)
+    from partcraft.pipeline_v3.vlm_core import render_overview_png  # noqa: E402
     out_p = Path(out_png)
     if not force and out_p.is_file() and out_p.stat().st_size > 1000:
         return Path(mesh_npz).stem, "skip"
     out_p.parent.mkdir(parents=True, exist_ok=True)
     png = render_overview_png(Path(mesh_npz), Path(image_npz), blender)
-    out_p.write_bytes(png)
+    tmp = out_p.with_suffix(".png.tmp")
+    tmp.write_bytes(png)
+    tmp.replace(out_p)
     return Path(mesh_npz).stem, "ok"
 
 

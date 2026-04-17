@@ -69,7 +69,7 @@ def _load_trellis_pipeline(ckpt: str, logger: logging.Logger):
     return pipe
 
 
-def _all_all_previews_exist(edit_dir: Path, n: int = 5) -> bool:
+def _all_previews_exist(edit_dir: Path, n: int = 5) -> bool:
     """Return True if all preview_{0..n-1}.png files exist."""
     return all((edit_dir / f"preview_{i}.png").is_file() for i in range(n))
 
