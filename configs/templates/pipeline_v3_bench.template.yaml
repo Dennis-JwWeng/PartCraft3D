@@ -35,36 +35,61 @@ pipeline:
 
   # Scheduler source of truth
   stages:
-    - name: text_gen_gate_a
-      desc: VLM generation + Gate A
-      servers: vlm
-      steps: [gen_edits, gate_text_align]
+  - name: text_gen_gate_a
+    desc: VLM edit generation + text-align gate
+    servers: vlm
+    steps:
+    - gen_edits
+    - gate_text_align
 
-    - name: deletion_cpu
-      desc: Deletion branch (CPU). preview_del is intentionally omitted —
-        del/add are validated by the mask op + Gate A; no Blender preview
-        is required in the deliverable. Add `preview_del` here if a 5-view
-        preview is needed for inspection / downstream tools.
-      servers: none
-      parallel_group: edit_branches
-      steps: [del_mesh]
 
-    - name: flux_2d
-      desc: FLUX branch
-      servers: flux
-      parallel_group: edit_branches
-      steps: [flux_2d]
+  - name: del_mesh
+    desc: Deletion mesh masking (CPU). Produces del_*/after_new.glb plus
+      add_*/meta.json — terminal for the deletion/addition data branch
+      (no rendering needed unless preview_del is opted in).
+    servers: none
+    parallel_group: edit_branches
+    steps:
+    - del_mesh
 
-    - name: trellis_preview
-      desc: Trellis + preview
-      servers: none
-      use_gpus: true
-      steps: [trellis_3d, preview_flux]
+  - name: flux_2d
+    desc: FLUX 2D image editing (modification / style / material / scale /
+      colour / global / addition).
+    servers: flux
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 0
+    steps:
+    - flux_2d
 
-    - name: gate_quality
-      desc: Final quality gate
-      servers: vlm
-      steps: [gate_quality]
+  - name: trellis_preview
+    desc: Trellis 3D reconstruction + 5-view preview. Chained AFTER flux_2d
+      (chain_id=flux_chain) so Trellis can claim GPUs once FLUX servers
+      shut down. Runs in parallel with the del_mesh chain.
+    servers: none
+    use_gpus: true
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 1
+    steps:
+    - trellis_3d
+    - preview_flux
+
+  # preview_del is optional. It only matters if you plan to feed deletion
+  # edits into gate_quality. Enable explicitly via STAGES=...,preview_del,...
+  - name: preview_del
+    desc: Optional Blender 5-view preview of after_new.glb (deletion/addition
+      edits). Only needed when gate_quality runs on deletion edits.
+    servers: none
+    optional: true
+    steps:
+    - preview_del
+
+  - name: gate_quality
+    desc: VLM visual quality gate
+    servers: vlm
+    steps:
+    - gate_quality
 
 services:
   vlm:

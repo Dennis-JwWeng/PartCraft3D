@@ -2,14 +2,27 @@
 # pipeline_v3 stage scheduler — config-driven, GPU-count-agnostic.
 #
 # Mirrors scripts/tools/run_pipeline_v2_shard.sh but targets pipeline_v3.
-# Scheduling (GPUs, ports, server pools, parallel batches) is driven entirely
-# by the YAML pipeline: + services: sections via partcraft.pipeline_v3.scheduler.
+# Scheduling (GPUs, ports, server pools, parallel batches, sub-chains) is
+# driven entirely by the YAML pipeline: + services: sections via
+# partcraft.pipeline_v3.scheduler.
 #
 # The shell is responsible only for:
-#   1. Reading the resolved plan from Python (GPUs, ports, stage order)
+#   1. Reading the resolved plan from Python (GPUs, ports, batches, chains)
 #   2. Starting / stopping VLM and FLUX server pools per stage
 #   3. Invoking `python -m partcraft.pipeline_v3.run --stage <name>`
-#   4. Running parallel stage batches concurrently (& + wait)
+#   4. Running parallel chains concurrently (& + wait), each chain's stages
+#      sequentially with per-stage server lifecycle.
+#
+# Topology (from scheduler.dump_stage_chains):
+#   batch  ─ runs sequentially after the previous batch
+#   chain  ─ runs in parallel with sibling chains in the same batch
+#   stage  ─ runs sequentially within a chain (server lifecycle per stage)
+#
+# Text format consumed by this shell (one batch per line):
+#   chains separated by "|", stages within a chain by ">":
+#     text_gen_gate_a
+#     del_mesh|flux_2d>trellis_preview
+#     gate_quality
 #
 # GPU-bound steps (trellis_3d, preview_flux, render_3d) are dispatched
 # internally by pipeline_v3.run via dispatch_gpus() — the shell does NOT
@@ -26,8 +39,9 @@
 #   MACHINE_ENV=<path>    Override machine env file
 #   VLM_MEM_FRAC=0.57     VLM VRAM fraction passed to SGLang
 #
-# Each stage logs to logs/v3_<tag>/<stage>.log.
-# Pipeline aborts on the first stage failure and shows the relevant log tail.
+# Each stage logs to logs/v3_<tag>/stage_<name>.log; chains running in
+# parallel additionally aggregate to logs/v3_<tag>/chain_<head>.log.
+# Pipeline aborts on the first chain failure and shows the relevant log tail.
 
 set -euo pipefail
 
@@ -254,8 +268,8 @@ show_stage_errors() {
     printf "${_RED}+%s+${_RST}\n\n" "$bar"
 }
 
-# ─── live heartbeat for parallel batches ─────────────────────────────
-# Prints the last log line of each running stage every N seconds so the
+# ─── live heartbeat for parallel chains ──────────────────────────────
+# Prints the last log line of each running chain every N seconds so the
 # user sees progress without interleaved output.
 
 _live_monitor() {
@@ -269,9 +283,9 @@ _live_monitor() {
             local lf="${log_files[$i]}" nm="${names[$i]}"
             if [ -f "$lf" ]; then
                 local last; last=$(tail -1 "$lf" 2>/dev/null | sed 's/\[[0-9;]*m//g')
-                printf "${_CYN}[%s %-20s]${_RST} %s\n" "$ts" "$nm" "$last"
+                printf "${_CYN}[%s %-32s]${_RST} %s\n" "$ts" "$nm" "$last"
             else
-                printf "${_CYN}[%s %-20s]${_RST} (waiting for log...)\n" "$ts" "$nm"
+                printf "${_CYN}[%s %-32s]${_RST} (waiting for log...)\n" "$ts" "$nm"
             fi
         done
     done
@@ -292,14 +306,13 @@ print(dump_shell_env(cfg, stage_name='$stage'))
     )"
 }
 
-# ─── single-stage invocation ─────────────────────────────────────────
+# ─── single-stage invocation (foreground, tee'd for interactivity) ──
 
 run_stage() {
-    # run_stage <stage_name> [servers_already_started=0|1]
-    # When servers_already_started=1 (called from a parallel batch that
-    # already started servers), skip the server lifecycle entirely.
+    # run_stage <stage_name>
+    # Used for solo (single-chain, single-stage) batches so the user keeps
+    # interactive output. Multi-chain batches use _run_stage_bg via _run_chain.
     local stage="$1"
-    local servers_up="${2:-0}"
     local log="$LOG_DIR/stage_${stage}.log"
 
     _load_stage_meta "$stage"
@@ -309,7 +322,7 @@ run_stage() {
 
     # Pre-check: skip server startup if no objects have pending work.
     local _started=0
-    if [ "$servers_up" = "0" ] && [ "$STAGE_SERVERS" != "none" ]; then
+    if [ "$STAGE_SERVERS" != "none" ]; then
         local _pending
         _pending=$(
             LIMIT="${LIMIT:-}" \
@@ -356,136 +369,188 @@ run_stage() {
     fi
 }
 
-# ─── parallel batch executor ─────────────────────────────────────────
+# ─── single-stage invocation (background-friendly: no tee) ──────────
 
-run_parallel_batch() {
-    # run_parallel_batch <stage1> [<stage2> ...]
-    # 1 stage  → serial (run_stage).
-    # N stages → start servers for the batch, fork all stages in parallel,
-    #             live-monitor progress, collect exit codes, stop servers.
-    if [ "$#" -eq 1 ]; then
-        run_stage "$1"
-        return $?
-    fi
+_run_stage_bg() {
+    # _run_stage_bg <stage_name>
+    # Variant for use inside chain subshells that already redirect stdout.
+    # Manages server lifecycle per-stage so a chain like
+    #   flux_2d > trellis_preview
+    # frees the FLUX server before Trellis starts using the same GPUs.
+    local stage="$1"
+    _load_stage_meta "$stage"
 
-    local names=("$@") pids=() _any_fail=0
+    printf "\n${_BOLD}> Stage %-24s — %s${_RST}  (steps=[%s] servers=%s gpu=%s)\n" \
+        "$STAGE_NAME" "$STAGE_DESC" "${STAGE_STEPS[*]}" "$STAGE_SERVERS" "$STAGE_USE_GPUS"
 
-    printf "\n${_BOLD}> Parallel batch [%s] — launching${_RST}\n" "${names[*]}"
-
-    # Determine what servers the batch needs (union across all stages).
-    local batch_servers="none"
-    local server_stage=""
-    for _s in "${names[@]}"; do
-        _load_stage_meta "$_s"
-        if [ "$STAGE_SERVERS" != "none" ]; then
-            batch_servers="$STAGE_SERVERS"
-            server_stage="$_s"
-        fi
-    done
-
-    # Start servers for the whole batch once (pending precheck on server stage).
-    local _batch_servers_up=0
-    if [ "$batch_servers" != "none" ] && [ -n "$server_stage" ]; then
+    local _started=0
+    if [ "$STAGE_SERVERS" != "none" ]; then
         local _pending
         _pending=$(
             LIMIT="${LIMIT:-}" \
             "$PY_PIPE" -m partcraft.pipeline_v3.run \
                 --config "$CFG" --shard "$SHARD" \
-                "${_OBJ_FLAG[@]}" --stage "$server_stage" \
+                "${_OBJ_FLAG[@]}" --stage "$stage" \
                 --count-pending 2>/dev/null
         ) || _pending=1
 
         if [ "${_pending}" = "0" ]; then
-            echo "[scheduler] batch [${names[*]}]: server stage done — skipping startup"
+            echo "[scheduler] stage $stage: all objects done — skipping server startup"
         else
-            case "$batch_servers" in
-                vlm)  start_vlm  && _batch_servers_up=1 ;;
-                flux) start_flux && _batch_servers_up=1 ;;
+            printf "[scheduler] stage %s: %s objects pending\n" "$stage" "$_pending"
+            case "$STAGE_SERVERS" in
+                vlm)  start_vlm  && _started=1 ;;
+                flux) start_flux && _started=1 ;;
+                *)    echo "[scheduler] unknown servers=$STAGE_SERVERS"; return 1 ;;
             esac
         fi
     fi
 
-    # Fork all stages; each stage call gets servers_already_started=1 so it
-    # skips the server lifecycle (servers are owned by this function).
-    for _stage in "${names[@]}"; do
+    LIMIT="${LIMIT:-}" \
+    ATTN_BACKEND="${ATTN_BACKEND:-flash_attn}" \
+    "$PY_PIPE" -m partcraft.pipeline_v3.run \
+        --config "$CFG" \
+        --shard "$SHARD" \
+        "${_OBJ_FLAG[@]}" \
+        "${_FORCE_FLAG[@]}" \
+        --stage "$stage"
+    local rc=$?
+
+    if [ "$_started" = "1" ]; then
+        case "$STAGE_SERVERS" in
+            vlm)  stop_vlm ;;
+            flux) stop_flux ;;
+        esac
+    fi
+
+    return "$rc"
+}
+
+# ─── chain runner: serial stages in current (sub)shell ──────────────
+
+_run_chain() {
+    # _run_chain <stage1> [<stage2> ...]
+    # Runs stages sequentially; each stage owns its server lifecycle so
+    # mixed server-types in one chain are safe.
+    local stages=("$@")
+    for s in "${stages[@]}"; do
+        _run_stage_bg "$s" || return $?
+    done
+    return 0
+}
+
+# ─── parallel chains executor ────────────────────────────────────────
+
+run_parallel_chains() {
+    # run_parallel_chains <chain1> [<chain2> ...]
+    # Each <chainN> is a string of ">"-joined stage names, e.g.
+    #   "del_mesh"
+    #   "flux_2d>trellis_preview"
+    #
+    # 1 chain w/ 1 stage  → run_stage (foreground tee).
+    # 1 chain w/ N stages → run_stage per stage sequentially (foreground tee).
+    # M chains            → fork each chain to bg subshell, monitor, wait.
+    local chains=("$@")
+    local n=${#chains[@]}
+
+    # ── single-chain shortcut: run foreground, preserve interactive output ──
+    if [ "$n" -eq 1 ]; then
+        local _chain_str="${chains[0]}"
+        IFS='>' read -ra _stages <<< "$_chain_str"
+        if [ ${#_stages[@]} -eq 1 ]; then
+            run_stage "${_stages[0]}"
+        else
+            printf "\n${_BOLD}> Sequential chain: %s${_RST}\n" "$_chain_str"
+            for s in "${_stages[@]}"; do
+                run_stage "$s"
+            done
+        fi
+        return
+    fi
+
+    # ── multi-chain parallel ──
+    printf "\n${_BOLD}> Parallel chains: %s${_RST}\n" "${chains[*]}"
+    local pids=() chain_logs=() chain_labels=() any_fail=0
+
+    for chain_str in "${chains[@]}"; do
+        IFS='>' read -ra _stages <<< "$chain_str"
+        local first_stage="${_stages[0]}"
+        local chain_log="$LOG_DIR/chain_${first_stage}.log"
+        chain_labels+=("$chain_str")
+        chain_logs+=("$chain_log")
         (
-            _load_stage_meta "$_stage"
-            printf "  ${_BOLD}> %s${_RST}  steps=[%s]\n" "$_stage" "${STAGE_STEPS[*]}"
-            LIMIT="${LIMIT:-}" \
-            ATTN_BACKEND="${ATTN_BACKEND:-flash_attn}" \
-            "$PY_PIPE" -m partcraft.pipeline_v3.run \
-                --config "$CFG" --shard "$SHARD" \
-                "${_OBJ_FLAG[@]}" "${_FORCE_FLAG[@]}" \
-                --stage "$_stage"
-        ) > "$LOG_DIR/stage_${_stage}.log" 2>&1 &
+            # Each subshell installs its own EXIT trap so flux/vlm servers
+            # started inside the chain are torn down even on abnormal exit.
+            trap 'stop_vlm 2>/dev/null || true; stop_flux 2>/dev/null || true' EXIT
+            IFS='>' read -ra _ss <<< "$chain_str"
+            for s in "${_ss[@]}"; do
+                _run_stage_bg "$s" || exit $?
+            done
+        ) > "$chain_log" 2>&1 &
         pids+=($!)
-        printf "  ${_CYN}%s${_RST} -> PID %s\n" "$_stage" "${pids[-1]}"
+        printf "  ${_CYN}%-40s${_RST} -> PID %s -> %s\n" "$chain_str" "${pids[-1]}" "$chain_log"
     done
 
-    # Background heartbeat — one status line per stage every 15 s.
+    # Background heartbeat — one status line per chain every 15 s.
     local _mon_args=()
-    for _s in "${names[@]}"; do
-        _mon_args+=("$LOG_DIR/stage_${_s}.log" "$_s")
+    for i in "${!chain_labels[@]}"; do
+        _mon_args+=("${chain_logs[$i]}" "${chain_labels[$i]}")
     done
     _live_monitor 15 "${_mon_args[@]}" &
     local _mon_pid=$!
 
-    for _i in "${!pids[@]}"; do
+    for i in "${!pids[@]}"; do
         local _rc=0
-        wait "${pids[$_i]}" || _rc=$?
+        wait "${pids[$i]}" || _rc=$?
         if [ "$_rc" -ne 0 ]; then
-            printf "${_RED}[scheduler] %s FAILED (exit=%s)${_RST}\n" "${names[$_i]}" "$_rc"
-            show_stage_errors "$LOG_DIR/stage_${names[$_i]}.log" "${names[$_i]}"
-            _any_fail=$_rc
+            printf "${_RED}[scheduler] chain %s FAILED (exit=%s)${_RST}\n" \
+                "${chain_labels[$i]}" "$_rc"
+            show_stage_errors "${chain_logs[$i]}" "${chain_labels[$i]}"
+            any_fail=$_rc
         else
-            printf "${_GRN}[scheduler] %s OK${_RST}\n" "${names[$_i]}"
+            printf "${_GRN}[scheduler] chain %s OK${_RST}\n" "${chain_labels[$i]}"
         fi
     done
 
     kill "$_mon_pid" 2>/dev/null || true
     wait "$_mon_pid" 2>/dev/null || true
 
-    if [ "$_batch_servers_up" = "1" ]; then
-        case "$batch_servers" in
-            vlm)  stop_vlm ;;
-            flux) stop_flux ;;
-        esac
-    fi
-
-    if [ "$_any_fail" -ne 0 ]; then
-        printf "${_RED}[scheduler] parallel batch [%s] had failures — aborting${_RST}\n" "${names[*]}"
-        exit "$_any_fail"
+    if [ "$any_fail" -ne 0 ]; then
+        printf "${_RED}[scheduler] parallel chains [%s] had failures — aborting${_RST}\n" \
+            "${chain_labels[*]}"
+        exit "$any_fail"
     fi
 }
 
 # ═══ MAIN LOOP ═══════════════════════════════════════════════════════
-# Ask Python to group SELECTED_STAGES into execution batches respecting
-# parallel_group annotations.  Each output line is a space-separated
-# list of stage names; single-element lines run serially, multi-element
-# lines run concurrently (& + wait).
+# Ask Python for the chain layout of SELECTED_STAGES. Each output line
+# is one batch:
+#   - chains separated by "|"
+#   - stages within a chain separated by ">"
 #
-# Example output from dump_stage_batches:
+# Example output from dump_stage_chains:
 #   text_gen_gate_a
-#   deletion_cpu flux_2d     <- parallel (same parallel_group)
-#   trellis_preview
+#   del_mesh|flux_2d>trellis_preview     <- two parallel chains
 #   gate_quality
 
 _stages_str="${SELECTED_STAGES[*]}"
 
-while IFS=' ' read -ra _batch; do
-    [ "${#_batch[@]}" -eq 0 ] && continue
-    run_parallel_batch "${_batch[@]}"
+while IFS= read -r _line; do
+    [ -z "$_line" ] && continue
+    IFS='|' read -ra _chains <<< "$_line"
+    run_parallel_chains "${_chains[@]}"
 done < <(
     "$PY_PIPE" -c "
 import yaml
-from partcraft.pipeline_v3.scheduler import dump_stage_batches, stages_for
+from partcraft.pipeline_v3.scheduler import (
+    dump_stage_chains, format_stage_chains_text, stages_for,
+)
 cfg = yaml.safe_load(open('$CFG'))
 # Preserve config order, filter to the requested stages.
 all_names = [s.name for s in stages_for(cfg)]
 requested = set('$_stages_str'.split())
 ordered = [n for n in all_names if n in requested]
-for batch in dump_stage_batches(cfg, ordered):
-    print(' '.join(batch))
+print(format_stage_chains_text(dump_stage_chains(cfg, ordered)))
 "
 )
 

@@ -29,6 +29,13 @@ class Phase:
     use_gpus: bool = False
     optional: bool = False
     parallel_group: str = ""       # non-empty → run concurrently with same-group stages
+    # Sub-chain support inside a parallel_group: stages sharing the same
+    # non-empty ``chain_id`` form a sequential sub-chain within the group's
+    # batch (sorted by ``chain_order``). Different chains in the same group
+    # run in parallel; stages without ``chain_id`` are treated as singleton
+    # chains. ``chain_id`` is meaningful only together with ``parallel_group``.
+    chain_id: str = ""
+    chain_order: int = 0
 
 
 def _pipeline(cfg: dict) -> dict:
@@ -116,6 +123,8 @@ def stages_for(cfg: dict) -> list[Phase]:
             use_gpus=bool(entry.get("use_gpus", False)),
             optional=bool(entry.get("optional", False)),
             parallel_group=str(entry.get("parallel_group", "")),
+            chain_id=str(entry.get("chain_id", "")),
+            chain_order=int(entry.get("chain_order", 0)),
         ))
     return out
 
@@ -140,55 +149,146 @@ def get_stage(cfg: dict, name: str) -> Phase:
     raise KeyError(f"stage {name!r} not in config")
 
 
+def dump_stage_chains(
+    cfg: dict,
+    stage_names: list[str],
+) -> list[list[list[str]]]:
+    """Group stage_names into ordered batches → parallel chains → serial stages.
+
+    Topology:
+    - **Batch** (top): runs serially after the previous batch finishes.
+      A batch is created from a ``parallel_group`` (or one solo stage).
+    - **Chain** (middle): chains within the same batch run concurrently.
+      A chain is created per non-empty ``chain_id`` inside a group, plus one
+      singleton chain per stage without ``chain_id``.
+    - **Stage** (inner): stages within a chain run sequentially, sorted by
+      ``chain_order`` (then by config order).
+
+    The output preserves the original relative order of ``stage_names`` for
+    chain placement (then ``chain_order`` re-sorts inside a chain).
+
+    Examples::
+
+        # Flat sequence (no groups, no chains)
+        dump_stage_chains(cfg, ["A", "B", "C"])
+        → [[["A"]], [["B"]], [["C"]]]
+
+        # Two stages in same parallel_group, no chains
+        dump_stage_chains(cfg, ["A", "D", "D2", "E"])  # D, D2 share group "x"
+        → [[["A"]], [["D"], ["D2"]], [["E"]]]
+
+        # Sub-chain inside a parallel_group
+        # group=g  chains: del → [del_mesh]; flux → [flux_2d, trellis_preview]
+        dump_stage_chains(cfg, ["A", "del_mesh", "flux_2d", "trellis_preview"])
+        → [[["A"]], [["del_mesh"], ["flux_2d", "trellis_preview"]]]
+    """
+    by_name = {ph.name: ph for ph in stages_for(cfg)}
+    batches: list[list[list[str]]] = []
+    group_to_idx: dict[str, int] = {}                  # parallel_group → batch index
+    chain_to_pos: dict[tuple[int, str], int] = {}      # (batch_idx, chain_id) → chain idx
+    server_count_per_chain: dict[tuple[int, int], int] = {}  # (batch, chain) → #server stages
+
+    log = logging.getLogger("scheduler")
+
+    for name in stage_names:
+        ph = by_name.get(name)
+        if ph is None:
+            log.warning("[scheduler] stage %r not in config — skipping", name)
+            continue
+
+        group = ph.parallel_group or ""
+        chain_id = ph.chain_id or ""
+        needs_servers = ph.servers != "none"
+
+        # Resolve target batch.
+        if group and group in group_to_idx:
+            batch_idx = group_to_idx[group]
+        else:
+            batch_idx = len(batches)
+            batches.append([])
+            if group:
+                group_to_idx[group] = batch_idx
+
+        # Resolve target chain inside the batch.
+        if chain_id:
+            key = (batch_idx, chain_id)
+            if key in chain_to_pos:
+                chain_idx = chain_to_pos[key]
+            else:
+                chain_idx = len(batches[batch_idx])
+                batches[batch_idx].append([])
+                chain_to_pos[key] = chain_idx
+        else:
+            chain_idx = len(batches[batch_idx])
+            batches[batch_idx].append([])
+
+        # Safety: at most one server-backed stage per chain — chains that need
+        # the same external server type would collide on ports if overlapped.
+        if needs_servers:
+            count = server_count_per_chain.get((batch_idx, chain_idx), 0)
+            if count >= 1:
+                log.warning(
+                    "[scheduler] stage %s adds a 2nd server-backed step to "
+                    "chain %r — server lifecycle is per-stage so this is OK, "
+                    "but verify the two stages use distinct server types.",
+                    name, chain_id or f"<solo:{name}>",
+                )
+            server_count_per_chain[(batch_idx, chain_idx)] = count + 1
+
+        batches[batch_idx][chain_idx].append(name)
+
+    # Sort stages inside each chain by chain_order (stable for ties).
+    for batch in batches:
+        for chain in batch:
+            chain.sort(key=lambda n: by_name[n].chain_order)
+
+    return batches
+
+
+def format_stage_chains_text(batches: list[list[list[str]]]) -> str:
+    """Serialise nested chain structure for the shell driver.
+
+    Format (one batch per line):
+    - Chains separated by ``|``
+    - Stages within a chain separated by ``>``
+
+    Example::
+
+        text_gen_gate_a
+        del_mesh|flux_2d>trellis_preview
+        gate_quality
+    """
+    lines = []
+    for batch in batches:
+        chain_strs = [">".join(chain) for chain in batch]
+        lines.append("|".join(chain_strs))
+    return "\n".join(lines)
+
+
 def dump_stage_batches(
     cfg: dict,
     stage_names: list[str],
 ) -> list[list[str]]:
-    """Group stage_names into ordered execution batches by parallel_group.
+    """Backward-compat wrapper: flatten chains within each batch.
 
-    Stages sharing the same non-empty ``parallel_group`` are placed in the
-    same batch and will be run concurrently by the shell orchestrator.
-    Stages without a group (or with ``servers != "none"``) form
-    single-element batches and run serially.
+    Prefer :func:`dump_stage_chains` for new callers — it preserves the
+    intra-batch chain (sequential) structure that this function loses.
 
     The output preserves the original relative order of stage_names.
 
-    Example with D and D2 both having ``parallel_group: "D+D2"``::
+    Example::
 
         dump_stage_batches(cfg, ["A", "C", "D", "D2", "E"])
         → [["A"], ["C"], ["D", "D2"], ["E"]]
     """
-    by_name = {ph.name: ph for ph in stages_for(cfg)}
-    batches: list[list[str]] = []
-    group_to_idx: dict[str, int] = {}   # parallel_group → index in batches
-    group_server_count: dict[str, int] = {}  # parallel_group → stages needing servers
-
-    for name in stage_names:
-        ph = by_name.get(name)
-        group = (ph.parallel_group if ph else "") or ""
-        needs_servers = bool(ph and ph.servers != "none")
-        # Safety guard: allow at most one server-backed stage per parallel group.
-        # This enables "server stage + CPU/GPU-only stage" concurrency while
-        # avoiding duplicate external server startups in the same group.
-        if group and needs_servers and group_server_count.get(group, 0) >= 1:
-            logging.getLogger("scheduler").warning(
-                "[scheduler] stage %s is in parallel_group %r with servers=%r "
-                "but that group already has a server-backed stage — running serially",
-                name, group, ph.servers,
-            )
-            group = ""
-        if group and group in group_to_idx:
-            batches[group_to_idx[group]].append(name)
-            if needs_servers:
-                group_server_count[group] = group_server_count.get(group, 0) + 1
-        else:
-            idx = len(batches)
-            batches.append([name])
-            if group:
-                group_to_idx[group] = idx
-                group_server_count[group] = 1 if needs_servers else 0
-
-    return batches
+    chains_by_batch = dump_stage_chains(cfg, stage_names)
+    out: list[list[str]] = []
+    for batch in chains_by_batch:
+        flat: list[str] = []
+        for chain in batch:
+            flat.extend(chain)
+        out.append(flat)
+    return out
 
 
 def dump_shell_env(
@@ -255,4 +355,6 @@ __all__ = [
     "phases_for", "select_phases", "get_phase",
     "dump_shell_env",
     "dump_stage_batches",
+    "dump_stage_chains",
+    "format_stage_chains_text",
 ]
