@@ -491,10 +491,11 @@ def dispatch_gpus(
             )
             procs.append((gpu, w, subprocess.Popen(cmd, env=env)))
 
+    LOG.info("[%s] waiting on %d children", step, len(procs))
     rc = 0
     for gpu, w, p in procs:
         r = p.wait()
-        LOG.info("[%s] GPU %s worker %d exit=%d", step, gpu, w, r)
+        LOG.info("[%s] GPU %s worker %d/%d exit=%d", step, gpu, w + 1, k, r)
         if r != 0:
             rc = r
     return rc
