@@ -102,6 +102,7 @@ services:
     trellis_text_ckpt: /mnt/zsn/zsn_workspace/PartCraft3D/checkpoints/TRELLIS-text-xlarge
     image_edit_backend: local_diffusers
     workers_per_server: 2
+    trellis_workers_per_gpu: 2
     export_ply: false
     export_ply_for_deletion: false
     large_part_threshold: 0.35

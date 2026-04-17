@@ -100,6 +100,13 @@ services:
     trellis_text_ckpt: /path/to/TRELLIS-text-xlarge
     image_edit_backend: local_diffusers
     workers_per_server: 2
+    # Per-GPU concurrent Trellis 3D workers (1 = current behavior).
+    # Recommended: 2 on 80+ GB cards, 3 only on 144 GB H800. K > 1 helps
+    # because each worker overlaps its CPU/IO (DINOv2, voxel mask, NFS)
+    # with another worker's GPU sampling. Only trellis_3d honors this;
+    # preview_flux / render_3d ignore it. Env override:
+    # TRELLIS_WORKERS_PER_GPU=<n>.
+    trellis_workers_per_gpu: 1
     export_ply: false
     export_ply_for_deletion: false
     repaint_mode: image
