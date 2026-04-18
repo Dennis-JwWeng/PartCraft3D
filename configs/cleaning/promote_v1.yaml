@@ -1,0 +1,29 @@
+v1_root: data/partverse_edit_v1
+
+promote_rules:
+  required_passes:
+    - gate_text_align
+    - gate_quality
+  edit_types_allowed:
+    - deletion
+    - addition
+    - modification
+    - scale
+    - material
+    - color
+    - glb
+
+source_layouts:
+  v2:
+    objects_glob: "objects/*/*"
+    edit_status_relpath: "edit_status.json"
+  v3:
+    objects_glob: "*/objects/*/*"
+    edit_status_relpath: "edit_status.json"
+
+before_assets:
+  view_indices: [89, 90, 91, 100, 8]
+  img_enc_root: data/partverse/img_Enc
+  slat_root:    data/partverse/slat
+
+link_mode: hardlink   # hardlink | symlink | copy
