@@ -66,12 +66,18 @@ def main(argv: list[str] | None = None) -> int:
     v1_root = args.v1_root or Path(rules["v1_root"])
     link_mode = LinkMode(args.link_mode or rules.get("link_mode", "hardlink"))
     layout = V1Layout(root=v1_root)
+    ba = rules["before_assets"]
+    image_npz_root = Path(ba["image_npz_root"]) if ba.get("image_npz_root") else None
+    img_enc_root   = Path(ba["img_enc_root"])   if ba.get("img_enc_root")   else None
+    if image_npz_root is None and img_enc_root is None:
+        raise SystemExit("rules.before_assets must set image_npz_root or img_enc_root")
     cfg = PromoterConfig(
         rule=rules["promote_rules"],
         link_mode=link_mode,
-        img_enc_root=Path(rules["before_assets"]["img_enc_root"]),
-        slat_root=Path(rules["before_assets"]["slat_root"]),
-        view_indices=list(rules["before_assets"]["view_indices"]),
+        slat_root=Path(ba["slat_root"]),
+        view_indices=list(ba["view_indices"]),
+        image_npz_root=image_npz_root,
+        img_enc_root=img_enc_root,
         force=args.force,
     )
     pending = DelLatentPending(layout.pending_del_latent_file())

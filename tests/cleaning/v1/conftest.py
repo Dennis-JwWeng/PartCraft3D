@@ -21,16 +21,25 @@ def _touch(p: Path, content: bytes = b"x") -> None:
 def v2_obj_dir(tmp_path: Path) -> Path:
     obj = tmp_path / "pipeline_v2_shard05" / "objects" / "05" / "objA"
     _write_json(obj / "phase1" / "parsed.json", {
-        "object": {"full_desc_stage1": "An object", "full_desc_stage2": ""},
-        "parts": [{"id": 0, "name": "handle"}, {"id": 1, "name": "body"}],
-        "edits": [
-            {"edit_type": "deletion", "selected_part_ids": [0],
-             "prompt": "Remove the handle.", "target_part_desc": "handle on right",
-             "view_index": 0, "edit_params": {}},
-            {"edit_type": "modification", "selected_part_ids": [1],
-             "prompt": "Make the body wooden.", "target_part_desc": "the body",
-             "view_index": 1, "edit_params": {"new_part_desc": "wooden body"}},
-        ],
+        "obj_id": "objA", "shard": "05", "validation": {"ok": True},
+        "parsed": {
+            "object": {
+                "full_desc_stage1": "An object",
+                "full_desc_stage2": "",
+                "parts": [
+                    {"part_id": 0, "name": "handle"},
+                    {"part_id": 1, "name": "body"},
+                ],
+            },
+            "edits": [
+                {"edit_type": "deletion", "selected_part_ids": [0],
+                 "prompt": "Remove the handle.", "target_part_desc": "handle on right",
+                 "view_index": 0, "edit_params": {}},
+                {"edit_type": "modification", "selected_part_ids": [1],
+                 "prompt": "Make the body wooden.", "target_part_desc": "the body",
+                 "view_index": 1, "edit_params": {"new_part_desc": "wooden body"}},
+            ],
+        },
     })
     _write_json(obj / "edit_status.json", {
         "obj_id": "objA", "shard": "05", "schema_version": 1,
@@ -70,13 +79,18 @@ def v2_obj_dir(tmp_path: Path) -> Path:
 def v3_obj_dir(tmp_path: Path) -> Path:
     obj = tmp_path / "shard08_run" / "mode_e_text_align" / "objects" / "08" / "objB"
     _write_json(obj / "phase1" / "parsed.json", {
-        "object": {"full_desc_stage1": "Another object"},
-        "parts": [{"id": 0, "name": "leg"}],
-        "edits": [
-            {"edit_type": "deletion", "selected_part_ids": [0],
-             "prompt": "Remove the leg.", "target_part_desc": "the leg",
-             "view_index": 0, "edit_params": {}},
-        ],
+        "obj_id": "objB", "shard": "08", "validation": {"ok": True},
+        "parsed": {
+            "object": {
+                "full_desc_stage1": "Another object",
+                "parts": [{"part_id": 0, "name": "leg"}],
+            },
+            "edits": [
+                {"edit_type": "deletion", "selected_part_ids": [0],
+                 "prompt": "Remove the leg.", "target_part_desc": "the leg",
+                 "view_index": 0, "edit_params": {}},
+            ],
+        },
     })
     _write_json(obj / "edit_status.json", {
         "obj_id": "objB", "shard": "08", "schema_version": 1,
@@ -108,13 +122,18 @@ def v2_obj_dir_with_addition(tmp_path: Path) -> Path:
     """
     obj = tmp_path / "pipeline_v2_shard05" / "objects" / "05" / "objA"
     _write_json(obj / "phase1" / "parsed.json", {
-        "object": {"full_desc_stage1": "An object"},
-        "parts": [{"id": 0, "name": "wheel"}],
-        "edits": [
-            {"edit_type": "deletion", "selected_part_ids": [0],
-             "prompt": "Remove the wheel.", "view_index": 0,
-             "target_part_desc": "the wheel", "edit_params": {}},
-        ],
+        "obj_id": "objA", "shard": "05", "validation": {"ok": True},
+        "parsed": {
+            "object": {
+                "full_desc_stage1": "An object",
+                "parts": [{"part_id": 0, "name": "wheel"}],
+            },
+            "edits": [
+                {"edit_type": "deletion", "selected_part_ids": [0],
+                 "prompt": "Remove the wheel.", "view_index": 0,
+                 "target_part_desc": "the wheel", "edit_params": {}},
+            ],
+        },
     })
     _write_json(obj / "edit_status.json", {
         "obj_id": "objA", "shard": "05", "schema_version": 1,

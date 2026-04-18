@@ -24,7 +24,8 @@ source_layouts:
 
 before_assets:
   view_indices: [89, 90, 91, 100, 8]
-  img_enc_root: data/partverse/img_Enc
+  image_npz_root: data/partverse/inputs/images   # NPZ of canonical-view PNGs
+  img_enc_root:    data/partverse/img_Enc          # legacy fallback (per-frame PNGs, RGBA, no bg)
   slat_root:    data/partverse/inputs/slat
 
 link_mode: hardlink

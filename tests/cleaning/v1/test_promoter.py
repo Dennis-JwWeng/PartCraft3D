@@ -93,3 +93,75 @@ def test_collision_from_different_run_appends_r2_suffix(tmp_path: Path, v2_obj_d
     assert edit_dir_r2.is_dir()
     qc = json.loads(v1.qc_json("05", "objA", "del_objA_000", suffix="__r2").read_text())
     assert qc["source"]["run_tag"] == "pipeline_v2_shard05_rerun"
+
+
+
+def _fake_image_npz(tmp_path: Path, obj_id: str = "objA", shard: str = "05",
+                    indices: list[int] = [8, 89, 90, 91, 100]) -> Path:
+    """Build a per-object image NPZ matching the real partverse format."""
+    import io
+    import numpy as np
+    from PIL import Image
+    npz_root = tmp_path / "data_images"
+    shard_dir = npz_root / shard
+    shard_dir.mkdir(parents=True)
+    arrs = {}
+    for idx in indices:
+        # encode a tiny distinct PNG so we can verify byte-for-byte preservation
+        img = Image.new("RGB", (4, 4), color=(idx % 256, 0, 0))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        arrs[f"{idx:03d}.png"] = np.frombuffer(buf.getvalue(), dtype=np.uint8)
+    np.savez(shard_dir / f"{obj_id}.npz", **arrs)
+    return npz_root
+
+
+def test_promote_with_image_npz_root_writes_decoded_pngs(
+    tmp_path: Path, v2_obj_dir: Path,
+):
+    """When image_npz_root is set, before/views are written from the NPZ
+    (PNG bytes preserved verbatim), not from img_enc_root."""
+    img_npz_root = _fake_image_npz(tmp_path)
+    data_root = _fake_before_assets(tmp_path)
+    v1 = V1Layout(root=tmp_path / "v1")
+    cfg = PromoterConfig(
+        rule={"required_passes": ["gate_text_align", "gate_quality"]},
+        link_mode=LinkMode.HARDLINK,
+        slat_root=data_root / "slat",
+        view_indices=[89, 90, 91, 100, 8],
+        image_npz_root=img_npz_root,
+    )
+    pending = DelLatentPending(v1.pending_del_latent_file())
+    summary = promote_records(
+        list(iter_records_from_v2_obj(v2_obj_dir, run_tag="t")),
+        layout=v1, cfg=cfg, pending=pending,
+    )
+    assert summary.promoted == 1, f"summary={summary}"
+    # Compare the v1 view against the NPZ source bytes for view index 89.
+    import numpy as np
+    z = np.load(img_npz_root / "05" / "objA.npz")
+    expected = bytes(z["089.png"].tobytes())
+    actual = (v1.before_view_paths("05", "objA")[0]).read_bytes()
+    assert actual == expected, "before/view_0.png is not byte-equal to NPZ source"
+
+
+def test_promote_without_image_npz_falls_back_to_img_enc(
+    tmp_path: Path, v2_obj_dir: Path,
+):
+    """When image_npz_root is None, the old img_enc_root path still works."""
+    data_root = _fake_before_assets(tmp_path)
+    v1 = V1Layout(root=tmp_path / "v1")
+    cfg = PromoterConfig(
+        rule={"required_passes": ["gate_text_align", "gate_quality"]},
+        link_mode=LinkMode.HARDLINK,
+        slat_root=data_root / "slat",
+        view_indices=[89, 90, 91, 100, 8],
+        img_enc_root=data_root / "img_Enc",
+    )
+    pending = DelLatentPending(v1.pending_del_latent_file())
+    summary = promote_records(
+        list(iter_records_from_v2_obj(v2_obj_dir, run_tag="t")),
+        layout=v1, cfg=cfg, pending=pending,
+    )
+    assert summary.promoted == 1
+    assert (v1.before_view_paths("05", "objA")[0]).read_bytes() == b"png"

@@ -17,9 +17,17 @@ from .pending import DelLatentPending, PendingEntry
 class PromoterConfig:
     rule: dict
     link_mode: LinkMode
-    img_enc_root: Path
     slat_root: Path
     view_indices: list[int]
+    # Preferred source for ``before/views/``: the per-object NPZ that the
+    # pipeline itself loads via ``load_views_from_npz`` for Gate-A judging.
+    # Layout: ``<image_npz_root>/<shard>/<obj_id>.npz`` with PNG-byte arrays
+    # keyed by ``"{idx:03d}.png"``.  This guarantees the v1 ``before`` views
+    # match the pipeline's judged-against pixels (background already
+    # composited).  When None we fall back to per-frame PNGs under
+    # ``img_enc_root/<obj_id>/{idx:03d}.png`` (RGBA, no bg compositing).
+    image_npz_root: Path | None = None
+    img_enc_root: Path | None = None
     force: bool = False
     promoter_version: str = "1.0.0"
 
@@ -62,23 +70,68 @@ def _pack_pt_to_npz(pt_path: Path, npz_path: Path) -> None:
     np.savez(npz_path, **arrs)
 
 
+def _decode_views_from_npz(
+    npz_path: Path, view_indices: list[int], dsts: list[Path], *, force: bool,
+) -> tuple[bool, str]:
+    """Extract canonical-view PNGs from a per-object image NPZ.
+
+    The NPZ stores each rendered frame as 1-D ``uint8`` PNG bytes under key
+    ``"{idx:03d}.png"`` (the same on-disk format the v3 alignment gate
+    consumes via ``load_views_from_npz``).  We just write the raw PNG bytes
+    out — no re-encoding — so the v1 ``before`` views are byte-equivalent
+    to what the pipeline judged against.
+    """
+    import numpy as np
+    if not npz_path.is_file():
+        return False, f"missing image NPZ: {npz_path}"
+    try:
+        z = np.load(npz_path)
+    except Exception as e:
+        return False, f"failed to open NPZ {npz_path}: {e}"
+    try:
+        for idx, dst in zip(view_indices, dsts):
+            key = f"{idx:03d}.png"
+            if key not in z.files:
+                return False, f"NPZ {npz_path.name} missing view {key}"
+            if dst.is_file() and not force:
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(bytes(z[key].tobytes()))
+    finally:
+        try:
+            z.close()
+        except Exception:
+            pass
+    return True, ""
+
+
 def _materialize_before(
     *, shard: str, obj_id: str, layout: V1Layout, cfg: PromoterConfig,
     summary: PromotionSummary,
 ) -> bool:
-    img_enc_dir = cfg.img_enc_root / obj_id
-    if not img_enc_dir.is_dir():
-        summary.notes.append(f"missing img_Enc dir: {img_enc_dir}")
-        return False
-    for k, idx in enumerate(cfg.view_indices):
-        src = img_enc_dir / f"{idx:03d}.png"
-        dst = layout.before_view_paths(shard, obj_id)[k]
-        if not src.is_file():
-            summary.notes.append(f"missing view {src}")
+    dsts = layout.before_view_paths(shard, obj_id)
+    if cfg.image_npz_root is not None:
+        npz = cfg.image_npz_root / shard / f"{obj_id}.npz"
+        ok, err = _decode_views_from_npz(npz, cfg.view_indices, dsts, force=cfg.force)
+        if not ok:
+            summary.notes.append(err)
             return False
-        res = link_one(src, dst, mode=cfg.link_mode, force=cfg.force)
-        if res.fell_back:
-            summary.fallback_count += 1
+    else:
+        if cfg.img_enc_root is None:
+            summary.notes.append("neither image_npz_root nor img_enc_root configured")
+            return False
+        img_enc_dir = cfg.img_enc_root / obj_id
+        if not img_enc_dir.is_dir():
+            summary.notes.append(f"missing img_Enc dir: {img_enc_dir}")
+            return False
+        for k, idx in enumerate(cfg.view_indices):
+            src = img_enc_dir / f"{idx:03d}.png"
+            if not src.is_file():
+                summary.notes.append(f"missing view {src}")
+                return False
+            res = link_one(src, dsts[k], mode=cfg.link_mode, force=cfg.force)
+            if res.fell_back:
+                summary.fallback_count += 1
     feats_pt = cfg.slat_root / shard / f"{obj_id}_feats.pt"
     coords_pt = cfg.slat_root / shard / f"{obj_id}_coords.pt"
     ss_pt = cfg.slat_root / shard / f"{obj_id}_ss.pt"
@@ -119,13 +172,15 @@ def _write_meta_json(layout: V1Layout, rec: PromotionRecord, cfg: PromoterConfig
     raw_p = rec.source_run_dir / "phase1" / "raw.txt"
     if raw_p.is_file():
         raw_caption = raw_p.read_text(errors="replace").strip()
+    from ._parsed import extract_edits_and_parts
+    _, parts_by_id = extract_edits_and_parts(parsed)
     meta = {
         "obj_id": rec.obj_id, "shard": rec.shard,
         "source_dataset": "partverse",
         "caption": raw_caption,
         "part_list": [
-            {"part_id": int(p["id"]), "name": p.get("name", "")}
-            for p in (parsed.get("parts") or [])
+            {"part_id": pid, "name": name}
+            for pid, name in sorted(parts_by_id.items())
         ],
         "promoted_at": _now_z(),
         "promoter_version": cfg.promoter_version,
@@ -134,7 +189,11 @@ def _write_meta_json(layout: V1Layout, rec: PromotionRecord, cfg: PromoterConfig
     p.write_text(json.dumps(meta, indent=2))
 
 
-def _resolve_suffix(layout: V1Layout, rec: PromotionRecord) -> str | None:
+def _resolve_suffix(layout: V1Layout, rec: PromotionRecord, *,
+                    force: bool = False) -> str | None:
+    """Pick the destination suffix for ``rec`` (``""`` for fresh, ``__rN`` for
+    a different-run collision).  Returns ``None`` iff the same run_tag has
+    already been promoted to ``edit_id`` (and ``force=False``)."""
     base = layout.edit_dir(rec.shard, rec.obj_id, rec.edit_id, suffix="")
     if not base.exists():
         return ""
@@ -143,7 +202,9 @@ def _resolve_suffix(layout: V1Layout, rec: PromotionRecord) -> str | None:
         try:
             qc = json.loads(qc_p.read_text())
             if qc.get("source", {}).get("run_tag") == rec.source_run_tag:
-                return None
+                # Same source already here. Either skip (default) or overwrite
+                # in place when the caller asked us to force.
+                return "" if force else None
         except Exception:
             pass
     n = 2
@@ -212,7 +273,7 @@ def promote_records(
                     continue
             _write_meta_json(layout, rec, cfg)
             seen_objs.add((rec.shard, rec.obj_id))
-        suffix = _resolve_suffix(layout, rec)
+        suffix = _resolve_suffix(layout, rec, force=cfg.force)
         if suffix is None:
             summary.skipped_existing += 1
             continue

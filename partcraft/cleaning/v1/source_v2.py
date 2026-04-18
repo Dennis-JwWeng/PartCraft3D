@@ -110,7 +110,14 @@ def _spec_subset_for_edit(
         "selected_part_ids": pids,
         "part_labels": [parts_by_id.get(p, "") for p in pids],
         "target_part_desc": src.get("target_part_desc", ""),
-        "new_parts_desc": (src.get("new_parts_desc") or src.get("target_part_desc", "")),
+        # v2 uses ``new_parts_desc``; v3 uses ``after_desc``; fall back to the
+        # target part description (or the edit prompt) when neither is set.
+        "new_parts_desc": (
+            src.get("new_parts_desc")
+            or src.get("after_desc")
+            or src.get("after_desc_full")
+            or src.get("target_part_desc", "")
+        ),
         "edit_params": dict(src.get("edit_params") or {}),
     }
 
@@ -123,9 +130,9 @@ def iter_records_from_v2_obj(
     shard = es.get("shard") or obj_dir.parent.name
 
     parsed_p = obj_dir / "phase1" / "parsed.json"
-    parsed = _read_json(parsed_p) if parsed_p.is_file() else {"edits": [], "parts": []}
-    parsed_edits = parsed.get("edits") or []
-    parts_by_id = {int(p["id"]): p.get("name", "") for p in (parsed.get("parts") or [])}
+    parsed = _read_json(parsed_p) if parsed_p.is_file() else {}
+    from ._parsed import extract_edits_and_parts
+    parsed_edits, parts_by_id = extract_edits_and_parts(parsed)
 
     edits = es.get("edits") or {}
 
