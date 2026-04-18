@@ -47,8 +47,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--link-mode", choices=[m.value for m in LinkMode], default=None)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--force-pipeline", choices=["v2", "v3"], default=None)
+    ap.add_argument("--obj-ids", type=Path, default=None,
+                    help="optional path to a file with one obj_id per line; if set, "
+                         "only edits whose obj_id is in the list are promoted")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args(argv)
+
+    obj_filter: set[str] | None = None
+    if args.obj_ids is not None:
+        obj_filter = {ln.strip() for ln in args.obj_ids.read_text().splitlines()
+                      if ln.strip() and not ln.startswith("#")}
+        LOG.info("obj_id filter: %d entries from %s", len(obj_filter), args.obj_ids)
 
     logging.basicConfig(level=args.log_level,
                         format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
@@ -76,6 +85,8 @@ def main(argv: list[str] | None = None) -> int:
             recs = iter_records_from_v2_run(run_root, run_tag=run_root.name)
         else:
             recs = iter_records_from_v3_run(run_root, run_tag=run_root.name)
+        if obj_filter is not None:
+            recs = (r for r in recs if r.obj_id in obj_filter)
         s = promote_records(recs, layout=layout, cfg=cfg, pending=pending)
         LOG.info("  promoted=%d skipped=%d deferred=%d failed=%d filtered=%d fallback=%d",
                  s.promoted, s.skipped_existing, s.deferred, s.failed,

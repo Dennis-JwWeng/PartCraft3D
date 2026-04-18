@@ -39,14 +39,23 @@ def _now_z() -> str:
     return datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
 
 
+def _to_np(t):
+    """Convert a torch tensor (possibly with grad) to numpy; passthrough otherwise."""
+    if hasattr(t, "detach"):
+        return t.detach().cpu().numpy()
+    if hasattr(t, "cpu"):
+        return t.cpu().numpy()
+    return t
+
+
 def _pack_pt_to_npz(pt_path: Path, npz_path: Path) -> None:
     import numpy as np
     import torch
     obj = torch.load(pt_path, map_location="cpu", weights_only=False)
     if isinstance(obj, dict):
-        arrs = {k: (v.cpu().numpy() if hasattr(v, "cpu") else v) for k, v in obj.items()}
-    elif hasattr(obj, "cpu"):
-        arrs = {"data": obj.cpu().numpy()}
+        arrs = {k: _to_np(v) for k, v in obj.items()}
+    elif hasattr(obj, "cpu") or hasattr(obj, "detach"):
+        arrs = {"data": _to_np(obj)}
     else:
         arrs = {"data": obj}
     npz_path.parent.mkdir(parents=True, exist_ok=True)
@@ -82,8 +91,10 @@ def _materialize_before(
         import torch
         feats = torch.load(feats_pt, map_location="cpu", weights_only=False)
         coords = torch.load(coords_pt, map_location="cpu", weights_only=False)
-        feats_arr = feats.cpu().numpy() if hasattr(feats, "cpu") else feats
-        coords_arr = coords.cpu().numpy() if hasattr(coords, "cpu") else coords
+        feats_arr = feats.detach().cpu().numpy() if hasattr(feats, "detach") else (
+                       feats.cpu().numpy() if hasattr(feats, "cpu") else feats)
+        coords_arr = coords.detach().cpu().numpy() if hasattr(coords, "detach") else (
+                        coords.cpu().numpy() if hasattr(coords, "cpu") else coords)
         slat_dst.parent.mkdir(parents=True, exist_ok=True)
         np.savez(slat_dst, feats=feats_arr, coords=coords_arr)
     ss_dst = layout.before_ss_npz(shard, obj_id)
