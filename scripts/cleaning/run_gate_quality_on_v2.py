@@ -88,10 +88,15 @@ def main(argv: list[str] | None = None) -> int:
 
     services = cfg.get("services") or {}
     vlm = services.get("vlm") or {}
-    vlm_urls = list(vlm.get("urls") or [])
     vlm_model = vlm.get("model", "")
+    # Prefer explicit URLs in services.vlm.{urls,base_urls}; otherwise
+    # derive from pipeline.gpus + vlm_port_base via the v3 scheduler.
+    vlm_urls = list(vlm.get("urls") or vlm.get("base_urls") or [])
     if not vlm_urls:
-        LOG.error("no services.vlm.urls in %s", args.v3_config)
+        from partcraft.pipeline_v3.scheduler import vlm_urls_for
+        vlm_urls = list(vlm_urls_for(cfg))
+    if not vlm_urls:
+        LOG.error("no VLM URLs derivable from %s", args.v3_config)
         return 2
 
     asyncio.run(run_gate_quality(
