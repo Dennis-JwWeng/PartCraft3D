@@ -76,11 +76,20 @@ def _decode_views_from_npz(
     """Extract canonical-view PNGs from a per-object image NPZ.
 
     The NPZ stores each rendered frame as 1-D ``uint8`` PNG bytes under key
-    ``"{idx:03d}.png"`` (the same on-disk format the v3 alignment gate
-    consumes via ``load_views_from_npz``).  We just write the raw PNG bytes
-    out — no re-encoding — so the v1 ``before`` views are byte-equivalent
-    to what the pipeline judged against.
+    ``"{idx:03d}.png"``.  Those PNGs are RGBA with a transparent background;
+    naively writing the raw bytes leaves alpha intact and viewers render the
+    transparent regions as a checkerboard, which is not what the pipeline
+    actually judges.
+
+    ``partcraft.render.overview.load_views_from_npz`` (the function every
+    downstream judge uses) decodes each PNG with ``cv2.IMREAD_UNCHANGED``
+    and, when alpha is present, composites onto a solid-white background
+    (``rgb*a + 255*(1-a)``) before returning BGR.  We replicate that exact
+    step here and re-encode as RGB PNG so the on-disk ``before/views/``
+    pixels match the model-facing pixels byte-for-byte after the same
+    composite that Gate A applied.
     """
+    import cv2
     import numpy as np
     if not npz_path.is_file():
         return False, f"missing image NPZ: {npz_path}"
@@ -95,8 +104,22 @@ def _decode_views_from_npz(
                 return False, f"NPZ {npz_path.name} missing view {key}"
             if dst.is_file() and not force:
                 continue
+            buf = np.frombuffer(bytes(z[key].tobytes()), dtype=np.uint8)
+            img = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                return False, f"NPZ {npz_path.name} view {key} failed to decode"
+            if img.ndim == 3 and img.shape[2] == 4:
+                a = img[:, :, 3:4].astype(np.float32) / 255.0
+                rgb = img[:, :, :3].astype(np.float32)
+                bg = np.full_like(rgb, 255)
+                img = (rgb * a + bg * (1 - a)).astype(np.uint8)
+            elif img.ndim == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
             dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(bytes(z[key].tobytes()))
+            ok, enc = cv2.imencode(".png", img)
+            if not ok:
+                return False, f"failed to encode {dst.name}"
+            dst.write_bytes(bytes(enc))
     finally:
         try:
             z.close()

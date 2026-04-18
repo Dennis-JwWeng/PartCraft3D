@@ -97,8 +97,14 @@ def test_collision_from_different_run_appends_r2_suffix(tmp_path: Path, v2_obj_d
 
 
 def _fake_image_npz(tmp_path: Path, obj_id: str = "objA", shard: str = "05",
-                    indices: list[int] = [8, 89, 90, 91, 100]) -> Path:
-    """Build a per-object image NPZ matching the real partverse format."""
+                    indices: list[int] = [8, 89, 90, 91, 100],
+                    *, mode: str = "RGB", alpha: int = 255) -> Path:
+    """Build a per-object image NPZ matching the real partverse format.
+
+    ``mode``/``alpha`` let tests cover both opaque-RGB and the real-world
+    RGBA-with-transparency case (which the promoter must alpha-composite
+    onto white before writing).
+    """
     import io
     import numpy as np
     from PIL import Image
@@ -107,8 +113,10 @@ def _fake_image_npz(tmp_path: Path, obj_id: str = "objA", shard: str = "05",
     shard_dir.mkdir(parents=True)
     arrs = {}
     for idx in indices:
-        # encode a tiny distinct PNG so we can verify byte-for-byte preservation
-        img = Image.new("RGB", (4, 4), color=(idx % 256, 0, 0))
+        if mode == "RGBA":
+            img = Image.new("RGBA", (4, 4), color=(idx % 256, 0, 0, alpha))
+        else:
+            img = Image.new("RGB", (4, 4), color=(idx % 256, 0, 0))
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         arrs[f"{idx:03d}.png"] = np.frombuffer(buf.getvalue(), dtype=np.uint8)
@@ -137,12 +145,15 @@ def test_promote_with_image_npz_root_writes_decoded_pngs(
         layout=v1, cfg=cfg, pending=pending,
     )
     assert summary.promoted == 1, f"summary={summary}"
-    # Compare the v1 view against the NPZ source bytes for view index 89.
+    # The v1 view should round-trip back to the same RGB pixels we'd get
+    # from naive PIL decode of the source PNG (this fake NPZ has no alpha).
+    import io
     import numpy as np
+    from PIL import Image
     z = np.load(img_npz_root / "05" / "objA.npz")
-    expected = bytes(z["089.png"].tobytes())
-    actual = (v1.before_view_paths("05", "objA")[0]).read_bytes()
-    assert actual == expected, "before/view_0.png is not byte-equal to NPZ source"
+    src_pixels = np.array(Image.open(io.BytesIO(bytes(z["089.png"].tobytes()))).convert("RGB"))
+    actual = np.array(Image.open(v1.before_view_paths("05", "objA")[0]).convert("RGB"))
+    assert np.array_equal(actual, src_pixels), "before/view_0 pixels differ from NPZ source"
 
 
 def test_promote_without_image_npz_falls_back_to_img_enc(
@@ -165,3 +176,36 @@ def test_promote_without_image_npz_falls_back_to_img_enc(
     )
     assert summary.promoted == 1
     assert (v1.before_view_paths("05", "objA")[0]).read_bytes() == b"png"
+
+
+
+def test_promote_npz_rgba_is_composited_onto_white(
+    tmp_path: Path, v2_obj_dir: Path,
+):
+    """When the NPZ entry is RGBA with transparency, the v1 ``before`` view
+    must be composited onto white (matching ``load_views_from_npz``), not
+    written with alpha intact (which would render as a checkerboard)."""
+    # alpha=0 → fully transparent everywhere → after compositing onto white,
+    # every pixel must be (255, 255, 255).
+    img_npz_root = _fake_image_npz(tmp_path, mode="RGBA", alpha=0)
+    data_root = _fake_before_assets(tmp_path)
+    v1 = V1Layout(root=tmp_path / "v1")
+    cfg = PromoterConfig(
+        rule={"required_passes": ["gate_text_align", "gate_quality"]},
+        link_mode=LinkMode.HARDLINK,
+        slat_root=data_root / "slat",
+        view_indices=[89, 90, 91, 100, 8],
+        image_npz_root=img_npz_root,
+    )
+    pending = DelLatentPending(v1.pending_del_latent_file())
+    summary = promote_records(
+        list(iter_records_from_v2_obj(v2_obj_dir, run_tag="t")),
+        layout=v1, cfg=cfg, pending=pending,
+    )
+    assert summary.promoted == 1
+    import numpy as np
+    from PIL import Image
+    out = np.array(Image.open(v1.before_view_paths("05", "objA")[0]).convert("RGB"))
+    assert out.shape == (4, 4, 3)
+    assert (out == 255).all(), \
+        "transparent RGBA NPZ entry should composite to all-white, not stay transparent"
