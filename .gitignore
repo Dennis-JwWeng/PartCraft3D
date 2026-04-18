@@ -48,3 +48,6 @@ qwen.yaml
 .DS_Store
 Thumbs.db
 outputs
+
+# Git worktrees
+.worktrees/
