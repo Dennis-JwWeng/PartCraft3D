@@ -209,3 +209,63 @@ def test_promote_npz_rgba_is_composited_onto_white(
     assert out.shape == (4, 4, 3)
     assert (out == 255).all(), \
         "transparent RGBA NPZ entry should composite to all-white, not stay transparent"
+
+
+
+def test_blocklist_excludes_records_from_named_run(
+    tmp_path: Path, v2_obj_dir: Path,
+):
+    """Records whose source_run_tag is in cfg.source_blocklist must be
+    counted as ``blocklisted`` (not ``promoted``, ``filtered`` or
+    ``failed``) and must never materialize files on disk.
+
+    Regression guard for the shard05 upside-down-overview poisoning:
+    even if a future caller forgets to drop shard05 from --source-runs,
+    the YAML-level blocklist refuses to admit any of its records.
+    """
+    img_npz_root = _fake_image_npz(tmp_path)
+    data_root = _fake_before_assets(tmp_path)
+    v1 = V1Layout(root=tmp_path / "v1")
+    cfg = PromoterConfig(
+        rule={"required_passes": ["gate_text_align", "gate_quality"]},
+        link_mode=LinkMode.HARDLINK,
+        slat_root=data_root / "slat",
+        view_indices=[89, 90, 91, 100, 8],
+        image_npz_root=img_npz_root,
+        source_blocklist=frozenset({"pipeline_v2_shard05"}),
+    )
+    pending = DelLatentPending(v1.pending_del_latent_file())
+    # Tag the records with the blocklisted run name.
+    recs = list(iter_records_from_v2_obj(v2_obj_dir, run_tag="pipeline_v2_shard05"))
+    assert len(recs) >= 1, "fixture should yield at least one record"
+    summary = promote_records(recs, layout=v1, cfg=cfg, pending=pending)
+
+    assert summary.blocklisted == len(recs), \
+        f"expected {len(recs)} blocklisted, got summary={summary}"
+    assert summary.promoted == 0
+    assert summary.failed == 0
+    assert summary.filtered == 0
+    # No before/views should be on disk.
+    assert not (v1.before_view_paths("05", "objA")[0]).exists()
+    # And no edit dir.
+    assert not (v1.edit_dir("05", "objA", "del_objA_000")).exists()
+
+
+def test_blocklist_lets_other_runs_through(tmp_path: Path, v2_obj_dir: Path):
+    """A blocklist on one run name must not affect records from another."""
+    img_npz_root = _fake_image_npz(tmp_path)
+    data_root = _fake_before_assets(tmp_path)
+    v1 = V1Layout(root=tmp_path / "v1")
+    cfg = PromoterConfig(
+        rule={"required_passes": ["gate_text_align", "gate_quality"]},
+        link_mode=LinkMode.HARDLINK,
+        slat_root=data_root / "slat",
+        view_indices=[89, 90, 91, 100, 8],
+        image_npz_root=img_npz_root,
+        source_blocklist=frozenset({"some_other_bad_run"}),
+    )
+    pending = DelLatentPending(v1.pending_del_latent_file())
+    recs = list(iter_records_from_v2_obj(v2_obj_dir, run_tag="pipeline_v2_shard06"))
+    summary = promote_records(recs, layout=v1, cfg=cfg, pending=pending)
+    assert summary.blocklisted == 0
+    assert summary.promoted >= 1

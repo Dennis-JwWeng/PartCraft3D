@@ -30,6 +30,12 @@ class PromoterConfig:
     img_enc_root: Path | None = None
     force: bool = False
     promoter_version: str = "1.0.0"
+    # Run tags that must never contribute records.  Use this when an entire
+    # source run is known to be poisoned (e.g. ``pipeline_v2_shard05`` was
+    # processed against an upside-down ``phase1/overview.png`` from the
+    # historical Y/Z swap bug, so every Gate A verdict — and therefore
+    # every promotion candidate — derived from it is meaningless).
+    source_blocklist: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass
@@ -39,6 +45,7 @@ class PromotionSummary:
     deferred: int = 0
     failed: int = 0
     filtered: int = 0
+    blocklisted: int = 0
     fallback_count: int = 0
     notes: list[str] = field(default_factory=list)
 
@@ -277,6 +284,13 @@ def promote_records(
     summary = PromotionSummary()
     seen_objs: set[tuple[str, str]] = set()
     for rec in recs:
+        if rec.source_run_tag in cfg.source_blocklist:
+            summary.blocklisted += 1
+            summary.notes.append(
+                f"blocklisted source_run_tag={rec.source_run_tag!r} "
+                f"(obj={rec.obj_id}, edit={rec.edit_id})"
+            )
+            continue
         ok, reason = evaluate_rule(rec.passes, cfg.rule, edit_type=rec.edit_type)
         if not ok:
             if reason.startswith("missing"):

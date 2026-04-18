@@ -29,3 +29,10 @@ before_assets:
   slat_root:    data/partverse/inputs/slat
 
 link_mode: hardlink
+# Source runs that must never contribute records to v1.  shard05 was processed
+# against an upside-down ``phase1/overview.png`` from the historical Y/Z swap
+# bug in the partverse pre-rendering — every Gate A verdict (and the parsed
+# parts/edits the VLM produced) is therefore unreliable.  Re-promote only
+# after the upstream NPZ is re-rendered or the mesh is re-aligned.
+source_blocklist:
+  - pipeline_v2_shard05

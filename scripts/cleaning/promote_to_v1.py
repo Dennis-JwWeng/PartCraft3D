@@ -71,6 +71,13 @@ def main(argv: list[str] | None = None) -> int:
     img_enc_root   = Path(ba["img_enc_root"])   if ba.get("img_enc_root")   else None
     if image_npz_root is None and img_enc_root is None:
         raise SystemExit("rules.before_assets must set image_npz_root or img_enc_root")
+    blocklist = frozenset(
+        rules.get("source_blocklist")
+        or rules["promote_rules"].get("source_blocklist")
+        or ()
+    )
+    if blocklist:
+        LOG.info("source_blocklist active: %s", sorted(blocklist))
     cfg = PromoterConfig(
         rule=rules["promote_rules"],
         link_mode=link_mode,
@@ -79,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
         image_npz_root=image_npz_root,
         img_enc_root=img_enc_root,
         force=args.force,
+        source_blocklist=blocklist,
     )
     pending = DelLatentPending(layout.pending_del_latent_file())
 
