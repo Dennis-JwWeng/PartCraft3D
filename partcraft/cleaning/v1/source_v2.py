@@ -48,6 +48,53 @@ def _gate_a_to_pass(gate_a: dict[str, Any] | None) -> PassResult | None:
     )
 
 
+def _addition_source_del_map(obj_dir: Path) -> dict[str, str]:
+    """Return ``{add_edit_id: source_del_id}`` by scanning ``edits_3d/add_*/meta.json``.
+
+    Pipeline-v3 (``mesh_deletion._write_addition_meta``) records this link when
+    an addition edit is created as the inverse of a deletion.  v2 reuses the
+    same on-disk layout, so we read it the same way.
+    """
+    out: dict[str, str] = {}
+    edits_root = obj_dir / "edits_3d"
+    if not edits_root.is_dir():
+        return out
+    for sub in edits_root.iterdir():
+        if not sub.is_dir() or not sub.name.startswith("add_"):
+            continue
+        meta = sub / "meta.json"
+        if not meta.is_file():
+            continue
+        try:
+            d = json.loads(meta.read_text())
+        except Exception:
+            continue
+        src = d.get("source_del_id")
+        add_id = d.get("edit_id") or sub.name
+        if src:
+            out[add_id] = src
+    return out
+
+
+def _inherited_pass(src: PassResult, *, source_del_id: str) -> PassResult:
+    """Synthetic ``gate_text_align`` verdict for an addition, inherited from
+    its source deletion.  Additions are the prompt-flipped inverse of a
+    deletion (see ``pipeline_v3.addition_utils.invert_delete_prompt``); v3
+    handles the same idea implicitly via Gate E (`_inherit_gate_e`).
+    """
+    base_reason = (src.reason or "").strip()
+    suffix = f"inherited from {source_del_id}"
+    new_reason = f"{base_reason} | {suffix}" if base_reason else suffix
+    return PassResult(
+        passed=src.passed,
+        score=src.score,
+        producer=f"{src.producer} (inherited:add->del)",
+        reason=new_reason,
+        ts=src.ts,
+        extra={**(src.extra or {}), "inherited_from": source_del_id},
+    )
+
+
 def _spec_subset_for_edit(
     edit_id: str, edit_type: str, parsed_edits: list[dict[str, Any]],
     parts_by_id: dict[int, str],
@@ -81,11 +128,28 @@ def iter_records_from_v2_obj(
     parts_by_id = {int(p["id"]): p.get("name", "") for p in (parsed.get("parts") or [])}
 
     edits = es.get("edits") or {}
+
+    # Pre-pass: collect del Gate A so we can inherit it for additions.
+    del_gta: dict[str, PassResult] = {}
+    for edit_id, entry in edits.items():
+        if entry.get("edit_type") != "deletion":
+            continue
+        p = _gate_a_to_pass((entry.get("gates") or {}).get("A"))
+        if p is not None:
+            del_gta[edit_id] = p
+
+    # Map add_id -> source_del_id from on-disk meta.json.
+    add_src_map = _addition_source_del_map(obj_dir)
+
     for edit_id, entry in edits.items():
         edit_type = entry.get("edit_type", "")
         gates = entry.get("gates") or {}
         passes: dict[str, PassResult] = {}
         gta = _gate_a_to_pass(gates.get("A"))
+        if gta is None and edit_type == "addition":
+            src_del = add_src_map.get(edit_id)
+            if src_del and src_del in del_gta:
+                gta = _inherited_pass(del_gta[src_del], source_del_id=src_del)
         if gta is not None:
             passes["gate_text_align"] = gta
         gte = _gate_e_to_pass(gates.get("E"))

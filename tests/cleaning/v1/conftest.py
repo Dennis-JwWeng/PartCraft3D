@@ -97,3 +97,55 @@ def v3_obj_dir(tmp_path: Path) -> Path:
     for k in range(5):
         _touch(obj / "edits_3d" / "del_objB_000" / f"preview_{k}.png")
     return obj
+
+
+@pytest.fixture
+def v2_obj_dir_with_addition(tmp_path: Path) -> Path:
+    """v2 object with one deletion (PASS Gate A) and its inverse addition.
+
+    Mirrors what ``pipeline_v3.mesh_deletion._write_addition_meta`` produces:
+    add_*/meta.json carries a ``source_del_id`` linking back to the deletion.
+    """
+    obj = tmp_path / "pipeline_v2_shard05" / "objects" / "05" / "objA"
+    _write_json(obj / "phase1" / "parsed.json", {
+        "object": {"full_desc_stage1": "An object"},
+        "parts": [{"id": 0, "name": "wheel"}],
+        "edits": [
+            {"edit_type": "deletion", "selected_part_ids": [0],
+             "prompt": "Remove the wheel.", "view_index": 0,
+             "target_part_desc": "the wheel", "edit_params": {}},
+        ],
+    })
+    _write_json(obj / "edit_status.json", {
+        "obj_id": "objA", "shard": "05", "schema_version": 1,
+        "edits": {
+            "del_objA_000": {
+                "edit_type": "deletion",
+                "gates": {
+                    "A": {"rule": {"pass": True},
+                          "vlm": {"pass": True, "score": 1.0,
+                                  "reason": "auto_pass_deletion"}},
+                    "C": None, "E": None,
+                },
+            },
+            "add_objA_000": {
+                "edit_type": "addition",
+                # NB: no gates — v2 never runs Gate A on additions.
+            },
+        },
+    })
+    _touch(obj / "edits_3d" / "del_objA_000" / "after_new.glb")
+    for k in range(5):
+        _touch(obj / "edits_3d" / "del_objA_000" / f"preview_{k}.png")
+    _write_json(obj / "edits_3d" / "add_objA_000" / "meta.json", {
+        "edit_id": "add_objA_000", "edit_type": "addition",
+        "obj_id": "objA", "shard": "05",
+        "source_del_id": "del_objA_000",
+        "selected_part_ids": [0],
+        "prompt": "Add the wheel.",
+        "target_part_desc": "the wheel",
+    })
+    _touch(obj / "edits_3d" / "add_objA_000" / "after_new.glb")
+    for k in range(5):
+        _touch(obj / "edits_3d" / "add_objA_000" / f"preview_{k}.png")
+    return obj
