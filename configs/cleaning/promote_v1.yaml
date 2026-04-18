@@ -24,6 +24,6 @@ source_layouts:
 before_assets:
   view_indices: [89, 90, 91, 100, 8]
   img_enc_root: data/partverse/img_Enc
-  slat_root:    data/partverse/slat
+  slat_root:    data/partverse/inputs/slat
 
 link_mode: hardlink   # hardlink | symlink | copy
