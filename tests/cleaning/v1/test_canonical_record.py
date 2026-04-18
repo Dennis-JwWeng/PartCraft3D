@@ -75,3 +75,26 @@ def test_record_qc_dict_contains_source_and_passes():
     assert qc["source"]["run_tag"] == "pipeline_v2_shard05"
     assert qc["source"]["promoted_at"] == "2026-04-19T12:00:00Z"
     assert set(qc["passes"].keys()) == {"gate_text_align", "gate_quality"}
+
+def test_evaluate_rule_filters_disallowed_edit_type():
+    rule = {
+        "required_passes": ["gate_text_align"],
+        "edit_types_allowed": ["deletion", "addition"],
+    }
+    ok, reason = evaluate_rule(_ok_passes(), rule, edit_type="modification")
+    assert ok is False
+    assert reason.startswith("disallowed_type")
+    assert "modification" in reason
+
+
+def test_evaluate_rule_passes_allowed_edit_type():
+    rule = {
+        "required_passes": ["gate_text_align"],
+        "edit_types_allowed": ["deletion", "addition"],
+    }
+    assert evaluate_rule(_ok_passes(), rule, edit_type="deletion") == (True, "")
+
+
+def test_evaluate_rule_ignores_edit_type_when_allowed_unset():
+    rule = {"required_passes": ["gate_text_align"]}
+    assert evaluate_rule(_ok_passes(), rule, edit_type="anything") == (True, "")

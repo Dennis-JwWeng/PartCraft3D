@@ -77,19 +77,22 @@ def main(argv: list[str] | None = None) -> int:
         else:
             recs = iter_records_from_v3_run(run_root, run_tag=run_root.name)
         s = promote_records(recs, layout=layout, cfg=cfg, pending=pending)
-        LOG.info("  promoted=%d skipped=%d deferred=%d failed=%d fallback=%d",
-                 s.promoted, s.skipped_existing, s.deferred, s.failed, s.fallback_count)
+        LOG.info("  promoted=%d skipped=%d deferred=%d failed=%d filtered=%d fallback=%d",
+                 s.promoted, s.skipped_existing, s.deferred, s.failed,
+                 s.filtered, s.fallback_count)
         for n in s.notes[:20]:
             LOG.info("  note: %s", n)
         overall.promoted += s.promoted
         overall.skipped_existing += s.skipped_existing
         overall.deferred += s.deferred
         overall.failed += s.failed
+        overall.filtered += s.filtered
         overall.fallback_count += s.fallback_count
 
-    LOG.info("TOTAL promoted=%d skipped=%d deferred=%d failed=%d fallback=%d",
+    LOG.info("TOTAL promoted=%d skipped=%d deferred=%d failed=%d filtered=%d fallback=%d",
              overall.promoted, overall.skipped_existing,
-             overall.deferred, overall.failed, overall.fallback_count)
+             overall.deferred, overall.failed,
+             overall.filtered, overall.fallback_count)
     return 0
 
 

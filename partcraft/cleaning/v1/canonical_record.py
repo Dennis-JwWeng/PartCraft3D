@@ -70,8 +70,14 @@ class PromotionRecord:
 
 
 def evaluate_rule(
-    passes: dict[str, PassResult], rule: dict[str, Any],
+    passes: dict[str, PassResult],
+    rule: dict[str, Any],
+    *,
+    edit_type: str | None = None,
 ) -> tuple[bool, str]:
+    allowed = rule.get("edit_types_allowed") or []
+    if allowed and edit_type is not None and edit_type not in allowed:
+        return False, f"disallowed_type: {edit_type}"
     required = list(rule.get("required_passes", []))
     missing = [name for name in required if name not in passes]
     if missing:

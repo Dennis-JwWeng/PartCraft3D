@@ -30,6 +30,7 @@ class PromotionSummary:
     skipped_existing: int = 0
     deferred: int = 0
     failed: int = 0
+    filtered: int = 0
     fallback_count: int = 0
     notes: list[str] = field(default_factory=list)
 
@@ -181,10 +182,12 @@ def promote_records(
     summary = PromotionSummary()
     seen_objs: set[tuple[str, str]] = set()
     for rec in recs:
-        ok, reason = evaluate_rule(rec.passes, cfg.rule)
+        ok, reason = evaluate_rule(rec.passes, cfg.rule, edit_type=rec.edit_type)
         if not ok:
             if reason.startswith("missing"):
                 summary.deferred += 1
+            elif reason.startswith("disallowed_type"):
+                summary.filtered += 1
             else:
                 summary.failed += 1
             continue
