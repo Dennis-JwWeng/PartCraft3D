@@ -1,0 +1,48 @@
+# Promote rule for v2 add/del edits using ONLY text-alignment (Gate A) verdicts.
+#
+# Use case: v2 pipeline runs already produced gates.A but never ran Gate E.
+# For deletion + addition edits, Gate E (visual quality) is meaningless
+# anyway — the gate just inherits Gate A. So we can short-circuit the whole
+# Gate-E backfill step and promote directly.
+#
+# IMPORTANT: this rule is intentionally *less strict* than the default
+# `promote_v1.yaml`. Edits promoted under this rule will be missing the
+# `gate_quality` pass in their `qc.json`; downstream consumers that gate on
+# `gate_quality` should treat these edits as "Gate-A only".
+#
+# Usage:
+#   python -m scripts.cleaning.promote_to_v1 \
+#       --source-runs outputs/partverse/pipeline_v2_shard05 ... \
+#       --rules configs/cleaning/promote_v1_addel_textalign.yaml
+
+v1_root: data/partverse_edit_v1
+
+promote_rules:
+  required_passes:
+    - gate_text_align
+  edit_types_allowed:
+    - deletion
+    - addition
+
+source_layouts:
+  v2:
+    objects_glob: "objects/*/*"
+    edit_status_relpath: "edit_status.json"
+  v3:
+    objects_glob: "*/objects/*/*"
+    edit_status_relpath: "edit_status.json"
+
+before_assets:
+  view_indices: [89, 90, 91, 100, 8]
+  image_npz_root: data/partverse/inputs/images   # NPZ of canonical-view PNGs
+  img_enc_root:    data/partverse/img_Enc          # legacy fallback (per-frame PNGs, RGBA, no bg)
+  slat_root:    data/partverse/inputs/slat
+
+link_mode: hardlink   # hardlink | symlink | copy
+# Source runs that must never contribute records to v1.  shard05 was processed
+# against an upside-down ``phase1/overview.png`` from the historical Y/Z swap
+# bug in the partverse pre-rendering — every Gate A verdict (and the parsed
+# parts/edits the VLM produced) is therefore unreliable.  Re-promote only
+# after the upstream NPZ is re-rendered or the mesh is re-aligned.
+source_blocklist:
+  - pipeline_v2_shard05
