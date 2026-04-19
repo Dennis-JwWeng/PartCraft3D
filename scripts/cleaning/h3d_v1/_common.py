@@ -120,12 +120,47 @@ def collect_edits(
     return accepted, stats, paths
 
 
-def build_promote_context(paths: PipelinePaths, *, ss_encoder=None) -> PromoteContext:
+def _git_short_sha(repo_root: Path | None = None) -> str:
+    """Best-effort short HEAD SHA; returns "" if unavailable."""
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(repo_root) if repo_root else None,
+            stderr=subprocess.DEVNULL, timeout=2,
+        )
+        return out.decode().strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _repo_relative(p: Path) -> str:
+    """Convert ``p`` to a repo-relative POSIX path; fall back to absolute."""
+    try:
+        # Repo root: 3 levels up from this file (scripts/cleaning/h3d_v1/_common.py)
+        repo = Path(__file__).resolve().parents[3]
+        return str(p.resolve().relative_to(repo))
+    except Exception:  # noqa: BLE001
+        return str(p)
+
+
+def build_promote_context(
+    paths: PipelinePaths,
+    *,
+    ss_encoder=None,
+    pipeline_cfg_path: Path | None = None,
+    source_dataset: str = "partverse",
+) -> PromoteContext:
+    """Construct a ``PromoteContext`` with lineage fields auto-populated."""
     return PromoteContext(
         pipeline_obj_root=paths.objects_root,
         slat_dir=paths.slat_dir,
         images_root=paths.images_root,
         ss_encoder=ss_encoder,
+        pipeline_version="v3",
+        pipeline_config=_repo_relative(pipeline_cfg_path) if pipeline_cfg_path else "",
+        pipeline_git_sha=_git_short_sha(),
+        source_dataset=source_dataset,
     )
 
 

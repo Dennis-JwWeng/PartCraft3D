@@ -70,7 +70,7 @@ def main() -> int:
         print_summary(stats, "pull_flux (dry-run)")
         return 0
 
-    ctx = build_promote_context(paths)
+    ctx = build_promote_context(paths, pipeline_cfg_path=args.pipeline_cfg)
     run_promote_pool(
         edits, layout, ctx,
         promote_fn=lambda e, l: promote_flux(e, l, ctx=ctx),

@@ -185,7 +185,7 @@ def main() -> int:
         for e in needs_encode:
             stats.add_skip("missing_after_npz_skip_encode")
 
-    ctx = build_promote_context(paths)
+    ctx = build_promote_context(paths, pipeline_cfg_path=args.pipeline_cfg)
     run_promote_pool(
         ready, layout, ctx,
         promote_fn=lambda e, l: promote_deletion(e, l, ctx=ctx),

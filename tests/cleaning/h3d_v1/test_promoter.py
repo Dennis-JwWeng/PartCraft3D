@@ -144,7 +144,12 @@ def test_promote_deletion_writes_files_and_links_to_assets(fixture: dict) -> Non
 
     meta = json.loads(layout.meta_json("deletion", SHARD, OBJ, DEL_ID).read_text())
     assert meta["edit_id"] == DEL_ID
-    assert meta["gates"]["gate_A"]["status"] == "pass"
+    assert meta["quality"]["final_pass"] is True
+    assert meta["quality"].get("gate_A_score") == 1.0
+    assert meta["lineage"]["pipeline_version"] == "v3"
+    assert meta["lineage"]["source_dataset"] == "partverse"
+    assert "promoted_at" in meta["lineage"]
+    assert meta["lineage"].get("paired_edit_id") == "add_" + DEL_ID[4:]
 
 
 def test_promote_deletion_idempotent(fixture: dict) -> None:
@@ -209,7 +214,7 @@ def test_promote_addition_succeeds_after_deletion(fixture: dict) -> None:
     assert promote_deletion(fixture["del_edit"], layout, ctx=ctx).ok
     res = promote_addition(fixture["add_edit"], layout, ctx=ctx)
     assert res.ok, res.reason
-    assert res.manifest_record["paired_edit_id"] == DEL_ID
+    assert res.manifest_record["lineage"]["paired_edit_id"] == DEL_ID
 
     object_npz = layout.object_npz(SHARD, OBJ)
     add_before = layout.before_npz("addition", SHARD, OBJ, ADD_ID)
