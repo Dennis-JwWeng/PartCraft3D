@@ -67,8 +67,19 @@ class V1Layout:
     def after_npz_path(self, shard: str, obj_id: str, edit_id: str, *, suffix: str = "") -> Path:
         return self.edit_dir(shard, obj_id, edit_id, suffix=suffix) / "after.npz"
 
+    def before_npz_path(self, shard: str, obj_id: str, edit_id: str, *, suffix: str = "") -> Path:
+        # Per-edit before.npz (combined-schema: slat_feats / slat_coords / ss).
+        # For most edit types this hardlinks to the per-object shared cache;
+        # for addition it hardlinks to the source deletion's after.npz.
+        return self.edit_dir(shard, obj_id, edit_id, suffix=suffix) / "before.npz"
+
     def after_pending_marker(self, shard: str, obj_id: str, edit_id: str, *, suffix: str = "") -> Path:
         return self.edit_dir(shard, obj_id, edit_id, suffix=suffix) / "_after_pending.json"
+
+    def before_pending_marker(self, shard: str, obj_id: str, edit_id: str, *, suffix: str = "") -> Path:
+        # Marker for addition edits whose per-edit before.npz is awaiting the
+        # source deletion's after.npz to be encoded.
+        return self.edit_dir(shard, obj_id, edit_id, suffix=suffix) / "_before_pending.json"
 
     def after_view_paths(self, shard: str, obj_id: str, edit_id: str, *, suffix: str = "") -> list[Path]:
         d = self.edit_dir(shard, obj_id, edit_id, suffix=suffix) / "views"
