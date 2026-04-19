@@ -52,3 +52,10 @@ outputs
 # Git worktrees
 .worktrees/
 /data
+
+# Generated reports / HTML dashboards
+reports/
+
+# Manual / agent-cached file backups
+*.bak_*
+.efc_*
