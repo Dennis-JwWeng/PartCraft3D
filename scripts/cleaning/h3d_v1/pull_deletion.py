@@ -78,6 +78,30 @@ def _parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
+def _normalize_device_env(device: str) -> str:
+    """Map ``cuda:N`` → ``cuda`` after pinning ``CUDA_VISIBLE_DEVICES=N``.
+
+    The downstream loaders (``trellis``,
+    ``encode_asset.encode_into_SLAT._get_slat_encoder``) check only for
+    ``device == "cuda"``; passing ``cuda:0`` causes
+    ``partcraft.io.npz_utils.load_ss_encoder`` to silently fall through
+    to CPU and the encode step then fails with a torch type mismatch
+    on the first conv. Pin the visible device and call everything
+    below with the bare ``"cuda"`` token.
+    """
+    if device == "cuda" or not device.startswith("cuda:"):
+        return device
+    idx = device.split(":", 1)[1]
+    existing = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if existing is None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = idx
+        LOG.info("pinned CUDA_VISIBLE_DEVICES=%s (from --device %s)", idx, device)
+    elif existing != idx:
+        LOG.warning("--device %s but CUDA_VISIBLE_DEVICES=%s already set; "
+                    "trusting existing env", device, existing)
+    return "cuda"
+
+
 def _maybe_load_encoder(ckpt_root: Path, device: str):
     """Lazy-load Trellis ss_encoder; deferred so CPU-only paths skip torch."""
     from scripts.tools.migrate_slat_to_npz import _load_ss_encoder  # noqa: PLC0415
@@ -137,12 +161,13 @@ def main() -> int:
     LOG.info("ready=%d needs_encode=%d", len(ready), len(needs_encode))
 
     if needs_encode and not args.skip_encode:
-        ss_encoder = _maybe_load_encoder(args.ckpt_root, args.device)
+        device = _normalize_device_env(args.device)
+        ss_encoder = _maybe_load_encoder(args.ckpt_root, device)
         t0 = time.time()
         for i, edit in enumerate(needs_encode, 1):
             t = time.time()
             ok = _encode_after_npz(
-                edit, ss_encoder=ss_encoder, device=args.device,
+                edit, ss_encoder=ss_encoder, device=device,
                 work_dir=args.encode_work_dir,
                 num_views=args.num_views, blender_path=args.blender,
             )
