@@ -88,33 +88,43 @@ If `[CONFIG_ERROR] data.images_root vs data.image_npz_dir …` fires, two roots 
 
 ---
 
-## Pipeline → unified edit dataset
+## Pipeline → H3D_v1 dataset
 
-Pipeline runs land per-shard under `outputs/.../objects/<NN>/<obj_id>/`. To consolidate cleaned passes from one or more runs (mix of v2 + v3) into a versioned dataset (`data/partverse_edit_v1/`), use `partcraft.cleaning.v1` + the `scripts/cleaning/` CLIs.
+Pipeline runs land per-shard under `outputs/.../objects/<NN>/<obj_id>/`. To promote one shard at a time into the **H3D_v1** dataset (`data/H3D_v1/`), run the three `pull_*` CLIs in order:
 
 ```bash
-# (v2-source only) backfill Gate E / Gate A on a v2 run using the v3 judges
-python -m scripts.cleaning.run_gate_quality_on_v2 \
-    --v2-run outputs/partverse/pipeline_v2_shard05 \
-    --v3-config <v3_config.yaml> --shards 05 --concurrency 4
-python -m scripts.cleaning.run_gate_text_align_on_v2 \
-    --v2-run outputs/partverse/pipeline_v2_shard05 \
-    --v3-config <v3_config.yaml> --shards 05 --force
+# 1) Deletions — filter by gate_a, encode any missing after.npz on GPU,
+#    then hardlink the dataset bundle. The only GPU CLI of the three.
+python -m scripts.cleaning.h3d_v1.pull_deletion \
+    --pipeline-cfg configs/pipeline_v3_shard08.yaml --shard 08 \
+    --dataset-root data/H3D_v1 \
+    --device cuda:0 --blender /usr/local/bin/blender --workers 8
 
-# Promote rule-passing edits from runs into v1 (hardlink/symlink/copy)
-python -m scripts.cleaning.promote_to_v1 \
-    --source-runs outputs/partverse/pipeline_v2_shard05 \
-                  outputs/partverse/shard08/mode_e_text_align \
-    --rules configs/cleaning/promote_v1.yaml
+# 2) Flux edits (modification | scale | material | color | global) —
+#    filter by gate_a AND gate_e, then hardlink. Pure IO.
+python -m scripts.cleaning.h3d_v1.pull_flux \
+    --pipeline-cfg configs/pipeline_v3_shard08.yaml --shard 08 \
+    --dataset-root data/H3D_v1 --workers 8
 
-# Encode pending deletion latents (after_new.glb → after.npz with SLAT + DINOv2)
-python -m scripts.cleaning.encode_del_latent --rules configs/cleaning/promote_v1.yaml --num-gpus 4
+# 3) Additions — backfill from each paired deletion already in dataset.
+#    Run **after** pull_deletion. Pure IO.
+python -m scripts.cleaning.h3d_v1.pull_addition \
+    --pipeline-cfg configs/pipeline_v3_shard08.yaml --shard 08 \
+    --dataset-root data/H3D_v1 --workers 8
 
-# Rebuild data/partverse_edit_v1/index/{objects,edits}.jsonl
-python -m scripts.cleaning.rebuild_v1_index --rules configs/cleaning/promote_v1.yaml
+# 4) Build the whole-dataset index (manifests/all.jsonl) + validate.
+python -m scripts.cleaning.h3d_v1.build_h3d_v1_index \
+    --dataset-root data/H3D_v1 --validate
+
+# 5) (optional) Pack one shard into a single tarball for transfer/upload.
+python -m scripts.cleaning.h3d_v1.pack_shard \
+    --dataset-root data/H3D_v1 --shard 08 \
+    --out releases/H3D_v1__shard08.tar
 ```
 
-Promotion rules (required passes, allowed edit types, `link_mode`, `before_assets.*`, `source_blocklist`) live in `configs/cleaning/promote_v1.yaml`. End-to-end smoke walkthrough: **`docs/superpowers/runbooks/2026-04-19-edit-data-v1-smoke.md`**. Design / spec: `docs/superpowers/specs/2026-04-19-edit-data-v1-design.md`.
+Add `--dry-run` to any `pull_*` CLI for a count-only preview, or `--limit N` / `--obj-id <uuid>` to scope work for testing. Multi-GPU = run multiple `pull_deletion` invocations with disjoint `--obj-id` allowlists and different `--device cuda:N`.
+
+Layout, gate rules, asset-pool semantics, and concurrency model: **`docs/superpowers/specs/2026-04-19-h3d-v1-design.md`**. End-to-end runbook (incl. multi-machine sharding): **`docs/runbooks/h3d-v1-promote.md`**.
 
 ---
 
