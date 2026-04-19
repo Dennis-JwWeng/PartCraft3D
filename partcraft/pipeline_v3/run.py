@@ -309,9 +309,16 @@ def run_step(
                 if getattr(args, "vlm_url", None) else sched.vlm_urls_for(cfg))
         if not urls:
             raise SystemExit("[CONFIG] no VLM urls for gate_text_align")
+        # Default cross-obj concurrency to N_servers so peak in-flight =
+        # len(urls) * per_obj_concurrency, scaling with the GPU count
+        # rather than a hardcoded 8.  Override via pipeline.gate_a_concurrency.
+        _pcfg = (cfg.get("pipeline") or {})
+        _gta_conc = int(_pcfg.get("gate_a_concurrency", len(urls)))
+        _gta_pobj = int(_pcfg.get("gate_a_per_obj_concurrency", 0))
         asyncio.run(run_gate_text_align(
             ctxs, vlm_urls=urls,
-            vlm_model=psvc.vlm_model_name(cfg), force=args.force
+            vlm_model=psvc.vlm_model_name(cfg), force=args.force,
+            concurrency=_gta_conc, per_obj_concurrency=_gta_pobj,
         ))
 
     # ── del_mesh ──────────────────────────────────────────────────────
@@ -659,10 +666,18 @@ def main():
             _vlm_model = psvc.vlm_model_name(cfg)
             _force = args.force
             _gta_urls = sched.vlm_urls_for(cfg)
+            # Per-object fan-out cap: limit how many concurrent edit-level
+            # VLM image calls fire at the bound server.  Default 0 (legacy
+            # unbounded); set pipeline.gate_a_per_obj_concurrency in YAML
+            # to e.g. 3 on memory-tight machines.
+            _pcfg = (cfg.get("pipeline") or {})
+            _gta_pobj = int(_pcfg.get("gate_a_per_obj_concurrency", 0))
             async def _gta_hook(ctx, vlm_url,
-                                _m=_vlm_model, _f=_force, _urls=_gta_urls):
+                                _m=_vlm_model, _f=_force, _urls=_gta_urls,
+                                _pobj=_gta_pobj):
                 await _run_gta([ctx], vlm_urls=[vlm_url], vlm_model=_m,
-                               force=_f, concurrency=1)
+                               force=_f, concurrency=1,
+                               per_obj_concurrency=_pobj)
             _post_fn = _gta_hook
 
         # GPU dispatch only when this step is GPU-bound AND the stage

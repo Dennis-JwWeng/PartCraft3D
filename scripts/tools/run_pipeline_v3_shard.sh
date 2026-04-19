@@ -399,8 +399,8 @@ _run_stage_bg() {
         else
             printf "[scheduler] stage %s: %s objects pending\n" "$stage" "$_pending"
             case "$STAGE_SERVERS" in
-                vlm)  start_vlm  && _started=1 ;;
-                flux) start_flux && _started=1 ;;
+                vlm)  start_vlm  && { _started=1; _CHAIN_STARTED_VLM=1; } ;;
+                flux) start_flux && { _started=1; _CHAIN_STARTED_FLUX=1; } ;;
                 *)    echo "[scheduler] unknown servers=$STAGE_SERVERS"; return 1 ;;
             esac
         fi
@@ -418,8 +418,8 @@ _run_stage_bg() {
 
     if [ "$_started" = "1" ]; then
         case "$STAGE_SERVERS" in
-            vlm)  stop_vlm ;;
-            flux) stop_flux ;;
+            vlm)  stop_vlm;  _CHAIN_STARTED_VLM=0 ;;
+            flux) stop_flux; _CHAIN_STARTED_FLUX=0 ;;
         esac
     fi
 
@@ -481,7 +481,15 @@ run_parallel_chains() {
         (
             # Each subshell installs its own EXIT trap so flux/vlm servers
             # started inside the chain are torn down even on abnormal exit.
-            trap 'stop_vlm 2>/dev/null || true; stop_flux 2>/dev/null || true' EXIT
+            # IMPORTANT: only stop a server if THIS chain started it —
+            # otherwise a sibling chain (e.g. del_mesh finishing first)
+            # would pkill -9 the FLUX/VLM servers a parallel chain is using.
+            _CHAIN_STARTED_VLM=0
+            _CHAIN_STARTED_FLUX=0
+            trap '
+                [ "$_CHAIN_STARTED_VLM"  = "1" ] && stop_vlm  2>/dev/null || true
+                [ "$_CHAIN_STARTED_FLUX" = "1" ] && stop_flux 2>/dev/null || true
+            ' EXIT
             IFS='>' read -ra _ss <<< "$chain_str"
             for s in "${_ss[@]}"; do
                 _run_stage_bg "$s" || exit $?

@@ -65,14 +65,36 @@ launch_sglang() {
     fi
     echo "Starting SGLang: model=$model port=$port tp=$tp gpus=$gpus"
 
-    # Auto-detect CUDA_HOME from nvcc location (fixes FlashInfer JIT)
-    if [ -z "$CUDA_HOME" ]; then
+    # Validate / auto-detect CUDA_HOME for FlashInfer JIT (sampling kernels).
+    # FlashInfer reads $CUDA_HOME/bin/nvcc — if that path is missing/stale
+    # (e.g. user shell exports cuda-12.1 but the dir was removed), JIT fails
+    # with "/usr/local/cuda-12.1/bin/nvcc: not found" and the server crashes
+    # the moment the first sampling op runs. Re-detect whenever the configured
+    # nvcc isn't actually executable.
+    if [ -z "$CUDA_HOME" ] || [ ! -x "$CUDA_HOME/bin/nvcc" ]; then
+        local _bad_home="$CUDA_HOME"
+        unset CUDA_HOME
         local nvcc_path
-        nvcc_path=$(which nvcc 2>/dev/null) || true
-        if [ -n "$nvcc_path" ]; then
+        nvcc_path=$(command -v nvcc 2>/dev/null) || true
+        if [ -n "$nvcc_path" ] && [ -x "$nvcc_path" ]; then
             export CUDA_HOME="$(dirname "$(dirname "$(readlink -f "$nvcc_path")")")"
-            echo "  Auto-detected CUDA_HOME=$CUDA_HOME"
+        else
+            for _try in /usr/local/cuda-12.4 /usr/local/cuda-12.1 /usr/local/cuda; do
+                if [ -x "$_try/bin/nvcc" ]; then
+                    export CUDA_HOME="$_try"; break
+                fi
+            done
         fi
+        if [ -n "$_bad_home" ] && [ "$_bad_home" != "$CUDA_HOME" ]; then
+            echo "  CUDA_HOME corrected: $_bad_home -> $CUDA_HOME"
+        else
+            echo "  CUDA_HOME auto-detected: $CUDA_HOME"
+        fi
+        if [ -z "$CUDA_HOME" ] || [ ! -x "$CUDA_HOME/bin/nvcc" ]; then
+            echo "  ERROR: no usable nvcc found; FlashInfer JIT will fail." >&2
+            exit 1
+        fi
+        export PATH="$CUDA_HOME/bin:$PATH"
     fi
 
     # Clear stale FlashInfer JIT cache (may have wrong nvcc path baked in)
@@ -81,15 +103,69 @@ launch_sglang() {
         rm -rf "$HOME/.cache/flashinfer"
     fi
 
-    CUDA_VISIBLE_DEVICES="$gpus" \
-    CUDA_HOME="$CUDA_HOME" \
-    python -m sglang.launch_server \
-        --model-path "$model" \
-        --port "$port" \
-        --tp "$tp" \
-        --max-total-tokens "$max_len" \
-        --mem-fraction-static "$VLM_MEM_FRAC" \
-        --attention-backend triton
+    # VLM_MAX_RUNNING caps in-flight requests per SGLang server.  Without
+    # this, an aggressive client (e.g. gate_text_align fan-out across many
+    # objects) can submit far more multimodal requests than the KV cache
+    # can hold; SGLang then queues them but the OpenAI client times out
+    # before they ever get scheduled.  8 is safe for Qwen3.5-27B on a
+    # single A800 with mem-fraction-static=0.85.
+    local _maxrun_args=()
+    if [ -n "${VLM_MAX_RUNNING:-}" ]; then
+        _maxrun_args=(--max-running-requests "$VLM_MAX_RUNNING")
+    fi
+
+    # Watchdog: SGLang has a known multimodal shm race
+    # (mm_utils.__setstate__ → SharedMemory(name='/psm_xxx') →
+    # FileNotFoundError → scheduler crash → server dies) that can fire
+    # under multi-hour load when the OpenAI client cancels in-flight
+    # requests.  When VLM_AUTO_RESTART > 0, we restart the server up to
+    # that many times after non-fatal exits (runtime ≥ MIN_HEALTHY_S).
+    # Default 0 = preserve legacy single-shot behaviour.
+    local _max_restart="${VLM_AUTO_RESTART:-0}"
+    local _min_healthy="${VLM_MIN_HEALTHY_S:-120}"
+    local _attempt=0 _start_ts _end_ts _runtime _exit
+    # Forward kill signals from the parent (run_pipeline_v3_shard.sh
+    # stop_vlm) to the child python process so cleanup is prompt.
+    local _child_pid=
+    _fwd() { [ -n "$_child_pid" ] && kill -TERM "$_child_pid" 2>/dev/null; exit 143; }
+    trap _fwd TERM INT HUP
+
+    while true; do
+        _start_ts=$(date +%s)
+        set +e
+        CUDA_VISIBLE_DEVICES="$gpus" \
+        CUDA_HOME="$CUDA_HOME" \
+        python -m sglang.launch_server \
+            --model-path "$model" \
+            --port "$port" \
+            --tp "$tp" \
+            --max-total-tokens "$max_len" \
+            --mem-fraction-static "$VLM_MEM_FRAC" \
+            --attention-backend triton \
+            "${_maxrun_args[@]}" &
+        _child_pid=$!
+        wait "$_child_pid"
+        _exit=$?
+        set -e
+        _child_pid=
+        _end_ts=$(date +%s)
+        _runtime=$((_end_ts - _start_ts))
+
+        if [ "$_max_restart" = "0" ]; then
+            return $_exit
+        fi
+        if [ "$_runtime" -lt "$_min_healthy" ]; then
+            echo "[watchdog] sglang :$port exited too fast (${_runtime}s, code=$_exit) — fatal, giving up"
+            return $_exit
+        fi
+        _attempt=$((_attempt + 1))
+        if [ "$_attempt" -gt "$_max_restart" ]; then
+            echo "[watchdog] sglang :$port: $_attempt restarts reached, giving up"
+            return $_exit
+        fi
+        echo "[watchdog] sglang :$port crashed after ${_runtime}s (exit=$_exit); restarting (attempt $_attempt/$_max_restart) in 10s..."
+        sleep 10
+    done
 }
 
 launch_vllm() {

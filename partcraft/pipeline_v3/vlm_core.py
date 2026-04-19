@@ -431,7 +431,12 @@ async def call_vlm_image_async(client, image_png, system, user, model, max_token
         ],
         temperature=0.3,
         max_tokens=max_tokens,
-        timeout=600,
+        # Image-VLM round-trips are dominated by SGLang KV-cache queueing
+        # under fan-out (gate_text_align fires ~N_edits per object, plus
+        # cross-object concurrency).  900 s gives the request enough head
+        # room to survive a transient queue spike without the OpenAI
+        # client cancelling it.
+        timeout=900,
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
     return resp.choices[0].message.content or ""
@@ -1106,7 +1111,11 @@ async def call_vlm_text_async(
         ],
         temperature=0.3,
         max_tokens=max_tokens,
-        timeout=300,
+        # gen_edits is text-only but produces up to ~12 K tokens; under
+        # heavy concurrent load on shared servers (e.g. inline gate_a hook
+        # fan-out hitting the same SGLang) generation can be queued > 5 min.
+        # 600 s lets the request survive without spurious client timeout.
+        timeout=600,
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
     return resp.choices[0].message.content or ""
@@ -1981,7 +1990,7 @@ async def _call_quality_judge_vlm(
                         {"type": "text", "text": text},
                     ]},
                 ],
-                temperature=0.1, max_tokens=max_tokens, timeout=120,
+                temperature=0.1, max_tokens=max_tokens, timeout=300,
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
             try:
@@ -2313,11 +2322,18 @@ async def _run_text_align_gate_for_object(
     vlm_model: str,
     force: bool,
     log: "logging.Logger",
+    per_obj_concurrency: int = 0,
 ) -> dict:
     """Run gate_text_align for one object.
 
     Reads phase1/parsed.json and overview.png, runs per-edit alignment gate,
     writes gate_a results to edit_status.json.
+
+    ``per_obj_concurrency`` (>0) caps how many of this object's edits may
+    have an in-flight VLM image call at once.  This prevents a single
+    object's ``asyncio.gather`` from sending 10+ concurrent multimodal
+    requests to one SGLang server (which exhausts KV cache and stalls
+    other consumers).  ``0`` (default) keeps the legacy unbounded fan-out.
     """
     import cv2
     import numpy as np
@@ -2514,9 +2530,20 @@ async def _run_text_align_gate_for_object(
         return aligned
 
     if vlm_tasks:
-        aligned_results = await _asyncio.gather(
-            *(_judge_one(t) for t in vlm_tasks)
-        )
+        if per_obj_concurrency and per_obj_concurrency > 0:
+            _per_obj_sem = _asyncio.Semaphore(per_obj_concurrency)
+
+            async def _judge_one_throttled(t: tuple) -> bool:
+                async with _per_obj_sem:
+                    return await _judge_one(t)
+
+            aligned_results = await _asyncio.gather(
+                *(_judge_one_throttled(t) for t in vlm_tasks)
+            )
+        else:
+            aligned_results = await _asyncio.gather(
+                *(_judge_one(t) for t in vlm_tasks)
+            )
         for aligned in aligned_results:
             if aligned:
                 n_pass += 1
@@ -2537,6 +2564,7 @@ async def run_gate_text_align(
     vlm_model: str,
     force: bool = False,
     concurrency: int = 8,
+    per_obj_concurrency: int = 0,
     logger: "logging.Logger | None" = None,
 ) -> "list[dict]":
     """Async entry point for the alignment gate (gate_text_align / gate_A).
@@ -2548,8 +2576,12 @@ async def run_gate_text_align(
     This is the replacement for the deleted ``sq1_qc_a.py``.
 
     Args:
-        vlm_urls:    One URL per VLM server (round-robin across objects).
-        concurrency: Max simultaneous objects being gated.
+        vlm_urls:           One URL per VLM server (round-robin across objects).
+        concurrency:        Max simultaneous objects being gated.
+        per_obj_concurrency: Max simultaneous in-flight edit-level VLM
+            image calls per object. ``0`` keeps unbounded fan-out (legacy).
+            Setting to ~3 prevents one object's ~10 edits from saturating
+            one SGLang server's KV cache.
     """
     if not vlm_urls:
         raise ValueError("vlm_urls must not be empty")
@@ -2560,7 +2592,8 @@ async def run_gate_text_align(
     async def _run_one(i: int, ctx) -> dict:
         async with sem:
             return await _run_text_align_gate_for_object(
-                ctx, vlm_urls[i % len(vlm_urls)], vlm_model, force, log
+                ctx, vlm_urls[i % len(vlm_urls)], vlm_model, force, log,
+                per_obj_concurrency=per_obj_concurrency,
             )
 
     return await _asyncio.gather(*[_run_one(i, c) for i, c in enumerate(ctxs)])
