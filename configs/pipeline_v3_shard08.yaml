@@ -28,8 +28,10 @@ data:
   slat_dir:    /mnt/zsn/zsn_workspace/PartCraft3D/data/partverse/inputs/slat
 
 pipeline:
-  # GPUs 0/1 are occupied by another job; use 2-7 only.
-  gpus: [2, 3, 4, 5, 6, 7]
+  # gate_quality run (2026-04-19): use all 8 GPUs. VLM (Qwen3.5-27B)
+  # is co-tenanted with whatever else lives on each card — VRAM
+  # headroom verified sufficient on every GPU.
+  gpus: [0, 1, 2, 3, 4, 5, 6, 7]
   vlm_port_base:  8200
   vlm_port_stride: 1
   flux_port_base: 8020
