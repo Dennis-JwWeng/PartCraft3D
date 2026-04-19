@@ -1,6 +1,13 @@
 # Edit Dataset v1 — Cleaned, Pipeline-Version-Agnostic Layout
 
-**Status**: Design (awaiting user review)
+> **SUPERSEDED 2026-04-19** by [`2026-04-19-h3d-v1-design.md`](./2026-04-19-h3d-v1-design.md).
+> The `partverse_edit_v1` layout, the multi-step `promote_to_v1` / `encode_del_latent`
+> CLIs, and the `del_latent.txt` pending list are deprecated. New work targets the
+> `H3D_v1` dataset with three end-to-end CLIs (`pull_deletion`, `pull_flux`,
+> `pull_addition`) sharing a `_assets/` pool and a per-edit-type top-level layout.
+> This document is kept for historical context only.
+
+**Status**: Superseded
 **Date**: 2026-04-19
 **Owners**: PartCraft3D pipeline team
 **Related**:
