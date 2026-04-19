@@ -1,0 +1,116 @@
+# Pipeline v3 — node03 (8× A800-80GB), shard 01
+#
+# Inputs  : /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/{mesh,images,slat}/01
+# Output  : /Node11_nvme/wjw/3D_Editing/data/outputs/partverse/pipeline_v3_shard01
+# Runner  : bash scripts/tools/run_pipeline_v3_shard.sh shard01 \
+#               configs/pipeline_v3_shard01.yaml
+# Machine env: configs/machine/node03.env (auto-loaded by hostname).
+#
+# Stages: text_gen_gate_a → (del_mesh ‖ flux_2d → trellis_preview) → gate_quality
+
+blender:    /Node11_nvme/artgen/lac/.tools/blender-4.2.0-linux-x64/blender
+ckpt_root:  /Node11_nvme/wjw/3D_Editing/PartCraft3D/checkpoints
+
+data:
+  output_dir:  /Node11_nvme/wjw/3D_Editing/data/outputs/partverse/pipeline_v3_shard01
+  mesh_root:   /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/mesh
+  images_root: /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/images
+  slat_dir:    /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/slat
+
+pipeline:
+  # node03 has 8× A800-80GB; node is currently exclusive (zsn jobs
+  # killed 2026-04-19 to unblock shard01).
+  gpus: [0, 1, 2, 3, 4, 5, 6, 7]
+
+  # One VLM / FLUX server per GPU (stride=1, v3 convention).
+  vlm_port_base:  8200
+  vlm_port_stride: 1
+  flux_port_base: 8020
+  flux_port_stride: 1
+
+  prerender_workers: 12
+  s6p_del_workers:   12
+
+  stages:
+  - name: text_gen_gate_a
+    desc: VLM edit generation + text-align gate. gen_edits internally
+      backfills phase1/overview.png via Blender pre-pass, then VLM-judges
+      every edit against the overview to fix npz_view per edit.
+    servers: vlm
+    steps:
+    - gen_edits
+    - gate_text_align
+
+  - name: del_mesh
+    desc: Deletion mesh masking (CPU). Produces del_*/after_new.glb plus
+      add_*/meta.json — terminal for the deletion/addition data branch.
+      ~50% already done from a previous run; resume picks up the rest.
+    servers: none
+    parallel_group: edit_branches
+    steps:
+    - del_mesh
+
+  - name: flux_2d
+    desc: FLUX 2D image editing (mod / scl / mat / clr / glb / add).
+      All edits_2d will be regenerated from scratch using the corrected
+      npz_view from gate_text_align (existing PNGs were wiped).
+    servers: flux
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 0
+    steps:
+    - flux_2d
+
+  - name: trellis_preview
+    desc: Trellis 3D reconstruction + 5-view preview. Chained AFTER
+      flux_2d so Trellis can claim GPUs once FLUX servers shut down.
+      Runs in parallel with the del_mesh chain.
+    servers: none
+    use_gpus: true
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 1
+    steps:
+    - trellis_3d
+    - preview_flux
+
+  - name: preview_del
+    desc: Optional Blender preview of after_new.glb. Only needed if
+      gate_quality is to score deletion edits. Enable via
+      STAGES=...,preview_del,...
+    servers: none
+    optional: true
+    steps:
+    - preview_del
+
+  - name: gate_quality
+    desc: VLM visual quality gate (Gate E).
+    servers: vlm
+    steps:
+    - gate_quality
+
+services:
+  vlm:
+    model: /Node11_nvme/zsn/checkpoints/Qwen3.5-27B
+
+  image_edit:
+    enabled: true
+    trellis_text_ckpt: /Node11_nvme/wjw/3D_Editing/PartCraft3D/checkpoints/TRELLIS-text-xlarge
+    image_edit_backend: local_diffusers
+    workers_per_server: 2
+    # K=2 is safe on 80 GB A800; see docs/runbooks/restart-shard-K2.md.
+    trellis_workers_per_gpu: 2
+    export_ply: false
+    export_ply_for_deletion: false
+    large_part_threshold: 0.35
+    repaint_mode: image
+
+qc:
+  thresholds_by_type:
+    deletion:     { min_visual_quality: 3 }
+    modification: { min_visual_quality: 3, require_preserve_other: true }
+    scale:        { min_visual_quality: 3, require_preserve_other: true }
+    material:     { min_visual_quality: 3 }
+    color:        { min_visual_quality: 3 }
+    global:       { min_visual_quality: 3 }
+    addition:     { min_visual_quality: 3 }

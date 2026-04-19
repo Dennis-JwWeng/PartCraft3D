@@ -1,0 +1,127 @@
+# Pipeline v3 — node03 (8× A800-80GB), shard 03
+#
+# Inputs  : /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/{mesh,images,slat}/03
+# Output  : /Node11_nvme/wjw/3D_Editing/data/outputs/partverse/pipeline_v3_shard03
+# Runner  : bash scripts/tools/run_pipeline_v3_shard.sh shard03 \
+#               configs/pipeline_v3_shard03.yaml
+# Machine env: configs/machine/node03.env (auto-loaded by hostname).
+#   ATTN_BACKEND=xformers   (Trellis attention/sparse backend)
+#
+# This shard runs on a 5-GPU subset (2, 4, 5, 6, 7); GPUs 0/1/3 are
+# in use by other workloads on this host (artgen encode_all on GPU 0,
+# xiaowei diffusion-renderer train+inference on 1/3).  GPU list has
+# been adjusted twice to track which GPUs are free at launch time.
+#
+# Stages: text_gen_gate_a → (del_mesh ‖ flux_2d → trellis_preview) → gate_quality
+
+blender:    /Node11_nvme/artgen/lac/.tools/blender-4.2.0-linux-x64/blender
+ckpt_root:  /Node11_nvme/wjw/3D_Editing/PartCraft3D/checkpoints
+
+data:
+  output_dir:  /Node11_nvme/wjw/3D_Editing/data/outputs/partverse/pipeline_v3_shard03
+  mesh_root:   /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/mesh
+  images_root: /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/images
+  slat_dir:    /Node11_nvme/wjw/3D_Editing/data/inputs/partverse/slat
+
+pipeline:
+  # 5-GPU subset of node03 (other GPUs are reserved for other users).
+  gpus: [2, 4, 5, 6, 7]
+
+  # One VLM / FLUX server per GPU (stride=1, v3 convention).
+  vlm_port_base:  8200
+  vlm_port_stride: 1
+  flux_port_base: 8020
+  flux_port_stride: 1
+
+  prerender_workers: 10
+  s6p_del_workers:   10
+
+  # Throttle gate_text_align so that:
+  #   peak in-flight image VLM calls = gate_a_concurrency * gate_a_per_obj_concurrency
+  # With 5 servers and per_obj=3 → ~15 in-flight, well within the 8-per-server
+  # SGLang cap (VLM_MAX_RUNNING).  Prevents the per-object asyncio.gather
+  # fan-out from saturating one server's KV cache.
+  gate_a_concurrency:         5
+  gate_a_per_obj_concurrency: 3
+
+  stages:
+  - name: text_gen_gate_a
+    desc: VLM edit generation + text-align gate. gen_edits internally
+      backfills phase1/overview.png via Blender pre-pass, then VLM-judges
+      every edit against the overview to fix npz_view per edit.
+    servers: vlm
+    steps:
+    - gen_edits
+    - gate_text_align
+
+  - name: del_mesh
+    desc: Deletion mesh masking (CPU). Produces del_*/after_new.glb plus
+      add_*/meta.json — terminal for the deletion/addition data branch.
+    servers: none
+    parallel_group: edit_branches
+    steps:
+    - del_mesh
+
+  - name: flux_2d
+    desc: FLUX 2D image editing (mod / scl / mat / clr / glb / add).
+      Uses the corrected npz_view from gate_text_align.
+    servers: flux
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 0
+    steps:
+    - flux_2d
+
+  - name: trellis_preview
+    desc: Trellis 3D reconstruction + 5-view preview. Chained AFTER
+      flux_2d so Trellis can claim GPUs once FLUX servers shut down.
+      Runs in parallel with the del_mesh chain.
+    servers: none
+    use_gpus: true
+    parallel_group: edit_branches
+    chain_id: flux_chain
+    chain_order: 1
+    steps:
+    - trellis_3d
+    - preview_flux
+
+  - name: preview_del
+    desc: Optional Blender preview of after_new.glb. Only needed if
+      gate_quality is to score deletion edits. Enable via
+      STAGES=...,preview_del,...
+    servers: none
+    optional: true
+    steps:
+    - preview_del
+
+  - name: gate_quality
+    desc: VLM visual quality gate (Gate E).
+    servers: vlm
+    steps:
+    - gate_quality
+
+services:
+  vlm:
+    model: /Node11_nvme/zsn/checkpoints/Qwen3.5-27B
+
+  image_edit:
+    enabled: true
+    trellis_text_ckpt: /Node11_nvme/wjw/3D_Editing/PartCraft3D/checkpoints/TRELLIS-text-xlarge
+    image_edit_backend: local_diffusers
+    workers_per_server: 2
+    # K=2 is safe on 80 GB A800; see docs/runbooks/restart-shard-K2.md.
+    trellis_workers_per_gpu: 2
+    export_ply: false
+    export_ply_for_deletion: false
+    large_part_threshold: 0.35
+    repaint_mode: image
+
+qc:
+  thresholds_by_type:
+    deletion:     { min_visual_quality: 3 }
+    modification: { min_visual_quality: 3, require_preserve_other: true }
+    scale:        { min_visual_quality: 3, require_preserve_other: true }
+    material:     { min_visual_quality: 3 }
+    color:        { min_visual_quality: 3 }
+    global:       { min_visual_quality: 3 }
+    addition:     { min_visual_quality: 3 }
