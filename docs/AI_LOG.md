@@ -48,6 +48,57 @@
 
 ---
 
+## 2026-04-19 — Showcase / gallery 编辑对人工挑选脚本三件套
+
+**背景**：H3D Dataset Overview hero 报告（28 picks，shard08）+ gallery 候选（50 picks 目标，shard07+08）需要稳定的"扫一遍 → 挑出来 → 出最终报告"流程。把临时脚本沉淀成可复用的三件套，并写 runbook。
+
+**新增**：
+
+- `scripts/tools/build_showcase_candidates.py` — 单 shard 候选 HTML（沿用 2026-04-19 已有版本，含 `_flatten_to_white`、addition 反向 BEFORE/AFTER）
+- `scripts/tools/build_gallery_candidates.py` — 多 shard 候选 HTML，card id 形如 `<shard>/<obj>/<eid>`，新增 `glb ready / needs decode` 徽章（区分 del/add vs FLUX 五类），toolbar 加 shard / glb 过滤
+- `scripts/tools/build_showcase_hero.py` — picks JSON → 高质量 hero HTML（已有；这次只整理文档）
+
+**关键约定**（详见 `docs/runbooks/showcase-pick-workflow.md`）：
+
+- BEFORE/AFTER 数据来源：deletion / FLUX 取 NPZ 5 帧（view `[89,90,91,100,8]`）+ `preview_{0..4}.png`；**addition 是 deletion 的反向**——BEFORE 走 `source_del_id` 的 preview，AFTER 走原 NPZ 帧（不能用 add 自己的 preview，会带 TRELLIS 重建伪影）。
+- 所有图先 `_flatten_to_white`（RGBA → RGB on white），与 gate_a / gate_e 看到的版本对齐。
+- `eid` 必须严格复刻 `partcraft/pipeline_v3/specs.iter_all_specs` 的 seq 规则（deletion 独立 `del_seq`、FLUX 五类共享 `flux_seq`、addition 不在 parsed.json 里需读 `meta.json`），否则 prompt 会贴错卡。
+
+**GLB 现状（gallery 阶段会用到）**：
+
+- 仅 `del_*/after_new.glb` 在磁盘上（s5b `del_mesh` 写出，shard07/08 各 ~3500 个）。
+- `addition` 不需要新建文件，引用 `source_del_id` 的 `after_new.glb` + 输入 mesh NPZ 内 `full.glb` 即可。
+- `modification / material / color / global / scale` 在 `<eid>/after.npz` 里只有 TRELLIS slat tokens，**需要解码**才能给 Blender 用。当前没有现成 picks → GLB CLI；最朴素做法是仿 `partcraft/pipeline_v3/preview_render.py` 的 `after_new.glb` / `after.ply` 路径写一个解码 CLI，或者对这些 picks 重跑 trellis_preview。
+
+**用法摘要**：
+
+```bash
+# 1) 多 shard 候选页（seed 决定抽样次序）
+python scripts/tools/build_gallery_candidates.py \
+  --shards 07 08 \
+  --root outputs/partverse/shard07/mode_e_text_align \
+  --root outputs/partverse/shard08/mode_e_text_align \
+  --images-root data/partverse/inputs/images \
+  --seed 2026 --target 50 \
+  --out reports/h3d_gallery_candidates.html
+
+# 2) 浏览器里挑星标 → 右下角 copy JSON → 落盘 reports/<tag>_picks.json
+
+# 3) 出最终 hero（当前是单 shard 入口）
+python scripts/tools/build_showcase_hero.py \
+  --root outputs/partverse/shard08/mode_e_text_align --shard 08 \
+  --images-root data/partverse/inputs/images \
+  --picks reports/shard08_picks.json \
+  --out reports/shard08_showcase_hero.html
+```
+
+**遗留**：
+
+- `build_showcase_hero.py` 仍只接受单 shard `--root`，多 shard picks 现需按 shard 拆开跑两次再拼或扩展脚本。
+- FLUX 五类 picks → GLB 的解码 CLI 还没写。
+
+---
+
 ## 2026-04-08 — pipeline_v2：object-centric 全管线入口 + validator 修复
 
 **问题**：phase1 v2 之后,后续 step（FLUX 2D / TRELLIS 3D / rerender / addition backfill）原本仍走旧 batch 入口（`scripts/run_pipeline.py`），与 object-centric 输出布局（`outputs/<root>/objects/<shard>/<obj_id>/{phase1,edits_2d,edits_3d,...}`）不对齐；并且没有按 phase 自动起停 VLM/FLUX 服务的统一调度。

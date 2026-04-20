@@ -470,6 +470,19 @@ GPUS=0,3,4,5,6,7 SHARD=01 ONLY_TYPES=deletion \
 | `render_ply_pairs.py` | PLY 文件 | PNG（3 或 4 视角） | Blender Cycles | mesh 质量对比 / VLM 清洗输入 |
 | `visualize_edit_pair.py` | PLY 文件 | MP4 旋转视频 | Open3D | mesh 旋转动画 |
 
+
+### showcase / gallery 人工挑选（`scripts/tools/`）
+
+不属于 `scripts/vis/`，但是同类用途（人工 review 编辑对）：
+
+| 脚本 | 用途 |
+|------|------|
+| `build_showcase_candidates.py` | 单 shard 候选 HTML（5-view BEFORE/AFTER 拼图 + 类型/已选 toolbar） |
+| `build_gallery_candidates.py` | 多 shard 候选 HTML，card id 含 shard，附 `glb ready / needs decode` 徽章 |
+| `build_showcase_hero.py` | 根据 picks JSON 出最终 hero 高质量报告 |
+
+完整流程见 `docs/runbooks/showcase-pick-workflow.md`（含 NPZ→白底、addition 反向 BEFORE/AFTER、`eid` 与 `parsed.json` 的映射规则、GLB-availability 约束）。
+
 ### render_edit_gallery.py（推荐）
 
 支持新旧两种数据格式，输出单张 PNG：header 显示编辑元信息 + 上行 before N 视角 + 下行 after N 视角。
