@@ -1748,10 +1748,10 @@ def _iter_unapproved_add_edits(ctx):
 # Quality judge prompt (single source of truth for the Gate E VLM judge)
 #
 # Pattern mirrors the alignment gate: ONE static system prompt for all edit
-# types -> VLM KV-cache is fully reused across the judge batch.  Deletion
-# and addition never reach this judge (they inherit from Gate A via
-# _GATE_A_ONLY in _run_quality_gate_for_object), so this prompt covers only
-# modification / scale / material / color / global.
+# types -> VLM KV-cache is fully reused across the judge batch.  Covers all
+# seven edit types (deletion / addition + modification / scale / material /
+# color / global).  For *addition* the caller swaps the collage rows so the
+# judge always sees BEFORE on top and AFTER on bottom.
 # ============================================================================
 
 JUDGE_SYSTEM_PROMPT = """You are a 3D-edit quality judge.
@@ -1765,6 +1765,15 @@ INPUT:
   (new_part_desc | factor | target_material | target_color | target_style).
 
 WHAT SHOULD CHANGE vs MUST NOT CHANGE (by edit_type):
+  deletion      change: target part is REMOVED (gone in AFTER)
+                keep:   ALL other parts intact in shape, position, colour,
+                        material; no new geometry introduced; no holes,
+                        no orphan stubs left where the part was attached.
+  addition      change: target part is ADDED (present in AFTER, absent in
+                        BEFORE) at its natural location and orientation.
+                keep:   ALL other (already-present) parts intact in shape,
+                        position, colour, material; no duplicates, no
+                        misplaced clones, no clipping into existing parts.
   modification  change: SHAPE / SILHOUETTE of target part
                 keep:   colour, material, position; ALL other parts intact
   scale         change: SIZE of target part (shrinks by factor; still attached)
@@ -1777,8 +1786,10 @@ WHAT SHOULD CHANGE vs MUST NOT CHANGE (by edit_type):
                 keep:   underlying geometry + structure still recognisable
 
 TASK:
-  1. Locate the target region in the TOP row from the part label + description
-     (for global edits the target is the whole object).
+  1. Locate the target region in the BEFORE row from the part label +
+     description.  For *addition* the target is ABSENT in BEFORE and you
+     must instead verify it APPEARS in AFTER.  For global edits the target
+     is the whole object.
   2. For each column i in [0..4] compare same-camera BEFORE vs AFTER:
      did "what should change" actually change, and did anything in
      "must not change" change?
@@ -1802,23 +1813,38 @@ OUTPUT: ONE valid JSON object only. First character must be "{" and last "}".
 RULES:
   R1. HARD_FAIL => edit_executed=false:
         * AFTER is visually identical to BEFORE (any edit_type).
+        * deletion:     target part still visible in AFTER, OR a different
+                        part has been removed/altered.
+        * addition:     target part still absent in AFTER, OR an extra
+                        unrelated part appeared, OR an existing part was
+                        deleted/altered to make room.
         * modification: only colour/material changed, shape identical.
         * scale:        target part unchanged in size OR grown.
         * material:     geometry altered OR surface finish unchanged.
         * color:        geometry or material type changed OR hue unchanged.
         * global:       underlying structure no longer recognisable.
   R2. correct_region = change is localised to the named target part;
-      for global, applied CONSISTENTLY across all 5 views.
+      for global, applied CONSISTENTLY across all 5 views; for deletion the
+      removed region must match the named part; for addition the new part
+      must appear at its natural attachment site, not floating elsewhere.
   R3. preserve_other = every OTHER part intact in shape and position
-      (for global: read as "structure + part count preserved"). Minor
-      lighting/shading shifts are acceptable.
+      (for global: read as "structure + part count preserved"). For
+      deletion / addition, hard-fail if any non-target part shifted, was
+      duplicated, lost colour, gained holes, or sprouted seam artefacts.
+      Minor lighting/shading shifts are acceptable.
   R4. visual_quality in [1..5]: 1=terrible, 2=poor, 3=acceptable,
       4=good, 5=excellent. Penalise broken meshes, floating blobs,
-      seam artefacts, per-view style inconsistency.
+      seam artefacts, per-view style inconsistency.  For deletion the
+      attachment site should be cleanly closed (no jagged stubs); for
+      addition the new part must be solidly attached (no floating /
+      clipping / interpenetration with existing parts).
   R5. prompt_quality rates how precisely the ORIGINAL prompt describes
       what actually happened (1=wrong/missing .. 5=precise).
       improved_prompt is an imperative rewrite matching the observed
       AFTER; if BEFORE == AFTER write "No change observed - <diagnosis>".
+      For *addition* the improved_prompt should read as a natural
+      "Add <new part description> to <attachment site>" instruction --
+      avoid mechanical inversions of the deletion prompt.
   R6. All output fields in English only.
 """
 
@@ -2075,6 +2101,38 @@ async def _judge_edit_quality(
                                   "reason": j.get("reason", "")})
     _update_edit_stage(ctx, edit_id, edit_type, "gate_e",
                        status="pass" if ok else "fail")
+    # Persist VLM-suggested rewrite next to the edit artefacts.  Always written
+    # so downstream export can reuse it; only consumed for addition where the
+    # original prompt is mechanically inverted from the deletion prompt.
+    try:
+        edit_dir.mkdir(parents=True, exist_ok=True)
+        improved = j.get("improved_prompt") or ""
+        improved_after = j.get("improved_after_desc") or ""
+        sidecar = {
+            "edit_id": edit_id,
+            "edit_type": edit_type,
+            "original_prompt": prompt,
+            "improved_prompt": improved,
+            "improved_after_desc": improved_after,
+            "prompt_quality": j.get("prompt_quality"),
+            "judge_pass": ok,
+        }
+        (edit_dir / "refined_prompt.json").write_text(
+            json.dumps(sidecar, ensure_ascii=False, indent=2)
+        )
+        if edit_type == "addition" and improved:
+            meta_p = edit_dir / "meta.json"
+            if meta_p.is_file():
+                try:
+                    m = json.loads(meta_p.read_text())
+                    m["refined_prompt"] = improved
+                    if improved_after:
+                        m["refined_after_desc"] = improved_after
+                    meta_p.write_text(json.dumps(m, ensure_ascii=False, indent=2))
+                except Exception:
+                    pass
+    except Exception as _e:
+        _LOG_QE.debug("[gate_quality] refined_prompt write failed (%s): %s", edit_id, _e)
     return ok, (1 if ok else 0), (0 if ok else 1)
 
 
@@ -2085,13 +2143,33 @@ async def _run_quality_gate_for_object(
     thresholds: dict,
     force: bool,
     log: "logging.Logger",
+    only_edit_types: "set[str] | None" = None,
 ) -> dict:
-    """Judge all edits for one object."""
+    """Judge all edits for one object via Gate E (VLM visual quality).
+
+    All seven edit types are judged here.  For *addition* the collage rows
+    are swapped (preview = before-state, image_npz = after-state) so the
+    judge always sees BEFORE on top, AFTER on bottom.
+
+    Args:
+        only_edit_types:  If provided, only edits whose ``edit_type`` is in
+            this set are (re-)judged; previously-recorded Gate E verdicts
+            for other types are preserved.  Used to selectively re-judge
+            del/add on already-completed shards (env: ``QC_ONLY_TYPES``).
+    """
     from .specs import iter_all_specs as _iter_all_specs
     from .status import update_step as _update_step, STATUS_OK as _STATUS_OK, step_done as _step_done
     from .qc_io import is_edit_qc_failed as _is_edit_qc_failed
-    if not force and _step_done(ctx, "sq3_qc_E"):
-        return {"obj_id": ctx.obj_id, "skipped": True}
+    # Partial-completion aware skip:
+    #   * Restricted run (only_edit_types set) ALWAYS walks so newly-allowed
+    #     types get judged.
+    #   * Unrestricted run skips only if a previous unrestricted run finished
+    #     (recorded as status=ok WITHOUT an "only_types" field).
+    if not force:
+        from .status import load_status as _load_status
+        rec = (_load_status(ctx).get("steps") or {}).get("sq3_qc_E") or {}
+        if only_edit_types is None and rec.get("status") == "ok" and not rec.get("only_types"):
+            return {"obj_id": ctx.obj_id, "skipped": True}
 
     n_pass = n_fail = n_skip = 0
     before_imgs = _load_before_view_images(ctx)
@@ -2106,32 +2184,19 @@ async def _run_quality_gate_for_object(
     from openai import AsyncOpenAI
     client = AsyncOpenAI(base_url=vlm_url, api_key="EMPTY")
 
-    # Deletion + addition edits are already validated by Alignment Gate A
-    # (Mode E text-image alignment) — their Gate E verdict is inherited from
-    # Gate A (pass or fail propagates via final_pass since absent gates are
-    # treated as passed).  We write an explicit "inherited" marker so the
-    # skip is observable in edit_status.json rather than silently absent.
-    from .qc_io import update_edit_gate as _update_edit_gate
-    from .edit_status_io import update_edit_stage as _update_edit_stage
-    _GATE_A_ONLY = {"deletion", "addition"}
+    def _should_judge(et: str) -> bool:
+        return only_edit_types is None or et in only_edit_types
 
-    def _inherit_gate_e(edit_id: str, edit_type: str) -> None:
-        _update_edit_gate(
-            ctx, edit_id, edit_type, "E",
-            vlm_result={"pass": True, "score": 1.0,
-                        "reason": "inherited_from_gate_a"},
-        )
-        _update_edit_stage(ctx, edit_id, edit_type, "gate_e",
-                           status="pass", reason="inherited_from_gate_a")
-
+    # ── modification / scale / material / color / global / deletion ─────
+    # iter_all_specs yields these directly (addition is backfilled and
+    # iterated separately below).  Deletion now goes through the full VLM
+    # judge instead of inheriting from Gate A.
     for spec in _iter_all_specs(ctx):
-        if not force and _is_edit_qc_failed(ctx, spec.edit_id):
+        if not _should_judge(spec.edit_type):
             n_skip += 1
             continue
-        if spec.edit_type in _GATE_A_ONLY:
-            _inherit_gate_e(spec.edit_id, spec.edit_type)
+        if not force and _is_edit_qc_failed(ctx, spec.edit_id):
             n_skip += 1
-            n_pass += 1
             continue
         edit_dir = ctx.edit_3d_dir(spec.edit_id)
         _, dp, df = await _judge_edit_quality(
@@ -2142,23 +2207,48 @@ async def _run_quality_gate_for_object(
             before_imgs, edit_dir, thresholds, ctx,
             target_part_desc=spec.target_part_desc,
             edit_params=spec.edit_params,
+            swap_collage=False,
         )
         n_pass += dp; n_fail += df
 
-    # Addition-only edits (sourced from backfill) — also inherit from Gate A.
+    # ── addition (backfilled from deletion in del_mesh) ─────────────────
+    # Addition meta.json carries the inverted prompt + part labels.  The
+    # preview_*.png inside add_*/ are *copied* from the source del_*/ and
+    # therefore depict the partial (post-deletion) object — so the Gate E
+    # judge needs swap_collage=True: top = preview (BEFORE = partial),
+    # bottom = image_npz (AFTER = original complete object).
     for add_id, meta in _iter_unapproved_add_edits(ctx):
+        if not _should_judge("addition"):
+            n_skip += 1
+            continue
         if not force and _is_edit_qc_failed(ctx, add_id):
             n_skip += 1
             continue
-        _inherit_gate_e(add_id, "addition")
-        n_skip += 1
-        n_pass += 1
+        edit_dir = ctx.edit_3d_dir(add_id)
+        part_label = ", ".join(meta.get("part_labels") or []) or (meta.get("target_part_desc") or "")
+        _, dp, df = await _judge_edit_quality(
+            client, vlm_model,
+            add_id, "addition",
+            meta.get("prompt") or "",
+            meta.get("object_desc") or "",
+            part_label,
+            before_imgs, edit_dir, thresholds, ctx,
+            target_part_desc=meta.get("target_part_desc") or "",
+            edit_params={},
+            swap_collage=True,
+        )
+        n_pass += dp; n_fail += df
 
+    extra = {}
+    if only_edit_types is not None:
+        extra["only_types"] = sorted(only_edit_types)
     _update_step(ctx, "sq3_qc_E", status=_STATUS_OK,
-                 n_pass=n_pass, n_fail=n_fail, n_skip=n_skip)
-    log.info("[gate_quality] %s done: pass=%d fail=%d skip=%d",
-             ctx.obj_id, n_pass, n_fail, n_skip)
-    return {"obj_id": ctx.obj_id, "n_pass": n_pass, "n_fail": n_fail}
+                 n_pass=n_pass, n_fail=n_fail, n_skip=n_skip, **extra)
+    log.info("[gate_quality] %s done: pass=%d fail=%d skip=%d  filter=%s",
+             ctx.obj_id, n_pass, n_fail, n_skip,
+             sorted(only_edit_types) if only_edit_types else "all")
+    return {"obj_id": ctx.obj_id, "n_pass": n_pass, "n_fail": n_fail,
+            "only_types": extra.get("only_types")}
 
 
 async def run_gate_quality(
@@ -2170,6 +2260,7 @@ async def run_gate_quality(
     force: bool = False,
     concurrency: int = 8,
     logger: "logging.Logger | None" = None,
+    only_edit_types: "set[str] | None" = None,
 ) -> "list[dict]":
     """Async entry point for the final quality gate (gate_quality / gate_e).
 
@@ -2195,7 +2286,8 @@ async def run_gate_quality(
     async def _run_one(i: int, ctx: "_ObjectContext") -> dict:
         async with sem:
             return await _run_quality_gate_for_object(
-                ctx, vlm_urls[i % len(vlm_urls)], vlm_model, thresholds, force, log
+                ctx, vlm_urls[i % len(vlm_urls)], vlm_model, thresholds, force, log,
+                only_edit_types=only_edit_types,
             )
 
     return await _asyncio.gather(*[_run_one(i, c) for i, c in enumerate(ctxs)])

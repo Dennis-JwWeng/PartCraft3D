@@ -359,14 +359,36 @@ def run_step(
     # Writes gate_e: pass/fail to edit_status.json.
     elif step == "gate_quality":
         from .vlm_core import run_gate_quality as sq3_run
-        import asyncio
+        import asyncio, os as _os
         urls = ([u.strip() for u in args.vlm_url.split(",") if u.strip()]
                 if getattr(args, "vlm_url", None) else sched.vlm_urls_for(cfg))
         if not urls:
             raise SystemExit("[CONFIG] no VLM urls for gate_quality "
                              "(set pipeline.gpus or services.vlm.base_urls)")
+        # Restrict Gate E to a subset of edit types.  Resolution order:
+        #   1. env QC_ONLY_TYPES   (csv, e.g. "deletion,addition")
+        #   2. cfg["qc"]["gate_quality_types"]  (list[str])
+        #   3. all 7 types (None = no filter)
+        # Useful for staged completion: judge mod/scl/mat/clr/glb first while
+        # preview_del is still running, then re-run for del/add later.
+        only_csv = (_os.environ.get("QC_ONLY_TYPES") or "").strip()
+        if only_csv:
+            only_set = {t.strip().lower() for t in only_csv.split(",") if t.strip()} or None
+            _src = "env QC_ONLY_TYPES"
+        else:
+            cfg_types = ((cfg.get("qc") or {}).get("gate_quality_types"))
+            if cfg_types:
+                only_set = {str(t).strip().lower() for t in cfg_types if str(t).strip()} or None
+                _src = "cfg qc.gate_quality_types"
+            else:
+                only_set = None; _src = "all types"
+        if only_set:
+            log.info("[gate_quality] type filter active (from %s): %s",
+                     _src, sorted(only_set))
+        else:
+            log.info("[gate_quality] type filter: all 7 types")
         asyncio.run(sq3_run(ctxs, vlm_urls=urls, vlm_model=psvc.vlm_model_name(cfg),
-                            cfg=cfg, force=args.force))
+                            cfg=cfg, force=args.force, only_edit_types=only_set))
 
     # ── flux_2d ───────────────────────────────────────────────────────────
     # FLUX 2D image edit for mod/scl/mat/glb/color edits.
@@ -619,12 +641,34 @@ def main():
             _cp_steps = [s.strip() for s in args.steps.split(",") if s.strip()]
         else:
             _cp_steps = list(ALL_STEPS)
+        # Resolve any active gate_quality type filter so partial runs are
+        # correctly counted as pending (otherwise the bash scheduler would
+        # skip VLM startup after a previous partial run marked status=ok).
+        import os as _os_cp
+        _qc_only_csv = (_os_cp.environ.get("QC_ONLY_TYPES") or "").strip()
+        if _qc_only_csv:
+            _qc_only = {t.strip().lower() for t in _qc_only_csv.split(",") if t.strip()}
+        else:
+            _ct = ((cfg.get("qc") or {}).get("gate_quality_types"))
+            _qc_only = ({str(t).strip().lower() for t in _ct if str(t).strip()}
+                        if _ct else set())
         _done_statuses = {"ok", "skip"}
         _pending = 0
         for _c in ctxs:
             _step_data = (load_status(_c).get("steps") or {})
-            if any(_step_data.get(_step_to_status_key(_s), {}).get("status")
-                   not in _done_statuses for _s in _cp_steps):
+            _need = False
+            for _s in _cp_steps:
+                _key = _step_to_status_key(_s)
+                _rec = _step_data.get(_key, {})
+                if _rec.get("status") not in _done_statuses:
+                    _need = True; break
+                if _s == "gate_quality" and _qc_only:
+                    _covered = set(_rec.get("only_types") or [])
+                    # If previous record was unrestricted (no only_types), it
+                    # already covered everything: not pending for this filter.
+                    if _covered and not _qc_only.issubset(_covered):
+                        _need = True; break
+            if _need:
                 _pending += 1
         print(_pending)
         return

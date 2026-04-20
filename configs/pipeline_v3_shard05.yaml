@@ -1,7 +1,7 @@
-# Pipeline v3 — Mode E full shard07 (1203 objects)
+# Pipeline v3 — Mode E full shard05 (1203 objects)
 #
-# Inputs  : /mnt/zsn/zsn_workspace/PartCraft3D/data/partverse/inputs/{mesh,images,slat}/07
-# Output  : /mnt/zsn/zsn_workspace/PartCraft3D/outputs/partverse/shard07/mode_e_text_align
+# Inputs  : /mnt/zsn/zsn_workspace/PartCraft3D/data/partverse/inputs/{mesh,images,slat}/05
+# Output  : /mnt/zsn/zsn_workspace/PartCraft3D/outputs/partverse/shard05/mode_e_text_align
 # Runner  : scripts/tools/run_pipeline_v3_shard.sh (uses --all by default)
 #
 # Stages (run only up to — and NOT including — gate_quality):
@@ -9,32 +9,30 @@
 #   del_mesh         : CPU only   (parallel with flux_2d)
 #   flux_2d          : n_gpus FLUX servers (ports 8020-8025)
 #   trellis_preview  : n_gpus Trellis workers via dispatch_gpus
-#   gate_quality     : VLM collage scoring   <- SKIP for this run
+#   gate_quality     : VLM collage scoring   <- run separately
 #
 # Typical invocation:
 #   STAGES=text_gen_gate_a,del_mesh,flux_2d,trellis_preview \
-#   SHARD=07 \
+#   SHARD=05 \
 #   MACHINE_ENV=configs/machine/dedicated-developjob-saining-r0iyw.env \
-#     bash scripts/tools/run_pipeline_v3_shard.sh shard07 \
-#          configs/pipeline_v3_shard07.yaml
+#     bash scripts/tools/run_pipeline_v3_shard.sh shard05 \
+#          configs/pipeline_v3_shard05.yaml
 
 blender: /mnt/zsn/data/3DEditVerse/render_package_extracted/render_package/blender-3.5.1-linux-x64/blender
 ckpt_root: /mnt/zsn/zsn_workspace/PartCraft3D/checkpoints
 
 data:
-  output_dir:  /mnt/zsn/zsn_workspace/PartCraft3D/outputs/partverse/shard07/mode_e_text_align
+  output_dir:  /mnt/zsn/zsn_workspace/PartCraft3D/outputs/partverse/shard05/mode_e_text_align
   mesh_root:   /mnt/zsn/zsn_workspace/PartCraft3D/data/partverse/inputs/mesh
   images_root: /mnt/zsn/zsn_workspace/PartCraft3D/data/partverse/inputs/images
   slat_dir:    /mnt/zsn/zsn_workspace/PartCraft3D/data/partverse/inputs/slat
 
 pipeline:
-  # GPU 0 hosts an external Ori3DEdit eval (~45 GB resident, ~100 GB free).
-  # SGLang VLM (Qwen 2.5-VL 27B) needs ~80 GB and refuses to fit there
-  # (KV cache pool collapses to capture_bs=[0]); FLUX is similar. Trellis
-  # workers (~25 GB) DO fit, so flip this back to [0,1,...,7] for the
-  # final trellis_preview-only restart once VLM/FLUX stages are done, or
-  # once the Ori3DEdit job ends. For now run on GPUs 1-7 (7 workers).
-  gpus: [1, 2, 3, 4, 5, 6, 7]
+  # Default to all 8 GPUs (mirrors the recent shard08 layout). If GPU 0
+  # is occupied by an external job (e.g. Ori3DEdit ~45 GB resident), drop
+  # it and rerun with `gpus: [1,2,3,4,5,6,7]` — VLM/FLUX servers will
+  # not fit beside ~45 GB of resident state on a single card.
+  gpus: [0, 1, 2, 3, 4, 5, 6, 7]
   vlm_port_base:  8200
   vlm_port_stride: 1
   flux_port_base: 8020

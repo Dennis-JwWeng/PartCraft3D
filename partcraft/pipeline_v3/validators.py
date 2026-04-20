@@ -237,14 +237,33 @@ def check_sq2(ctx: ObjectContext) -> StepCheck:
                      missing=[] if found == len(flux_ids) else ["gate_C_not_written"])
 
 def check_sq3(ctx: ObjectContext) -> StepCheck:
+    """Gate E coverage check, partial-completion aware.
+
+    If the step record carries ``only_types`` (set when ``QC_ONLY_TYPES`` /
+    ``qc.gate_quality_types`` restricted the run), only edits of those types
+    are expected to have a Gate E verdict.  Other types' missing gate_E
+    entries are not validation failures — they will be filled in by a later
+    invocation of ``gate_quality`` covering those types.
+    """
+    from .status import load_status as _load_status
     qc = load_qc(ctx)
     edits = qc.get("edits") or {}
     if not edits:
         return StepCheck(step="sq3_qc_E", ok=True, expected=0, found=0, skip=True)
-    found = sum(1 for e in edits.values() if (e.get("gates") or {}).get("E") is not None)
-    return StepCheck(step="sq3_qc_E", ok=(found == len(edits)),
-                     expected=len(edits), found=found,
-                     missing=[] if found == len(edits) else ["gate_E_not_written"])
+    rec = (_load_status(ctx).get("steps") or {}).get("sq3_qc_E") or {}
+    only_types = set(rec.get("only_types") or [])
+    if only_types:
+        target_ids = [eid for eid, e in edits.items()
+                      if (e.get("edit_type") or "").lower() in only_types]
+    else:
+        target_ids = list(edits.keys())
+    if not target_ids:
+        return StepCheck(step="sq3_qc_E", ok=True, expected=0, found=0, skip=True)
+    found = sum(1 for eid in target_ids
+                if (edits.get(eid, {}).get("gates") or {}).get("E") is not None)
+    return StepCheck(step="sq3_qc_E", ok=(found == len(target_ids)),
+                     expected=len(target_ids), found=found,
+                     missing=[] if found == len(target_ids) else ["gate_E_not_written"])
 
 
 # ── Active step validators (Mode E decided) ──────────────────────────

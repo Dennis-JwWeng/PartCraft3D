@@ -111,6 +111,11 @@ services:
     repaint_mode: image
 
 qc:
+  # Restrict Gate E to a subset of edit types.  Useful when del/add previews
+  # are still being rendered (preview_del) and we want to start judging the
+  # FLUX-derived edits early.  Override per-invocation via env QC_ONLY_TYPES.
+  # Set to null / remove to judge all 7 types.
+  gate_quality_types: [modification, scale, material, color, global]
   thresholds_by_type:
     deletion:
       min_visual_quality: 3
