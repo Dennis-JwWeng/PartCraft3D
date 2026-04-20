@@ -4,6 +4,42 @@
 
 ---
 
+## 2026-04-20 — pipeline_v3 color 编辑 3D 生效（双 bug 修复）
+
+**背景**：shard08 `mode_e_text_align` 的 color 编辑 gate_e 通过率只有 **14.4%**（同配置下 `material` 60.8%、`global` 85.2%）。FLUX 已经把 2D 颜色改对了（`edits_2d/clr_*_edited.png` 显示目标色），但 TRELLIS 输出的 5 视图预览和 BEFORE 几乎像素级相同。定位到两个独立的退化路径同时存在。
+
+**变更**：
+
+- **Bug 1 — DINOv2 图像条件没接上 Color**  
+  `partcraft/pipeline_v3/trellis_utils.py::resolve_2d_conditioning` 的白名单只列 `Modification/Scale/Material/Global`，color 编辑一律 `return None`。`TrellisRefiner.edit` 在 `repaint_mode='image'` 下 `img_cond is None and img_new is None` 触发 `effective_mode='interleaved'` 回退到一张 518×518 白图，FLUX 的 recolour **完全没有进入 S2**。白名单加入 `"Color"` 后，`encode_multiview_cond` 产出的多视角 DINOv2 特征正确注入 S2。
+
+- **Bug 2 — S2 positive text 看到的是 BEFORE 文本**  
+  `partcraft/pipeline_v3/specs.py::EditSpec.from_parsed_edit` 的 `new_parts_desc` fallback 链是 `edit["new_parts_desc"] → edit["target_part_desc"]`，但 Phase-1 VLM 的 parsed.json **从不写** `new_parts_desc` 字段，只写 `after_desc`（统计：color 0/1544、material 0/1544、modification 0/4073、scale 0/1544、global 0/2256）。结果 `build_prompts_from_spec` 拿 BEFORE 文本当 AFTER 去 `_decompose_local` 生成 `new_s2_cpl`——对 `clr_be1691a3..._011` 来说字面上就是 `"white L-shaped component of the building structure"`，S2 的 CFG 正条件完全不知道 "crimson red"。修复：fallback 链插入 `edit.get("after_desc")` 作为中间级（`new_parts_desc → after_desc → target_part_desc`），有 `new_parts_desc` 时行为不变。
+
+- **Bench harness** (`scripts/tools/bench_color_fix.py`)：  
+  新增独立实验驱动，用 symlink 把 live shard 的 `phase1/` / `edits_2d/` / `highlights/` 链入 `outputs/partverse/_experiments/color_fix_exp_*/`，可写状态文件走 copy；monkey-patch `trellis_3d.iter_flux_specs` + `preview_render.iter_all_specs` 仅产 color 的 specs，避免误动其它类型；`--sample N --seed S` / `--obj-id`（可重复）/ `--repaint-mode image|text|interleaved` / `--skip-render`，跑完自动生成 HTML 卡片报告对比 LIVE vs EXP 5 视角预览。
+
+**验证**：随机抽 5 个 obj（`--sample 5 --seed 2026 --repaint-mode image`），三种 repaint_mode 对原报告 case `clr_be1691a3..._011`（40 voxel / 0.7% 覆盖率的退化 mask）全部无效（R-G imbalance ±0.00），但 3/5 典型样本清楚出现目标颜色：
+
+| case | edit | 修复前 | 修复后 | ΔG − ΔR |
+|---|---|---|---|---|
+| `c61d11af..005` | 车身换深红 | 橙色 | 酒红 | −0.79 |
+| `cec5f37535..006` | 车部件换红 | 银白 | 深红 | −3.73 |
+| `dbdccb3f..009` | 斗篷+裙换红 | 白袍 | 深酒红 | −5.84 |
+
+G 通道比 R 下降更多即视觉上偏红，与预期一致。两个未显著变化的 case（`c0575d5e..006` / `c245db41..005`）属于 mask 极小或 2D 编辑信号本身偏弱，留给后续 `edit_strength>1.0` 放大实验。
+
+**延伸发现**（未修复，已留 tracking）：`TrellisRefiner.encode_multiview_cond` 的 "residual" 公式 `feat_cond = feat_orig + edit_strength*(feat_edited - feat_orig)` 在默认 `edit_strength=1.0` 时数学上等价于 `feat_edited`，并非真正的 residual；DINOv2 对色相相对不敏感（训练期大量 color augmentation），这使"极小 part 纯换色"类 case 即使走对路径，img_cond 信号仍被模型自身压平。把 `edit_strength` 提到 2–3 或改用真 delta 形式，是拉动剩余失败 case 的下一个杠杆。
+
+**影响**：这两个修复是下一次 pipeline_v3 全量跑之前的前提，未改变 material/modification/global 的行为路径（material 的 `new_s2_cpl` 现在也会含"AFTER 场景描述"里的 polished marble 等关键词，预期 material 类通过率会顺带略有提升）。
+
+**Commits**：
+- `39f7b09 fix(pipeline_v3): route color edits through DINOv2 2D conditioning`
+- `504a033 fix(pipeline_v3): use after_desc fallback when new_parts_desc absent`
+- `edc2e12 tools(bench): isolated color-fix re-run harness for shard08`
+
+---
+
 ## 2026-04-20 — H3D_v1 per-edit 视图降为单张 `before.png` / `after.png`
 
 **背景**：上一版只把 `views.best_view_index` 写进 `meta.json`，但 `<edit_dir>/before_views/` 和 `after_views/` 仍然各 hardlink 5 张 PNG，下游要先读 json 再索引 viewK，目录自解释性差。
