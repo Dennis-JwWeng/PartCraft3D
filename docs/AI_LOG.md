@@ -4,6 +4,50 @@
 
 ---
 
+## 2026-04-20 — H3D_v1 per-edit 视图降为单张 `before.png` / `after.png`
+
+**背景**：上一版只把 `views.best_view_index` 写进 `meta.json`，但 `<edit_dir>/before_views/` 和 `after_views/` 仍然各 hardlink 5 张 PNG，下游要先读 json 再索引 viewK，目录自解释性差。
+
+**变更**：
+
+- **Layout 扁平化** (`partcraft/cleaning/h3d_v1/layout.py`)：
+  - 新增 `before_image()` / `after_image()` → `<edit_dir>/{before,after}.png`。
+  - 废弃并删除 `before_views_dir()` / `after_views_dir()` / `before_view(k)` / `after_view(k)`。
+- **Promoter** (`partcraft/cleaning/h3d_v1/promoter.py`)：
+  `promote_deletion` / `promote_flux` / `promote_addition` 各只 hardlink 两张图，K 取自已写好的 `record["views"]["best_view_index"]`，确保 `meta.json` 里的 K 与磁盘上的图是同一视角。addition 的 `before.png` 直接 hardlink 配对 deletion 的 `after.png`（K 已镜像），自然共享 inode。
+- **Index validator** (`scripts/cleaning/h3d_v1/build_h3d_v1_index.py`)：`--validate` 只检查每条 edit 的 `before.png` + `after.png` 是否在位，不再按 N_VIEWS 展开。
+- **Decode inspect** (`scripts/datasets/h3d_v1/decode_inspect.py`)：GT strip 由"5 张视图拼条"改为单张图（保持 `_gt_strip` 入口名以兼容调用点）。
+- **Docs**：`docs/superpowers/specs/2026-04-19-h3d-v1-design.md` §3/§4/§6/§8/§13 全部同步到扁平 layout。
+
+**迁移策略**：不回填老 shard 上的 `before_views/after_views/` 五张旧图——直接把 shard08 已 promote 的目录清掉、跑三个 pull_* CLI 重新 promote 一遍（用户明确同意，见 2026-04-20 会话）。
+
+**测试**：`tests/cleaning/h3d_v1/` 74 pass（含 test_smoke_e2e 从 `pull_deletion` 一路跑到 `pack_shard`，已对单张 `before.png`/`after.png` 的 inode 做了断言）。
+
+---
+
+## 2026-04-20 — H3D_v1 `meta.json` 瘦身 + `views.best_view_index`
+
+**背景**：H3D_v1 per-edit 目录里一直有 5 张 `before/after` 五视角图，但 `meta.json` 里没有记录"哪一张是最值得看的那张"。同时之前的 schema 冗余字段（`part_labels` / `n_parts_selected` / `stats.*` / `lineage.{pipeline_config,pipeline_git_sha,promoted_at,paired_edit_id}`）与"释放给下游消费"的定位不匹配。
+
+**变更**：
+
+- **Schema v3 final** (`partcraft/cleaning/h3d_v1/promoter.py`)：
+  - 新增 `meta.views.best_view_index`（0..4，对应 `view{k}.png`）。    选择规则：flux/deletion 读 `edit_status.json.gates.A.vlm.best_view`    （pipeline_v3 对 selected part 掩码在 5 视角 overview 上取 argmax）；    addition 镜像配对 deletion；`global` 类及所有兜底走     `DEFAULT_FRONT_VIEW_INDEX = 4`（`view4` = front upward，yaw +22° pitch +52°，    见 `partcraft/render/overview.py::VIEW_INDICES`）。
+  - `quality.gate_A_score` → `alignment_score`（语义：文本-图像对齐）；    `quality.gate_E_score` → `quality_score`（3D 渲染质量）。    addition 的 `alignment_score` 镜像配对 deletion 的 gate A 分数。
+  - `lineage` 只保留 `source_dataset` + `pipeline_version`。    `paired_edit_id` 下游靠 `del_<obj>_NNN` ↔ `add_<obj>_NNN` 编号约定重建。
+  - `instruction` 删掉 `part_labels`、`n_parts_selected`（见     `partcraft/cleaning/h3d_v1/instruction.py`）。
+  - `stats.{before,after}_n_voxels` / `delta_voxels` 整块移除。
+
+- **Repro 审计** (`manifests/_internal/promote_log.jsonl`)：  每次 `promote_*` 成功后 append 一行，带 `pipeline_config` /   `pipeline_git_sha` / `promoted_at`。`pack_shard` 不打包   `manifests/_internal/`，仅本机留底。
+
+- **回填** (`scripts/tools/h3d_v1_backfill_meta.py`)：  `--dataset-root data/H3D_v1 [--shard 08] [--pipeline-cfg <yaml>]`  幂等重写已有 `meta.json` 到 v3 final；带 `--pipeline-cfg` 时从   `edit_status.json` 填 `views.best_view_index`，否则走 default front。  shard08 已回填（15 条 meta：8 × pipeline argmax + 5 × paired-deletion   镜像 + 2 × global default）。
+
+**Design choice**：GLB object 级"整体 overview 图"从本版本砍掉（用户决定不出）。下游要看对象概览就直接从 `_assets/<NN>/<obj>/orig_views/view{0..4}.png` 中 任取一张；同一张 `DEFAULT_FRONT_VIEW_INDEX` 会出现在所有 `global` 编辑的 `best_view_index` 里，语义统一。
+
+**测试**：`tests/cleaning/h3d_v1/` 74 pass（含 5 个新 views/promote_log 断言）。顺带把 `test_asset_pool.py` / `test_smoke_e2e.py` 的 fixture 接上合法 `images.npz`（`ensure_object_views` 在早先的 fix 之后已强依赖该输入）。
+
+---
+
 ## 2026-04-08 — pipeline_v2：object-centric 全管线入口 + validator 修复
 
 **问题**：phase1 v2 之后,后续 step（FLUX 2D / TRELLIS 3D / rerender / addition backfill）原本仍走旧 batch 入口（`scripts/run_pipeline.py`），与 object-centric 输出布局（`outputs/<root>/objects/<shard>/<obj_id>/{phase1,edits_2d,edits_3d,...}`）不对齐；并且没有按 phase 自动起停 VLM/FLUX 服务的统一调度。

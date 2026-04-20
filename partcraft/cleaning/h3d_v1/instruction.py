@@ -48,18 +48,18 @@ def _instruction_for(parsed_edit: dict[str, Any], object_desc: str) -> dict[str,
     """Build a slim, JSON-friendly instruction record from a parsed.edits entry.
 
     Schema v3: drop partverse-specific fields (``selected_part_ids``,
-    ``view_index``); only emit type-applicable fields (``new_parts_desc``
-    only for ``modification``; ``after_desc`` only when non-empty for the
-    flux group; ``edit_params`` only when non-empty).
+    ``view_index``, ``n_parts_selected``, ``part_labels``); only emit
+    type-applicable fields (``new_parts_desc`` only for ``modification``;
+    ``after_desc`` only when non-empty for the flux group; ``edit_params``
+    only when non-empty). Downstream consumers see the edit effect
+    (prompt + descs + params) without pipeline-internal part bookkeeping.
     """
     et = parsed_edit.get("edit_type") or ""
-    pids = list(parsed_edit.get("selected_part_ids") or [])
 
     instr: dict[str, Any] = {
         "prompt": parsed_edit.get("prompt") or "",
         "object_desc": object_desc,
         "target_part_desc": parsed_edit.get("target_part_desc") or "",
-        "n_parts_selected": len(pids),
     }
 
     if et == "modification":
@@ -100,11 +100,6 @@ def load_instructions(obj_dir: Path) -> dict[str, dict[str, Any]]:
     parsed = j.get("parsed") or {}
     obj = parsed.get("object") or {}
     object_desc = obj.get("full_desc") or ""
-    parts_by_id = {
-        p["part_id"]: p
-        for p in (obj.get("parts") or [])
-        if isinstance(p, dict) and "part_id" in p
-    }
     obj_id = j.get("obj_id") or obj_dir.name
     edits = parsed.get("edits") or []
 
@@ -125,10 +120,6 @@ def load_instructions(obj_dir: Path) -> dict[str, dict[str, Any]]:
         prefix = ID_PREFIX[et]
         edit_id = f"{prefix}_{obj_id}_{seq:03d}"
         instr = _instruction_for(e, object_desc)
-        pids = list(e.get("selected_part_ids") or [])
-        instr["part_labels"] = [
-            parts_by_id.get(pid, {}).get("name", "") for pid in pids
-        ]
         result[edit_id] = instr
 
     from partcraft.pipeline_v3.addition_utils import invert_delete_prompt
@@ -142,8 +133,6 @@ def load_instructions(obj_dir: Path) -> dict[str, dict[str, Any]]:
             "prompt": invert_delete_prompt(instr["prompt"]),
             "object_desc": instr["object_desc"],
             "target_part_desc": instr["target_part_desc"],
-            "n_parts_selected": instr["n_parts_selected"],
-            "part_labels": list(instr["part_labels"]),
             "synthesized": True,
         }
 

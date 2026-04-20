@@ -55,6 +55,34 @@ def _save_pngs(dir_: Path, prefix: str, *, n: int = N_VIEWS) -> None:
         cv2.imwrite(str(dir_ / f"{prefix}{k}.png"), img)
 
 
+def _make_image_npz(path: Path) -> None:
+    """Minimal valid images.npz covering VIEW_INDICES.
+
+    ``asset_pool.ensure_object_views`` renders from image_npz.  For smoke
+    e2e we inject a tiny synthetic npz so pull_deletion / pull_flux /
+    pull_addition can run without a real partverse staging area.
+    """
+    import json as _json
+    cv2 = pytest.importorskip("cv2")
+    from partcraft.render.overview import VIEW_INDICES  # noqa: PLC0415
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries: dict[str, np.ndarray] = {}
+    frames = []
+    for k, idx in enumerate(VIEW_INDICES):
+        img = np.full((64, 64, 3), fill_value=(k + 1) * 30, dtype=np.uint8)
+        ok, buf = cv2.imencode(".png", img)
+        assert ok
+        entries[f"{idx:03d}.png"] = np.frombuffer(buf.tobytes(), dtype=np.uint8)
+        frames.append({
+            "file_path": f"{idx:03d}.png",
+            "transform_matrix": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+            "camera_angle_x": 0.5,
+        })
+    tf_blob = _json.dumps({"frames": frames}).encode()
+    entries["transforms.json"] = np.frombuffer(tf_blob, dtype=np.uint8)
+    np.savez(path, **entries)
+
+
 def _write_yaml(path: Path, output_dir: Path, slat_dir: Path,
                 images_root: Path, mesh_root: Path) -> None:
     """Minimal pipeline_v3 yaml the loader will accept."""
@@ -114,12 +142,14 @@ def synthetic_shard(tmp_path: Path) -> dict:
 
     ckpt_root = tmp_path / "ckpt_unused"
     ckpt_root.mkdir(parents=True, exist_ok=True)
-    for d in ("slat_unused", "images_unused", "mesh_unused"):
+    for d in ("slat_unused", "mesh_unused"):
         (tmp_path / d).mkdir(parents=True, exist_ok=True)
+    images_root = tmp_path / "images"
+    _make_image_npz(images_root / SHARD / f"{OBJ}.npz")
     cfg = tmp_path / "pipeline.yaml"
     _write_yaml(cfg, output_dir,
                 slat_dir=tmp_path / "slat_unused",
-                images_root=tmp_path / "images_unused",
+                images_root=images_root,
                 mesh_root=tmp_path / "mesh_unused")
 
     dataset_root = tmp_path / "H3D_v1"

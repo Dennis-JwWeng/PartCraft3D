@@ -16,12 +16,14 @@ Source resolution (per spec §4):
   2. GPU fallback — load slat_dir tensor + run a user-supplied ``ss_encoder``.
 
 ``orig_views/view{i}.png``:
-  1. Copy from any addition edit's ``preview_{i}.png`` (already 518×518,
-     already alpha-flattened by s6p).
-  2. CPU fallback — ``load_views_from_npz(image_npz, VIEW_INDICES)`` and
-     resize 512×512 → 518×518 (matches the preview render shape so all
-     ``before_views/`` and ``after_views/`` PNGs are dimensionally
-     consistent across the dataset).
+  Rendered from the original ``image_npz`` using ``VIEW_INDICES``,
+  then resized to ``PREVIEW_SIDE`` × ``PREVIEW_SIDE`` so all
+  per-edit ``before.png`` / ``after.png`` are dimensionally
+  consistent across the dataset.
+
+  Note: addition previews (``add_*/preview_*.png``) are NOT used here
+  because pipeline_v3 s6p generates them as copies of the source
+  deletion's after-image (part-removed state), NOT the original object.
 
 Both ``ensure_*`` are idempotent: a second call on a fully-materialised
 obj is a no-op (returns immediately after the inexpensive existence
@@ -161,19 +163,6 @@ def _encode_object_npz_via_slat(
 
 
 # ── orig_views/ ────────────────────────────────────────────────────────
-def _find_addition_preview_dir(pipeline_obj_dir: Path) -> Path | None:
-    """Return any add edit dir whose 5 preview pngs all exist, or None."""
-    edits_root = pipeline_obj_dir / "edits_3d"
-    if not edits_root.is_dir():
-        return None
-    for edit_dir in sorted(edits_root.iterdir()):
-        if not (edit_dir.is_dir() and edit_dir.name.startswith("add_")):
-            continue
-        if all((edit_dir / f"preview_{k}.png").is_file() for k in range(N_VIEWS)):
-            return edit_dir
-    return None
-
-
 def ensure_object_views(
     layout: H3DLayout,
     shard: str,
@@ -184,6 +173,10 @@ def ensure_object_views(
 ) -> Path:
     """Materialise ``_assets/<NN>/<obj_id>/orig_views/view{0..4}.png``.
 
+    Always rendered from the original ``image_npz`` (raw sensor input)
+    using ``VIEW_INDICES``.  ``pipeline_obj_dir`` is accepted for API
+    compatibility but is not used.
+
     Returns the orig_views directory.
     """
     views_dir = layout.orig_views_dir(shard, obj_id)
@@ -193,22 +186,10 @@ def ensure_object_views(
 
         views_dir.mkdir(parents=True, exist_ok=True)
 
-        # Source 1: hardlink/copy from an add edit's preview_*.png (518×518).
-        add_dir = _find_addition_preview_dir(pipeline_obj_dir)
-        if add_dir is not None:
-            for k in range(N_VIEWS):
-                src = add_dir / f"preview_{k}.png"
-                dst = layout.orig_view(shard, obj_id, k)
-                if dst.exists():
-                    dst.unlink()
-                shutil.copy2(src, dst)
-            LOGGER.info("orig_views[%s/%s] copied from %s", shard, obj_id, add_dir)
-            return views_dir
-
-        # Source 2: render from image_npz, alpha-flatten, resize to PREVIEW_SIDE.
         if image_npz is None or not image_npz.is_file():
             raise RuntimeError(
-                f"orig_views[{shard}/{obj_id}]: no add preview and image_npz unavailable ({image_npz})"
+                f"orig_views[{shard}/{obj_id}]: image_npz unavailable ({image_npz}); "
+                f"cannot materialise original views"
             )
         _materialise_views_from_image_npz(image_npz, views_dir)
         LOGGER.info("orig_views[%s/%s] rendered from %s", shard, obj_id, image_npz)
@@ -216,11 +197,7 @@ def ensure_object_views(
 
 
 def _materialise_views_from_image_npz(image_npz: Path, views_dir: Path) -> None:
-    """Lazy-import path: load 5 raw views, resize, write PNGs.
-
-    cv2 is loaded only when this branch fires so the common case (Source 1)
-    keeps its imports cheap.
-    """
+    """Load 5 raw views from image_npz, resize to PREVIEW_SIDE, write PNGs."""
     import cv2  # noqa: PLC0415
 
     from partcraft.render.overview import VIEW_INDICES, load_views_from_npz  # noqa: PLC0415

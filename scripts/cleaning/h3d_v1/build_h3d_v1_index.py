@@ -13,8 +13,8 @@ writes the concatenation atomically to ``manifests/all.jsonl``.
 With ``--validate``, additionally checks for each record that:
 
 * the per-edit ``meta.json`` exists,
-* the four ``before.npz`` / ``after.npz`` / ``before_views/`` /
-  ``after_views/`` paths exist on disk,
+* the four ``before.npz`` / ``after.npz`` / ``before.png`` /
+  ``after.png`` paths exist on disk,
 * every ``*.npz`` is loadable via ``numpy.load`` and has the expected
   keys (``slat_feats``, ``slat_coords``, ``ss``).
 
@@ -36,7 +36,6 @@ import numpy as np
 from partcraft.cleaning.h3d_v1.layout import (
     EDIT_TYPES_ALL,
     H3DLayout,
-    N_VIEWS,
 )
 from partcraft.cleaning.h3d_v1.manifest import read_jsonl, rewrite_jsonl
 
@@ -92,10 +91,9 @@ def _validate_record(layout: H3DLayout, rec: dict[str, Any]) -> list[str]:
         layout.meta_json(et, shard, obj, eid),
         layout.before_npz(et, shard, obj, eid),
         layout.after_npz(et, shard, obj, eid),
+        layout.before_image(et, shard, obj, eid),
+        layout.after_image(et, shard, obj, eid),
     ]
-    for k in range(N_VIEWS):
-        expected_files.append(layout.before_view(et, shard, obj, eid, k))
-        expected_files.append(layout.after_view(et, shard, obj, eid, k))
     for fp in expected_files:
         if not fp.is_file():
             problems.append(f"missing file: {fp}")

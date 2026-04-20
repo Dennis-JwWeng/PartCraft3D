@@ -23,6 +23,42 @@ from partcraft.cleaning.h3d_v1.asset_pool import (
 from partcraft.cleaning.h3d_v1.layout import H3DLayout, N_VIEWS
 
 
+def _make_image_npz(path: Path) -> None:
+    """Create a minimal valid images.npz covering VIEW_INDICES.
+
+    asset_pool.ensure_object_views now always renders from image_npz
+    (the old add-preview fallback was removed because add previews are
+    copies of the part-removed state, not the original object).
+    """
+    import json as _json
+    cv2 = pytest.importorskip("cv2")
+    from partcraft.render.overview import VIEW_INDICES  # noqa: PLC0415
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries: dict[str, np.ndarray] = {}
+    frames = []
+    for k, idx in enumerate(VIEW_INDICES):
+        img = np.full((64, 64, 3), fill_value=(k + 1) * 30, dtype=np.uint8)
+        ok, buf = cv2.imencode(".png", img)
+        assert ok
+        entries[f"{idx:03d}.png"] = np.frombuffer(buf.tobytes(), dtype=np.uint8)
+        frames.append({
+            "file_path": f"{idx:03d}.png",
+            "transform_matrix": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+            "camera_angle_x": 0.5,
+        })
+    tf_blob = _json.dumps({"frames": frames}).encode()
+    entries["transforms.json"] = np.frombuffer(tf_blob, dtype=np.uint8)
+    np.savez(path, **entries)
+
+
+@pytest.fixture()
+def image_npz(tmp_path: Path) -> Path:
+    """Synthetic images.npz co-located with pipeline_obj_dir."""
+    path = tmp_path / "images" / "08" / "obj.npz"
+    _make_image_npz(path)
+    return path
+
+
 @pytest.fixture()
 def layout(tmp_path: Path) -> H3DLayout:
     return H3DLayout(root=tmp_path / "H3D_v1")
@@ -85,10 +121,12 @@ def test_ensure_object_npz_raises_without_source(layout: H3DLayout, tmp_path: Pa
                          slat_dir=tmp_path / "slat")
 
 
-def test_ensure_object_views_from_addition(layout: H3DLayout, pipeline_obj_dir: Path) -> None:
+def test_ensure_object_views_from_image_npz(
+    layout: H3DLayout, pipeline_obj_dir: Path, image_npz: Path,
+) -> None:
     views_dir = ensure_object_views(layout, "08", "obj",
                                     pipeline_obj_dir=pipeline_obj_dir,
-                                    image_npz=None)
+                                    image_npz=image_npz)
     assert views_dir == layout.orig_views_dir("08", "obj")
     for k in range(N_VIEWS):
         p = layout.orig_view("08", "obj", k)
@@ -98,21 +136,25 @@ def test_ensure_object_views_from_addition(layout: H3DLayout, pipeline_obj_dir: 
     assert img.shape == (PREVIEW_SIDE, PREVIEW_SIDE, 3)
 
 
-def test_ensure_object_views_idempotent(layout: H3DLayout, pipeline_obj_dir: Path) -> None:
+def test_ensure_object_views_idempotent(
+    layout: H3DLayout, pipeline_obj_dir: Path, image_npz: Path,
+) -> None:
     p1 = ensure_object_views(layout, "08", "obj",
-                             pipeline_obj_dir=pipeline_obj_dir, image_npz=None)
+                             pipeline_obj_dir=pipeline_obj_dir, image_npz=image_npz)
     mtimes_1 = [layout.orig_view("08", "obj", k).stat().st_mtime for k in range(N_VIEWS)]
     p2 = ensure_object_views(layout, "08", "obj",
-                             pipeline_obj_dir=pipeline_obj_dir, image_npz=None)
+                             pipeline_obj_dir=pipeline_obj_dir, image_npz=image_npz)
     assert p2 == p1
     mtimes_2 = [layout.orig_view("08", "obj", k).stat().st_mtime for k in range(N_VIEWS)]
     assert mtimes_1 == mtimes_2
 
 
-def test_ensure_object_views_raises_without_source(layout: H3DLayout, tmp_path: Path) -> None:
+def test_ensure_object_views_raises_without_image_npz(
+    layout: H3DLayout, tmp_path: Path,
+) -> None:
     empty_obj = tmp_path / "empty_obj"
     (empty_obj / "edits_3d").mkdir(parents=True)
-    with pytest.raises(RuntimeError, match="no add preview"):
+    with pytest.raises(RuntimeError, match="image_npz unavailable"):
         ensure_object_views(layout, "08", "obj",
                             pipeline_obj_dir=empty_obj, image_npz=None)
 

@@ -17,8 +17,9 @@ Layout summary (full doc in
     │   ├── meta.json
     │   ├── before.npz       # hardlink to _assets/.../object.npz
     │   ├── after.npz        # physical (s6b output)
-    │   ├── before_views/view{0..4}.png   # hardlink to _assets/.../orig_views/
-    │   └── after_views/view{0..4}.png    # hardlink to pipeline preview_{i}.png
+    │   ├── before.png       # hardlink to _assets/.../orig_views/view{K}.png
+    │   └── after.png        # hardlink to pipeline preview_{K}.png
+    │                        # K = meta.json["views"]["best_view_index"]
     ├── addition/<NN>/<obj_id>/<edit_id>/
     │   └── ... (mirror of paired deletion, see spec §3)
     ├── modification|scale|material|color|global/<NN>/<obj_id>/<edit_id>/
@@ -95,21 +96,23 @@ class H3DLayout:
     def after_npz(self, edit_type: str, shard: str, obj_id: str, edit_id: str) -> Path:
         return self.edit_dir(edit_type, shard, obj_id, edit_id) / "after.npz"
 
-    def before_views_dir(self, edit_type: str, shard: str, obj_id: str, edit_id: str) -> Path:
-        return self.edit_dir(edit_type, shard, obj_id, edit_id) / "before_views"
+    def before_image(self, edit_type: str, shard: str, obj_id: str, edit_id: str) -> Path:
+        """Per-edit single before.png (flat layout, schema v3).
 
-    def after_views_dir(self, edit_type: str, shard: str, obj_id: str, edit_id: str) -> Path:
-        return self.edit_dir(edit_type, shard, obj_id, edit_id) / "after_views"
+        Resolves to ``<edit_dir>/before.png`` — a hardlink to the original
+        object's ``orig_views/view{K}.png`` (or, for additions, to the paired
+        deletion's ``after.png``) where ``K = meta.views.best_view_index``.
+        """
+        return self.edit_dir(edit_type, shard, obj_id, edit_id) / "before.png"
 
-    def before_view(self, edit_type: str, shard: str, obj_id: str, edit_id: str, k: int) -> Path:
-        if not 0 <= k < N_VIEWS:
-            raise ValueError(f"view index out of range [0,{N_VIEWS}): {k}")
-        return self.before_views_dir(edit_type, shard, obj_id, edit_id) / f"view{k}.png"
+    def after_image(self, edit_type: str, shard: str, obj_id: str, edit_id: str) -> Path:
+        """Per-edit single after.png (flat layout, schema v3).
 
-    def after_view(self, edit_type: str, shard: str, obj_id: str, edit_id: str, k: int) -> Path:
-        if not 0 <= k < N_VIEWS:
-            raise ValueError(f"view index out of range [0,{N_VIEWS}): {k}")
-        return self.after_views_dir(edit_type, shard, obj_id, edit_id) / f"view{k}.png"
+        Resolves to ``<edit_dir>/after.png`` — a hardlink to the pipeline's
+        ``preview_{K}.png`` (deletion/flux) or to ``orig_views/view{K}.png``
+        (addition) where ``K = meta.views.best_view_index``.
+        """
+        return self.edit_dir(edit_type, shard, obj_id, edit_id) / "after.png"
 
     # ── manifests ───────────────────────────────────────────────────
     def manifest_dir(self, edit_type: str) -> Path:
@@ -122,6 +125,17 @@ class H3DLayout:
 
     def aggregated_manifest(self) -> Path:
         return self.root / "manifests" / "all.jsonl"
+
+    # ── internal / non-distributed ──────────────────────────────────
+    # Repro metadata dropped from per-edit ``meta.json`` (pipeline_config,
+    # pipeline_git_sha, promoted_at) is appended here for local audit.
+    # ``pack_shard`` deliberately does NOT include this directory so the
+    # released tarball is free of internal tooling fingerprints.
+    def internal_manifest_dir(self) -> Path:
+        return self.root / "manifests" / "_internal"
+
+    def promote_log(self) -> Path:
+        return self.internal_manifest_dir() / "promote_log.jsonl"
 
 
 def edit_type_from_id(edit_id: str) -> str:

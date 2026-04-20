@@ -45,6 +45,13 @@ from partcraft.cleaning.h3d_v1.pipeline_io import PipelineEdit, load_edit_status
 LOGGER = logging.getLogger(__name__)
 META_SCHEMA_VERSION = 3
 
+# Fixed view index for edits whose target is the whole object (no part
+# mask → no argmax signal) or where the upstream ``best_view`` lookup
+# fails.  ``view4`` = VIEW_INDICES[4] = 8 = front upward (yaw +22°,
+# pitch +52°) — the most frontal of the five canonical views.
+# See ``partcraft/render/overview.py::VIEW_INDICES``.
+DEFAULT_FRONT_VIEW_INDEX: int = 4
+
 
 @dataclass(frozen=True)
 class PromoteResult:
@@ -123,6 +130,39 @@ def _write_meta(path: Path, record: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def _append_promote_log(
+    layout: H3DLayout, edit: PipelineEdit, ctx: "PromoteContext",
+) -> None:
+    """Append one promote record to ``manifests/_internal/promote_log.jsonl``.
+
+    Captures repro metadata that we intentionally keep out of the
+    released ``meta.json`` (timestamp, git sha, pipeline config path).
+    Non-fatal on error — this is an audit trail, not a correctness gate.
+    ``pack_shard`` excludes ``manifests/_internal/`` so this file is never
+    shipped.
+    """
+    try:
+        log_path = layout.promote_log()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "edit_id":          edit.edit_id,
+            "edit_type":        edit.edit_type,
+            "obj_id":           edit.obj_id,
+            "shard":            edit.shard,
+            "promoted_at":      ctx._now_iso(),
+            "pipeline_version": ctx.pipeline_version,
+            "pipeline_config":  ctx.pipeline_config,
+            "pipeline_git_sha": ctx.pipeline_git_sha,
+            "source_dataset":   ctx.source_dataset,
+        }
+        # Single O_APPEND write ≤ 4 KiB is atomic on POSIX; safe across
+        # concurrent promote_* callers on the same log file.
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("failed to append promote_log for %s: %s", edit.edit_id, exc)
+
+
 def _instruction_or_empty(edit: PipelineEdit, ctx: "PromoteContext") -> dict[str, Any]:
     """Look up the parsed-VLM instruction for this edit_id.
 
@@ -141,9 +181,12 @@ def _instruction_or_empty(edit: PipelineEdit, ctx: "PromoteContext") -> dict[str
 def _quality_block(edit: PipelineEdit) -> dict[str, Any]:
     """Slim quality summary from edit_status.json (schema v3).
 
-    Only carries: ``final_pass`` + per-gate VLM scores. Status fields
-    are dropped (presence in dataset implies pass). Timestamps are
-    captured at promote time in ``lineage.promoted_at``.
+    Only carries: ``final_pass`` + semantic scores:
+    ``alignment_score`` (from gate A — text/image alignment) and
+    ``quality_score`` (from gate E — 3D render quality). Status fields
+    are dropped (presence in dataset implies pass).  Promote-time
+    metadata (timestamp, git sha, config path) is kept out of per-edit
+    meta.json and written to ``manifests/_internal/promote_log.jsonl``.
     """
     es = load_edit_status(edit.obj_dir)
     e = es.get("edits", {}).get(edit.edit_id, {}) or {}
@@ -156,50 +199,86 @@ def _quality_block(edit: PipelineEdit) -> dict[str, Any]:
         return float(s) if isinstance(s, (int, float)) else None
 
     out: dict[str, Any] = {"final_pass": bool(e.get("final_pass"))}
-    for letter in ("A", "E"):
-        score = _score(letter)
-        if score is not None:
-            out[f"gate_{letter}_score"] = score
-    return out
-
-
-def _voxel_count(npz_path: Path) -> int | None:
-    """Read ``slat_coords.shape[0]`` cheaply; tolerate IO errors."""
-    try:
-        with np.load(npz_path) as d:
-            return int(d["slat_coords"].shape[0])
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("could not read voxel count from %s: %s", npz_path, exc)
-        return None
-
-
-def _stats_block(before_npz: Path, after_npz: Path) -> dict[str, Any]:
-    bn = _voxel_count(before_npz)
-    an = _voxel_count(after_npz)
-    out: dict[str, Any] = {}
-    if bn is not None:
-        out["before_n_voxels"] = bn
-    if an is not None:
-        out["after_n_voxels"] = an
-    if bn is not None and an is not None:
-        out["delta_voxels"] = an - bn
+    # Gate A → alignment (text-image semantic alignment).
+    # For addition edits, gate A is null in edit_status (synthesised from
+    # paired deletion), so we mirror the paired del's gate A score so the
+    # per-edit meta.json still carries a meaningful alignment value.
+    a_score = _score("A")
+    if a_score is None and edit.edit_type == "addition":
+        paired = paired_edit_id(edit.edit_id)
+        if paired is not None:
+            pe = es.get("edits", {}).get(paired, {}) or {}
+            pg = (pe.get("gates") or {}).get("A")
+            pv = pg.get("vlm") if isinstance(pg, dict) else None
+            ps = pv.get("score") if isinstance(pv, dict) else None
+            if isinstance(ps, (int, float)):
+                a_score = float(ps)
+    if a_score is not None:
+        out["alignment_score"] = a_score
+    # Gate E → quality (3D render visual quality).
+    e_score = _score("E")
+    if e_score is not None:
+        out["quality_score"] = e_score
     return out
 
 
 def _lineage_block(edit: PipelineEdit, ctx: "PromoteContext") -> dict[str, Any]:
-    out: dict[str, Any] = {
+    """Minimal lineage for release: only ``source_dataset`` and
+    ``pipeline_version``.  Everything else (config path, git sha,
+    promote timestamp, pairing) lives in ``manifests/_internal/`` or
+    can be derived (paired del↔add from the edit_id convention).
+    """
+    return {
         "pipeline_version": ctx.pipeline_version,
-        "source_dataset": ctx.source_dataset,
-        "promoted_at": ctx._now_iso(),
+        "source_dataset":   ctx.source_dataset,
     }
-    if ctx.pipeline_config:
-        out["pipeline_config"] = ctx.pipeline_config
-    if ctx.pipeline_git_sha:
-        out["pipeline_git_sha"] = ctx.pipeline_git_sha
-    pair = paired_edit_id(edit.edit_id)
-    if pair is not None:
-        out["paired_edit_id"] = pair
-    return out
+
+
+# ── views block ────────────────────────────────────────────────────────
+def _read_best_view_from_status(
+    es: dict[str, Any], edit_id: str,
+) -> int | None:
+    e = es.get("edits", {}).get(edit_id, {}) or {}
+    gate_a = (e.get("gates") or {}).get("A")
+    vlm = gate_a.get("vlm") if isinstance(gate_a, dict) else None
+    bv = vlm.get("best_view") if isinstance(vlm, dict) else None
+    if isinstance(bv, int) and 0 <= bv < N_VIEWS:
+        return int(bv)
+    return None
+
+
+def _views_block(edit: PipelineEdit) -> dict[str, Any]:
+    """Return ``{"best_view_index": int}``.
+
+    Index is in 0..N_VIEWS-1.  In the flat schema-v3 layout each edit
+    only ships a single ``before.png`` / ``after.png`` picked at this
+    index (hardlinked from ``_assets/<obj>/orig_views/view{k}.png`` and
+    the pipeline's ``preview_{k}.png`` respectively).
+
+    Resolution order:
+
+    1. ``global`` edits have no per-part mask → use
+       ``DEFAULT_FRONT_VIEW_INDEX`` (aligned with how the dataset's
+       fixed "front" view is selected on the GLB object side).
+    2. Non-addition edits: read pipeline_v3 pixel-mask argmax from
+       ``edit_status.json.edits[edit_id].gates.A.vlm.best_view``.
+    3. ``addition`` edits: gate A is null in edit_status (synthesised
+       from paired deletion), so mirror the paired deletion's best_view.
+    4. If none of the above yield a valid index (stale status, missing
+       edit entry, etc.), fall back to ``DEFAULT_FRONT_VIEW_INDEX``.
+    """
+    if edit.edit_type == "global":
+        return {"best_view_index": DEFAULT_FRONT_VIEW_INDEX}
+
+    es = load_edit_status(edit.obj_dir)
+    bv = _read_best_view_from_status(es, edit.edit_id)
+    if bv is None and edit.edit_type == "addition":
+        paired = paired_edit_id(edit.edit_id)
+        if paired is not None:
+            bv = _read_best_view_from_status(es, paired)
+    if bv is None:
+        bv = DEFAULT_FRONT_VIEW_INDEX
+    return {"best_view_index": int(bv)}
 
 
 def _base_record(
@@ -209,21 +288,30 @@ def _base_record(
     before_npz: Path | None = None,
     after_npz: Path | None = None,
 ) -> dict[str, Any]:
-    record: dict[str, Any] = {
-        "edit_id": edit.edit_id,
-        "edit_type": edit.edit_type,
-        "obj_id": edit.obj_id,
-        "shard": edit.shard,
+    """Build the released ``meta.json`` record.
+
+    Schema v3 blocks:
+
+    * ``edit_id`` / ``edit_type`` / ``obj_id`` / ``shard`` / ``schema_version``
+    * ``instruction`` — prompt + descs + edit_params (no part bookkeeping)
+    * ``views.best_view_index`` — single int 0..4 matching ``view{k}.png``
+    * ``quality``  — ``final_pass`` + ``alignment_score`` + ``quality_score``
+    * ``lineage``  — ``source_dataset`` + ``pipeline_version``
+    """
+    # before_npz / after_npz kwargs retained for backwards compatibility
+    # with existing callers; stats block has been removed from schema v3.
+    del before_npz, after_npz
+    return {
+        "edit_id":        edit.edit_id,
+        "edit_type":      edit.edit_type,
+        "obj_id":         edit.obj_id,
+        "shard":          edit.shard,
         "schema_version": META_SCHEMA_VERSION,
-        "instruction": _instruction_or_empty(edit, ctx),
-        "quality": _quality_block(edit),
+        "instruction":    _instruction_or_empty(edit, ctx),
+        "views":          _views_block(edit),
+        "quality":        _quality_block(edit),
+        "lineage":        _lineage_block(edit, ctx),
     }
-    if before_npz is not None and after_npz is not None:
-        stats = _stats_block(before_npz, after_npz)
-        if stats:
-            record["stats"] = stats
-    record["lineage"] = _lineage_block(edit, ctx)
-    return record
 
 
 # ── deletion ───────────────────────────────────────────────────────────
@@ -257,20 +345,24 @@ def promote_deletion(
     after_dst = layout.after_npz("deletion", edit.shard, edit.obj_id, edit.edit_id)
     _hardlink_or_copy(object_npz, before_dst, ctx=ctx)
     _hardlink_or_copy(pipeline_after, after_dst, ctx=ctx)
-    for k in range(N_VIEWS):
-        _hardlink_or_copy(
-            layout.orig_view(edit.shard, edit.obj_id, k),
-            layout.before_view("deletion", edit.shard, edit.obj_id, edit.edit_id, k),
-            ctx=ctx,
-        )
-        _hardlink_or_copy(
-            edit.edit_dir / f"preview_{k}.png",
-            layout.after_view("deletion", edit.shard, edit.obj_id, edit.edit_id, k),
-            ctx=ctx,
-        )
 
+    # Flat schema-v3 layout: one before.png + one after.png per edit, picked
+    # at best_view_index.  Compute the record first so the K used for linking
+    # is the exact same K that downstream reads from meta.json.
     record = _base_record(edit, ctx, before_npz=object_npz, after_npz=pipeline_after)
+    k = int(record["views"]["best_view_index"])
+    _hardlink_or_copy(
+        layout.orig_view(edit.shard, edit.obj_id, k),
+        layout.before_image("deletion", edit.shard, edit.obj_id, edit.edit_id),
+        ctx=ctx,
+    )
+    _hardlink_or_copy(
+        edit.edit_dir / f"preview_{k}.png",
+        layout.after_image("deletion", edit.shard, edit.obj_id, edit.edit_id),
+        ctx=ctx,
+    )
     _write_meta(layout.meta_json("deletion", edit.shard, edit.obj_id, edit.edit_id), record)
+    _append_promote_log(layout, edit, ctx)
     return PromoteResult(True, None, record)
 
 
@@ -309,20 +401,21 @@ def promote_flux(
     # so all "before" copies in the dataset share one inode per obj.
     _hardlink_or_copy(object_npz, before_dst, ctx=ctx)
     _hardlink_or_copy(pipeline_after, after_dst, ctx=ctx)
-    for k in range(N_VIEWS):
-        _hardlink_or_copy(
-            layout.orig_view(edit.shard, edit.obj_id, k),
-            layout.before_view(edit.edit_type, edit.shard, edit.obj_id, edit.edit_id, k),
-            ctx=ctx,
-        )
-        _hardlink_or_copy(
-            edit.edit_dir / f"preview_{k}.png",
-            layout.after_view(edit.edit_type, edit.shard, edit.obj_id, edit.edit_id, k),
-            ctx=ctx,
-        )
 
     record = _base_record(edit, ctx, before_npz=object_npz, after_npz=pipeline_after)
+    k = int(record["views"]["best_view_index"])
+    _hardlink_or_copy(
+        layout.orig_view(edit.shard, edit.obj_id, k),
+        layout.before_image(edit.edit_type, edit.shard, edit.obj_id, edit.edit_id),
+        ctx=ctx,
+    )
+    _hardlink_or_copy(
+        edit.edit_dir / f"preview_{k}.png",
+        layout.after_image(edit.edit_type, edit.shard, edit.obj_id, edit.edit_id),
+        ctx=ctx,
+    )
     _write_meta(layout.meta_json(edit.edit_type, edit.shard, edit.obj_id, edit.edit_id), record)
+    _append_promote_log(layout, edit, ctx)
     return PromoteResult(True, None, record)
 
 
@@ -347,34 +440,36 @@ def promote_addition(
     object_npz = layout.object_npz(edit.shard, edit.obj_id)
     if not object_npz.is_file():
         return PromoteResult(False, f"_assets object.npz missing — promote a deletion or flux for {edit.obj_id} first")
-    paired_after_views = [
-        layout.after_view("deletion", edit.shard, edit.obj_id, paired, k) for k in range(N_VIEWS)
-    ]
-    if not all(p.is_file() for p in paired_after_views):
-        return PromoteResult(False, f"paired deletion {paired} after_views incomplete")
+    paired_after_image = layout.after_image("deletion", edit.shard, edit.obj_id, paired)
+    if not paired_after_image.is_file():
+        return PromoteResult(False, f"paired deletion {paired} after.png missing")
 
     before_dst = layout.before_npz("addition", edit.shard, edit.obj_id, edit.edit_id)
     after_dst = layout.after_npz("addition", edit.shard, edit.obj_id, edit.edit_id)
     _hardlink_or_copy(paired_after, before_dst, ctx=ctx)
     _hardlink_or_copy(object_npz, after_dst, ctx=ctx)
-    for k in range(N_VIEWS):
-        _hardlink_or_copy(
-            paired_after_views[k],
-            layout.before_view("addition", edit.shard, edit.obj_id, edit.edit_id, k),
-            ctx=ctx,
-        )
-        _hardlink_or_copy(
-            layout.orig_view(edit.shard, edit.obj_id, k),
-            layout.after_view("addition", edit.shard, edit.obj_id, edit.edit_id, k),
-            ctx=ctx,
-        )
 
     record = _base_record(edit, ctx, before_npz=paired_after, after_npz=object_npz)
+    # _views_block mirrors the paired deletion's best_view_index for additions,
+    # so the same K is used for both sides and the inodes naturally line up.
+    k = int(record["views"]["best_view_index"])
+    _hardlink_or_copy(
+        paired_after_image,
+        layout.before_image("addition", edit.shard, edit.obj_id, edit.edit_id),
+        ctx=ctx,
+    )
+    _hardlink_or_copy(
+        layout.orig_view(edit.shard, edit.obj_id, k),
+        layout.after_image("addition", edit.shard, edit.obj_id, edit.edit_id),
+        ctx=ctx,
+    )
     _write_meta(layout.meta_json("addition", edit.shard, edit.obj_id, edit.edit_id), record)
+    _append_promote_log(layout, edit, ctx)
     return PromoteResult(True, None, record)
 
 
 __all__ = [
+    "DEFAULT_FRONT_VIEW_INDEX",
     "META_SCHEMA_VERSION",
     "PromoteContext",
     "PromoteResult",

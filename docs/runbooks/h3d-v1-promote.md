@@ -53,11 +53,10 @@ DATASET=data/H3D_v1
 GPUS=0,1,2,3,4,5,6,7  # e.g. 0 for a single-GPU box
 
 # 1) Deletions (GPU). Encodes missing `after.npz` (s6b) then hardlinks
-#    into H3D_v1. A **single** `pull_deletion` process fans out encode
-#    (Blender + DINOv2 + SLAT) across ``--gpu-ids`` (default 0..7) via
-#    `multiprocessing` ``spawn`` workers; each worker loads `ss_encoder` once
-#    and round-robins its edit partition. For a **single** GPU, use
-#    ``--gpu-ids 0`` (or legacy ``--device cuda:0``).
+#    into H3D_v1. Uses **fork** workers (not spawn) to avoid numpy
+#    re-import race in child processes (see §2.1). A **single**
+#    `pull_deletion` process fans out over ``--gpu-ids`` (default 0..7);
+#    for a single GPU use ``--gpu-ids 0`` (or legacy ``--device cuda:0``).
 PARTCRAFT_CKPT_ROOT=$PWD/checkpoints \
 python -m scripts.cleaning.h3d_v1.pull_deletion \
   --pipeline-cfg $CFG --shard $SHARD --dataset-root $DATASET \
@@ -83,34 +82,68 @@ Expected per-deletion encode time: 5-15 s on an L20X, dominated by
 ### 2.1 How the encode step (s6b) is parallelised
 
 `pull_deletion` inlines pipeline_v3's s6b encode whenever an accepted
-edit lacks `after.npz`. The runner partitions pending edits **round-robin
-across `--gpu-ids`** and forks one `multiprocessing` `spawn` worker per
-GPU. Each worker runs **two phases** over its bucket:
+edit lacks `after.npz`. The encode step is split globally into a
+**render pool** and an **encode pool**, each using `multiprocessing`
+**fork** workers (CUDA-safe because the parent never initialises CUDA).
 
-1. **Phase 1 — Blender render + voxelize** for *every* edit in the
-   bucket. No torch / CUDA init yet, so Cycles owns the GPU during this
-   phase. Logs: `[gpu3 R 12/47] del_xxx_003 render ok (7.2s)`.
-2. **Phase 2 — DINOv2 + SLAT + SS encode** over the staged renders.
-   `ss_encoder` loads **once per worker**, then streams the bucket.
-   Logs: `[gpu3 E 12/47] del_xxx_003 encode ok (0.9s)`.
+**Why fork instead of spawn:** earlier `spawn` runs on shard08 hit a
+`PyCapsule_Import could not import module "datetime"` crash caused by
+concurrent numpy re-import in spawn children (the parent had already
+loaded numpy via `promoter.py`). `fork` copies the parent address space
+after numpy is stable, avoiding the race entirely.
 
-Rationale: interleaving Cycles and PyTorch on the same device per edit
-caused driver-context thrash in earlier runs. Splitting phases keeps
-each backend's state hot for the whole bucket.
+**Two pools, two phases (always global, not per-worker):**
+
+1. **Render pool** — Blender Cycles + voxelize for *all* pending edits.
+   No torch / trellis imported.  Each render result lands in a flat
+   directory `<encode-work-dir>/<shard>_<obj>_<edit>/` and a
+   `render.done` marker is written.
+   Logs: `[gpu3 R 12/437] del_xxx_003 render ok (7.2s)`.
+
+2. **Encode pool** — load `ss_encoder` once per worker, then
+   DINOv2 → SLAT → SS for all staged renders.  Staging is removed on
+   success unless `--keep-staging` is set.
+   Logs: `[gpu3 E 12/437] del_xxx_003 encode ok (0.9s)`.
+
+**`--phase` flag** lets you run the two pools independently:
+
+```bash
+SHARD=08; CFG=configs/pipeline_v3_shard${SHARD}.yaml; DATASET=data/H3D_v1
+
+# Step A — render only (no torch/trellis; can run while other GPU jobs occupy compute)
+python -m scripts.cleaning.h3d_v1.pull_deletion \
+  --pipeline-cfg $CFG --shard $SHARD --dataset-root $DATASET \
+  --phase render --gpu-ids 0,1,5,6,7 \
+  --encode-work-dir outputs/h3d_v1_encode \
+  --blender ${BLENDER_PATH:-/usr/local/bin/blender}
+
+# Step B — encode + promote (run after GPU compute is free; loads ss_encoder)
+PARTCRAFT_CKPT_ROOT=$PWD/checkpoints \
+python -m scripts.cleaning.h3d_v1.pull_deletion \
+  --pipeline-cfg $CFG --shard $SHARD --dataset-root $DATASET \
+  --phase encode --gpu-ids 0,1,2,3,4,5,6,7 \
+  --encode-work-dir outputs/h3d_v1_encode
+```
+
+`--phase both` (default) runs render → encode → promote in a single
+invocation, equivalent to the old behaviour.
 
 Practical knobs:
 
 - `--gpu-ids 0,1,2,3,4,5,6,7` — default, one worker per listed GPU.
 - `--gpu-ids 0` — single-GPU box (equivalent to legacy `--device cuda:0`;
   the legacy flag still works but prints a deprecation warning).
-- `--encode-work-dir <path>` — staging for per-GPU renders; each worker
-  creates `gpu<N>/` under it. Put this on the same FS as the pipeline
+- `--encode-work-dir <path>` — staging root; render artifacts land in
+  `<path>/<shard>_<obj>_<edit>/`. Put this on the same FS as the pipeline
   output to keep IO local.
+- `--keep-staging` — keep render artifacts after successful encode (default:
+  removed to reclaim disk; ~40 MB per edit × 1108 = ~43 GiB for shard08).
 - `--skip-encode` — skip s6b entirely (dry-run / CPU-only accounting).
+  Mutually exclusive with `--phase`.
 
-Workers write `<edit_dir>/after.npz` directly; the parent process
-re-enumerates ready edits after the pool finishes, so a partial encode
-failure in one worker does not block promotion of the rest of the shard.
+Workers write `<edit_dir>/after.npz` directly; the parent re-enumerates
+ready edits after the encode pool finishes, so a partial encode failure
+in one worker does not block promotion of the rest of the shard.
 
 ## 3. Wet promote — multi-machine, multi-GPU
 
@@ -167,6 +200,37 @@ is stored once per obj rather than once per edit. Add `--compression gz`
 only if you need on-disk compression; gzip will inflate the on-wire
 size where SLAT NPZ already compresses internally.
 
+`pack_shard` deliberately does **not** include `manifests/_internal/`
+(local promoter audit log — see spec §8); only `_assets/<NN>/`,
+`<edit_type>/<NN>/`, `manifests/<edit_type>/<NN>.jsonl` and
+`manifests/all.jsonl` are packed.
+
+## 5b. Backfill existing `meta.json` after schema changes
+
+If you have `meta.json` files from a previous promote that pre-date
+schema v3 final (no `views` block, old `gate_*_score` keys, `stats`
+block, verbose `lineage`), run the idempotent rewriter:
+
+```bash
+# Recommended: pass pipeline cfg so views.best_view_index is pulled
+# from the pipeline's pixel-mask argmax (gates.A.vlm.best_view).
+# Add --rebuild-manifests so manifests/<type>/<NN>.jsonl and
+# manifests/all.jsonl are regenerated from the rewritten meta.json files.
+python -m scripts.tools.h3d_v1_backfill_meta \
+  --dataset-root data/H3D_v1 --shard 08 \
+  --pipeline-cfg configs/pipeline_v3_shard08.yaml \
+  --rebuild-manifests
+
+# Without --pipeline-cfg, views.best_view_index falls back to
+# DEFAULT_FRONT_VIEW_INDEX (4, "front upward") with a warning count
+# in the final summary.
+```
+
+Safe to run multiple times.  On a clean v3-final dataset the tool
+reports `rewrite=0 unchanged=N` and exits 0.  ``--rebuild-manifests``
+may be used on its own (without meta rewrites) to just bring the
+manifest JSONLs back in sync with the per-edit ``meta.json`` files.
+
 ## 6. Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -178,3 +242,6 @@ size where SLAT NPZ already compresses internally.
 | `no after_new.glb; cannot encode` | Pipeline_v3 s5b never produced the GLB for this edit | Investigate the pipeline run; missing s5b output is a pipeline failure, not a promote issue |
 | Encode workers stall / one `gpu<N>` worker logs zero progress | A single hung Blender subprocess or CUDA context wedged on that card | Kill the worker PID; the parent re-enumerates ready edits, so rerunning `pull_deletion` picks up the remainder |
 | `--device is deprecated for pull_deletion; use --gpu-ids` | Passing legacy `--device cuda:N` | Replace with `--gpu-ids N` (single) or `--gpu-ids 0,1,…,7` (multi); the legacy flag still works but is removed in a future pass |
+| `--skip-encode and --phase are mutually exclusive` | Both flags passed together | Use `--phase both --skip-encode` (equivalent to old `--skip-encode` alone) or drop one |
+| `missing_staged_render` skip reason in summary | `--phase encode` ran but render artifacts absent | Run `--phase render` first with the same `--encode-work-dir`, then re-run `--phase encode` |
+| `render.done missing` in encode worker log | Individual edit's render failed or staging deleted | Rerun `--phase render` (idempotent; already-staged edits are skipped) |

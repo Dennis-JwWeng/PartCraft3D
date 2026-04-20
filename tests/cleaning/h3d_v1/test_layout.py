@@ -84,8 +84,12 @@ def test_edit_paths(layout: H3DLayout) -> None:
     assert edit_dir == layout.root / "deletion" / "08" / "abc" / "del_abc_000"
     assert layout.before_npz("deletion", "08", "abc", "del_abc_000").name == "before.npz"
     assert layout.after_npz("deletion", "08", "abc", "del_abc_000").name == "after.npz"
-    assert layout.before_view("deletion", "08", "abc", "del_abc_000", 2).name == "view2.png"
-    assert layout.after_view("deletion", "08", "abc", "del_abc_000", 2).parent.name == "after_views"
+    before_img = layout.before_image("deletion", "08", "abc", "del_abc_000")
+    after_img = layout.after_image("deletion", "08", "abc", "del_abc_000")
+    assert before_img.name == "before.png"
+    assert after_img.name == "after.png"
+    assert before_img.parent == layout.edit_dir("deletion", "08", "abc", "del_abc_000")
+    assert after_img.parent == layout.edit_dir("deletion", "08", "abc", "del_abc_000")
     assert layout.meta_json("deletion", "08", "abc", "del_abc_000").name == "meta.json"
 
 
