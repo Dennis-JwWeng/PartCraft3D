@@ -104,13 +104,18 @@ def check_edit_server(base_url: str):
 def _build_edit_prompt(edit_prompt: str, after_part_desc: str,
                        old_part_label: str = "",
                        before_part_desc: str = "",
-                       edit_type: str = "modification") -> str:
+                       edit_type: str = "modification",
+                       edit_params: dict | None = None) -> str:
     """Build a constrained prompt for 2D image editing.
 
     Adapts prompt structure to the edit type:
       - deletion: instruct removal, generate clean closure
       - scale: instruct part-only size/proportion change
-      - modification: instruct part replacement, preserve others
+      - color: pure hue swap on a single part (uses
+        edit_params['target_color'] when available)
+      - modification / material: edit specific part(s),
+        preserve others (material falls through to the
+        modification branch - already at ~62% pass)
       - global: instruct whole-object style change
     """
     et = edit_type.lower()
@@ -176,6 +181,50 @@ def _build_edit_prompt(edit_prompt: str, after_part_desc: str,
             "\n- Keep the target part identity and style, but change only its size/proportions."
             "\n- Do NOT move or rotate the object."
         )
+    elif et == "color":
+        # Color: pure HUE swap on a single part. Mirrors the material-style
+        # success pattern observed on shard07 (material 61.5% pass vs color
+        # 13.5% pass under the old shared modification template).
+        # Key changes vs the old template:
+        #   * Verb changed from "Repaint" to "Recolor" - empirically "Repaint"
+        #     pushes FLUX toward redrawing the part (causes geometry
+        #     distortion / "melted helmet" failures in shard07).
+        #   * Inline the canonical target_color from edit_params (same recipe
+        #     that makes "Change to polished walnut wood" work for material).
+        #   * Explicit guarantee: keep material/finish/geometry - only hue.
+        if old_part_label:
+            target = f"the '{old_part_label}' part"
+        else:
+            target = "the specified part"
+        target_color = ((edit_params or {}).get("target_color") or "").strip()
+        if target_color:
+            text = (
+                f"This is a 3D rendered object on a white background. "
+                f"Recolor ONLY {target} to {target_color}. "
+                f"Keep the same surface material, finish, lighting, and "
+                f"geometry - only swap the hue/shade of that part."
+            )
+        else:
+            # Fallback when edit_params lacks target_color: use the original
+            # natural-language instruction but with the safer "Recolor" verb.
+            text = (
+                f"This is a 3D rendered object on a white background. "
+                f"Recolor ONLY {target} of this object. "
+                f"Editing instruction: {edit_prompt}"
+            )
+        if before_part_desc:
+            text += f"\nThe part currently looks like: {before_part_desc}"
+        if after_part_desc:
+            text += f"\nAfter recoloring, it should look like: {after_part_desc}"
+        text += (
+            "\nIMPORTANT constraints:"
+            "\n- Keep the exact same camera viewpoint and angle."
+            "\n- Keep the white background completely unchanged."
+            "\n- Keep ALL other parts of the object exactly as they are."
+            "\n- Do NOT change the geometry, material, or finish of the "
+            "target part - only its color."
+            "\n- Apply the new color uniformly across the entire target part."
+        )
     else:
         # Modification: edit specific part(s)
         if old_part_label:
@@ -206,7 +255,8 @@ def call_local_edit(base_url: str, img_bytes: bytes, edit_prompt: str,
                     after_part_desc: str,
                     old_part_label: str = "",
                     before_part_desc: str = "",
-                    edit_type: str = "modification") -> "Image.Image | None":
+                    edit_type: str = "modification",
+                    edit_params: dict | None = None) -> "Image.Image | None":
     """Edit image via local HTTP image edit server."""
     import base64
     import urllib.request
@@ -214,7 +264,7 @@ def call_local_edit(base_url: str, img_bytes: bytes, edit_prompt: str,
 
     text_input = _build_edit_prompt(
         edit_prompt, after_part_desc, old_part_label, before_part_desc,
-        edit_type=edit_type)
+        edit_type=edit_type, edit_params=edit_params)
 
     image_b64 = base64.b64encode(img_bytes).decode("utf-8")
     payload = json.dumps({"image_b64": image_b64, "prompt": text_input}).encode()
@@ -243,6 +293,7 @@ def call_vlm_edit(client, img_bytes: bytes, edit_prompt: str,
                   old_part_label: str = "",
                   before_part_desc: str = "",
                   edit_type: str = "modification",
+                  edit_params: dict | None = None,
                   **kwargs) -> "Image.Image | None":
     """Call VLM to produce an edited image via OpenAI-compatible API."""
     import base64
@@ -251,7 +302,7 @@ def call_vlm_edit(client, img_bytes: bytes, edit_prompt: str,
     b64 = base64.b64encode(img_bytes).decode('utf-8')
     text_input = _build_edit_prompt(
         edit_prompt, after_part_desc, old_part_label, before_part_desc,
-        edit_type=edit_type)
+        edit_type=edit_type, edit_params=edit_params)
 
     try:
         response = client.chat.completions.create(
@@ -352,13 +403,15 @@ def process_one(spec: EditSpec, dataset, client, output_dir: Path,
             edited = call_local_edit(
                 edit_server_url, img_bytes, spec.prompt, after_desc,
                 old_part_label=part_label, before_part_desc=before_desc,
-                edit_type=spec.edit_type)
+                edit_type=spec.edit_type,
+                edit_params=getattr(spec, "edit_params", None))
         else:
             edited = call_vlm_edit(
                 client, img_bytes, spec.prompt,
                 after_desc, model,
                 old_part_label=part_label, before_part_desc=before_desc,
-                edit_type=spec.edit_type)
+                edit_type=spec.edit_type,
+                edit_params=getattr(spec, "edit_params", None))
 
         if edited is not None:
             edited = edited.resize((518, 518))
