@@ -16,10 +16,10 @@ records emitted by subsequent runs.  Transformations:
 * ``views``:    added.  ``best_view_index`` is sourced from the
                 pipeline's ``edit_status.json.gates.A.vlm.best_view``
                 (pixel-mask argmax) when ``--pipeline-cfg`` is
-                provided.  ``global`` edits always get
-                ``DEFAULT_FRONT_VIEW_INDEX``; ``addition`` edits mirror
-                their paired deletion; otherwise falls back to
-                ``DEFAULT_FRONT_VIEW_INDEX`` with a warning count.
+                provided.  ``global`` edits use the same field when
+                present; ``addition`` edits mirror their paired deletion;
+                otherwise falls back to ``DEFAULT_FRONT_VIEW_INDEX``
+                with a warning count.
 
 Idempotent: re-running on an already-v3-final meta.json is a no-op.
 
@@ -103,6 +103,10 @@ def _resolve_best_view(
 ) -> tuple[int, str]:
     """Return ``(best_view_index, source_tag)``."""
     if edit_type == "global":
+        if not no_status:
+            bv = _best_view_from_status(es, edit_id)
+            if bv is not None:
+                return bv, "global_pipeline_best_view"
         return DEFAULT_FRONT_VIEW_INDEX, "global_default_front"
     if no_status:
         return DEFAULT_FRONT_VIEW_INDEX, "fallback_no_status"

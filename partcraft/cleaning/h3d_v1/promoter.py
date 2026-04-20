@@ -45,10 +45,12 @@ from partcraft.cleaning.h3d_v1.pipeline_io import PipelineEdit, load_edit_status
 LOGGER = logging.getLogger(__name__)
 META_SCHEMA_VERSION = 3
 
-# Fixed view index for edits whose target is the whole object (no part
-# mask → no argmax signal) or where the upstream ``best_view`` lookup
-# fails.  ``view4`` = VIEW_INDICES[4] = 8 = front upward (yaw +22°,
-# pitch +52°) — the most frontal of the five canonical views.
+# Fallback view index when ``edit_status.json`` has no usable
+# ``gates.A.vlm.best_view`` (missing/stale) or for rare edit types that
+# never record one.  ``view4`` = VIEW_INDICES[4] = 8 = front upward
+# (yaw +22°, pitch +52°).  Prefer pipeline-recorded ``best_view`` when
+# available — especially for ``global`` edits, where forcing this index
+# historically picked an upward-looking camera users disliked.
 # See ``partcraft/render/overview.py::VIEW_INDICES``.
 DEFAULT_FRONT_VIEW_INDEX: int = 4
 
@@ -257,20 +259,25 @@ def _views_block(edit: PipelineEdit) -> dict[str, Any]:
 
     Resolution order:
 
-    1. ``global`` edits have no per-part mask → use
-       ``DEFAULT_FRONT_VIEW_INDEX`` (aligned with how the dataset's
-       fixed "front" view is selected on the GLB object side).
-    2. Non-addition edits: read pipeline_v3 pixel-mask argmax from
+    1. ``global`` edits: read ``gates.A.vlm.best_view`` from
+       ``edit_status.json`` when present (same field other flux types
+       use).  Whole-scene edits still get a VLM-picked canonical view;
+       only fall back to ``DEFAULT_FRONT_VIEW_INDEX`` when it is absent.
+    2. Other non-addition edits: read pipeline_v3 pixel-mask argmax from
        ``edit_status.json.edits[edit_id].gates.A.vlm.best_view``.
     3. ``addition`` edits: gate A is null in edit_status (synthesised
        from paired deletion), so mirror the paired deletion's best_view.
     4. If none of the above yield a valid index (stale status, missing
        edit entry, etc.), fall back to ``DEFAULT_FRONT_VIEW_INDEX``.
     """
-    if edit.edit_type == "global":
-        return {"best_view_index": DEFAULT_FRONT_VIEW_INDEX}
-
     es = load_edit_status(edit.obj_dir)
+
+    if edit.edit_type == "global":
+        bv = _read_best_view_from_status(es, edit.edit_id)
+        if bv is None:
+            bv = DEFAULT_FRONT_VIEW_INDEX
+        return {"best_view_index": int(bv)}
+
     bv = _read_best_view_from_status(es, edit.edit_id)
     if bv is None and edit.edit_type == "addition":
         paired = paired_edit_id(edit.edit_id)

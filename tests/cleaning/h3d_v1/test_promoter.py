@@ -318,13 +318,12 @@ def test_views_block_addition_mirrors_paired_deletion(fixture: dict) -> None:
     assert meta_views == {"best_view_index": 2}
 
 
-def test_views_block_global_uses_default_front(tmp_path: Path, fixture: dict) -> None:
+def test_views_block_global_reads_gate_a_best_view(tmp_path: Path, fixture: dict) -> None:
     from partcraft.cleaning.h3d_v1.pipeline_io import PipelineEdit
     glb_id = f"glb_{OBJ}_000"
     es_path = fixture["obj_dir"] / "edit_status.json"
     data = json.loads(es_path.read_text())
-    # Add a global edit with a non-default best_view; _views_block should
-    # ignore it and force DEFAULT_FRONT_VIEW_INDEX for edit_type=="global".
+    # Global edits still record a gate-A best_view for the whole scene.
     data["edits"][glb_id] = {
         "edit_type": "global",
         "gates": {"A": {"vlm": {"pass": True, "score": 1.0, "best_view": 1}},
@@ -338,7 +337,7 @@ def test_views_block_global_uses_default_front(tmp_path: Path, fixture: dict) ->
         edit_status_path=es_path,
     )
     meta_views = _views_block(edit)
-    assert meta_views == {"best_view_index": DEFAULT_FRONT_VIEW_INDEX}
+    assert meta_views == {"best_view_index": 1}
 
 
 def test_views_block_fallback_when_status_missing(tmp_path: Path) -> None:
