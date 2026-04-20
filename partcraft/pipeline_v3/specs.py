@@ -94,7 +94,17 @@ class EditSpec:
             part_labels=labels,
             prompt=edit.get("prompt") or "",
             target_part_desc=edit.get("target_part_desc") or "",
+            # Bug 2 fix (2026-04-20): parsed.json from Phase-1 VLM populates
+            # "after_desc" (scene-level AFTER text) but never "new_parts_desc".
+            # Previously we fell directly to "target_part_desc" (BEFORE text),
+            # so build_prompts_from_spec built S2 positive conditioning from
+            # the original state — the AFTER colour/material keywords never
+            # reached TRELLIS. Prefer after_desc over target_part_desc so
+            # that downstream S2 text conditioning actually differs from
+            # the BEFORE state.  See 2026-04-20 notes on shard08 color edits
+            # (clr_be1691a3..._011, crimson-red L-shaped building).
             new_parts_desc=(edit.get("new_parts_desc")
+                            or edit.get("after_desc")
                             or edit.get("target_part_desc") or ""),
             edit_params=dict(edit.get("edit_params") or {}),
             object_desc=object_desc,
