@@ -34,7 +34,15 @@ def resolve_2d_conditioning(
     if not use_2d:
         return None
     edit_type = prompts.get("edit_type")
-    if edit_type not in ("Modification", "Scale", "Material", "Global"):
+    # NOTE: ``prompts["edit_type"]`` holds the capitalised PartCraft-level
+    # edit_type (e.g. "Color", "Material"), not TRELLIS's internal
+    # effective_type ("TextureOnly" / "Modification" / ...).  Color was
+    # missing from this whitelist, which meant resolve_2d_conditioning
+    # returned None for color edits and ``refiner.edit`` silently fell
+    # back to a blank white image in ``repaint_mode='image'`` -- the 2D
+    # FLUX recolour never reached TRELLIS.  See 2026-04-20 debugging
+    # notes on shard08 clr_be1691a3..._011.
+    if edit_type not in ("Modification", "Scale", "Material", "Color", "Global"):
         return None
 
     num_edit_views = p25_cfg.get("num_edit_views", 4)
