@@ -368,6 +368,45 @@ def _render_ply_views(
     return render_out
 
 
+def _encode_from_render_dir(
+    render_out: Path,
+    ss_encoder,
+    device: str,
+    name: str,
+    num_views: int = 40,
+) -> dict[str, np.ndarray]:
+    """DINOv2 → SLAT → SS from an existing Blender render folder.
+
+    ``render_out`` is the directory returned by ``_render_ply_views``
+    (contains multi-view PNGs + voxelization artifacts).
+    """
+    from trellis.modules import sparse as sp
+    from encode_asset.encode_into_SLAT import (
+        extract_dino_voxel_mean, _get_slat_encoder, validate_slat,
+    )
+
+    dino_voxel_mean, indices = extract_dino_voxel_mean(str(render_out), num_views)
+
+    encoder = _get_slat_encoder()
+    aggregated = sp.SparseTensor(
+        feats=torch.from_numpy(dino_voxel_mean).float(),
+        coords=torch.cat([
+            torch.zeros(dino_voxel_mean.shape[0], 1).int(),
+            indices.cpu().int(),
+        ], dim=1),
+    ).cuda()
+    latent = encoder(aggregated, sample_posterior=False)
+    validate_slat(latent.feats, latent.coords, name)
+
+    z_s = encode_ss(ss_encoder, latent.coords.to(device), device)
+
+    return {
+        "slat_feats": latent.feats.detach().cpu().float().numpy(),
+        "slat_coords": latent.coords.detach().cpu().int().numpy(),
+        "ss": z_s.detach().cpu().float().numpy(),
+    }
+
+
 def _render_and_extract_dino(
     ply_path: Path,
     name: str,
@@ -399,34 +438,8 @@ def _render_and_full_encode(
     Returns dict with ``slat_feats``, ``slat_coords``, ``ss``,
     ``dino_voxel_mean`` — all numpy arrays ready for ``np.savez``.
     """
-    from trellis.modules import sparse as sp
-    from encode_asset.encode_into_SLAT import (
-        extract_dino_voxel_mean, _get_slat_encoder, validate_slat,
-    )
-
     render_out = _render_ply_views(ply_path, name, work_dir, num_views, blender_path)
-    dino_voxel_mean, indices = extract_dino_voxel_mean(str(render_out), num_views)
-
-    # SLAT encode
-    encoder = _get_slat_encoder()
-    aggregated = sp.SparseTensor(
-        feats=torch.from_numpy(dino_voxel_mean).float(),
-        coords=torch.cat([
-            torch.zeros(dino_voxel_mean.shape[0], 1).int(),
-            indices.cpu().int(),
-        ], dim=1),
-    ).cuda()
-    latent = encoder(aggregated, sample_posterior=False)
-    validate_slat(latent.feats, latent.coords, name)
-
-    # SS encode
-    z_s = encode_ss(ss_encoder, latent.coords.to(device), device)
-
-    return {
-        "slat_feats": latent.feats.detach().cpu().float().numpy(),
-        "slat_coords": latent.coords.detach().cpu().int().numpy(),
-        "ss": z_s.detach().cpu().float().numpy(),
-    }
+    return _encode_from_render_dir(render_out, ss_encoder, device, name, num_views)
 
 
 # ──────────────────── Phase 5: Deletion PLY → SLAT+SS re-encode ──────────
