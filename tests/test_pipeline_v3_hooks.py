@@ -6,6 +6,7 @@ from pathlib import Path
 
 from partcraft.pipeline_v3.scheduler import (
     Hook,
+    dump_hook_meta,
     dump_stage_chains,
     format_stage_chains_text,
     hooks_for,
@@ -312,6 +313,44 @@ class TestResolveHookCommand(unittest.TestCase):
         h = self._hook(["{h3d_dataset_root}/shard-{shard}.tar"])
         argv = resolve_hook_command(h, **self._ctx())
         self.assertEqual(argv, ["data/H3D_v1/shard-06.tar"])
+
+
+class TestDumpHookMeta(unittest.TestCase):
+    def _cfg_with_hook(self):
+        return {
+            "services": {"vlm": {"model": "m"}, "image_edit": {}},
+            "pipeline": {
+                "gpus": [0],
+                "stages": [
+                    {"name": "del_mesh", "servers": "none", "steps": ["del_mesh"]},
+                ],
+                "hooks": [{
+                    "name": "pull_deletion_render",
+                    "after_stage": "del_mesh",
+                    "uses": "cpu",
+                    "command": [
+                        "{py_pipe}", "-m", "scripts.cleaning.h3d_v1.pull_deletion",
+                        "--shard", "{shard}",
+                    ],
+                    "env_passthrough": ["PARTCRAFT_CKPT_ROOT"],
+                }],
+            },
+        }
+
+    def test_dump_hook_meta_shape(self):
+        meta = dump_hook_meta(self._cfg_with_hook(), "pull_deletion_render")
+        self.assertEqual(meta["name"], "pull_deletion_render")
+        self.assertEqual(meta["uses"], "cpu")
+        self.assertEqual(meta["after_stage"], "del_mesh")
+        self.assertEqual(meta["command"], [
+            "{py_pipe}", "-m", "scripts.cleaning.h3d_v1.pull_deletion",
+            "--shard", "{shard}",
+        ])
+        self.assertEqual(meta["env_passthrough"], ["PARTCRAFT_CKPT_ROOT"])
+
+    def test_dump_hook_meta_unknown_name_raises(self):
+        with self.assertRaises(KeyError):
+            dump_hook_meta(self._cfg_with_hook(), "nope")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@ Pure functions that read the ``pipeline:`` block and ``services`` of a config.
 * :func:`gpus_for` / :func:`vlm_urls_for` / :func:`flux_urls_for` — hardware + URL lists
 * :func:`hooks_for(cfg)` — list[:class:`Hook`] post-stage hooks (``pipeline.hooks``)
 * :func:`resolve_hook_command(hook, **ctx)` — expand ``{placeholder}`` tokens in ``hook.command``
+* :func:`get_hook(cfg, name)` — look up one :class:`Hook` by name (raises :class:`KeyError`)
+* :func:`dump_hook_meta(cfg, name)` — JSON-serialisable snapshot of one hook for shell drivers
 
 Imported by :mod:`run` (``dump_shell_env``).
 """
@@ -191,6 +193,37 @@ def resolve_hook_command(
         return table[key]
 
     return [_HOOK_PLACEHOLDER_RE.sub(_sub, arg) for arg in hook.command]
+
+
+def get_hook(cfg: dict, name: str) -> Hook:
+    """Return the parsed :class:`Hook` with ``hook.name == name``.
+
+    Raises :class:`KeyError` if no such hook is declared. Parser
+    validations (see :func:`hooks_for`) run first, so this also fails
+    fast on malformed ``pipeline.hooks``.
+    """
+    for h in hooks_for(cfg):
+        if h.name == name:
+            return h
+    raise KeyError(f"hook {name!r} not in pipeline.hooks")
+
+
+def dump_hook_meta(cfg: dict, name: str) -> dict:
+    """Return a JSON-serialisable snapshot of one hook for shell drivers.
+
+    Used by ``run_pipeline_v3_shard.sh`` to resolve and exec the hook
+    command once its chain position has been reached. The returned dict
+    intentionally mirrors :class:`Hook`'s field names so the shell side
+    can index by keyword.
+    """
+    h = get_hook(cfg, name)
+    return {
+        "name": h.name,
+        "after_stage": h.after_stage,
+        "uses": h.uses,
+        "command": list(h.command),
+        "env_passthrough": list(h.env_passthrough),
+    }
 
 
 def _pipeline(cfg: dict) -> dict:
@@ -538,4 +571,6 @@ __all__ = [
     "Hook",
     "hooks_for",
     "resolve_hook_command",
+    "get_hook",
+    "dump_hook_meta",
 ]
