@@ -313,6 +313,15 @@ run_stage() {
     # Used for solo (single-chain, single-stage) batches so the user keeps
     # interactive output. Multi-chain batches use _run_stage_bg via _run_chain.
     local stage="$1"
+    if [[ "$stage" == *@hook ]]; then
+        local hook_name="${stage%@hook}"
+        _run_hook "$hook_name"
+        local rc=$?
+        if [ "$rc" != "0" ]; then
+            exit "$rc"
+        fi
+        return 0
+    fi
     local log="$LOG_DIR/stage_${stage}.log"
 
     _load_stage_meta "$stage"
@@ -387,6 +396,7 @@ _run_hook() {
     # layout: line 1 = 'ENV:<space-separated names>', then 'ARGV:',
     # followed by one argv element per line.
     local resolved rc
+    local resolve_err="$LOG_DIR/hook_${name}.resolve.err"
     resolved=$(
         H3D_DATASET_ROOT_DEFAULT="${H3D_DATASET_ROOT:-data/H3D_v1}" \
         H3D_ENCODE_WORK_DIR_DEFAULT="${H3D_ENCODE_WORK_DIR:-outputs/h3d_v1_encode/${SHARD}}" \
@@ -414,11 +424,12 @@ print('ENV:' + ' '.join(h.env_passthrough))
 print('ARGV:')
 for a in argv:
     print(a)
-"
+" 2>"$resolve_err"
     )
     rc=$?
     if [ "$rc" != "0" ]; then
-        echo "[scheduler] hook $name resolve failed: $resolved"
+        echo "[scheduler] hook $name resolve failed (see $resolve_err):"
+        tail -20 "$resolve_err" 2>/dev/null
         return "$rc"
     fi
 
@@ -450,7 +461,7 @@ for a in argv:
         done
     fi
 
-    printf "\n${_BOLD}> Hook  %-24s${_RST}  (after-stage tail, uses=cpu|none)\n" "$name"
+    printf "\n${_BOLD}> Hook  %-24s${_RST}  (post-stage external command)\n" "$name"
     printf "  argv: %s\n" "${HOOK_ARGV[*]}"
     env "${env_assigns[@]}" "${HOOK_ARGV[@]}" > "$log" 2>&1
     rc=$?
