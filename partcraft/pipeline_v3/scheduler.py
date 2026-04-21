@@ -366,9 +366,10 @@ def dump_stage_chains(
                 if last in by_after:
                     if len(by_after[last]) > 1:
                         log.warning(
-                            "[scheduler] %d hooks share after_stage=%s; they "
-                            "will run sequentially in declaration order.",
+                            "[scheduler] %d hooks share after_stage=%s (%s); "
+                            "they will run sequentially in declaration order.",
                             len(by_after[last]), last,
+                            ", ".join(h.name for h in by_after[last]),
                         )
                     for h in by_after[last]:
                         chain.append(f"{h.name}@hook")
