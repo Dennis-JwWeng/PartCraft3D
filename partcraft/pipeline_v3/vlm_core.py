@@ -2156,20 +2156,39 @@ async def _run_quality_gate_for_object(
             this set are (re-)judged; previously-recorded Gate E verdicts
             for other types are preserved.  Used to selectively re-judge
             del/add on already-completed shards (env: ``QC_ONLY_TYPES``).
+            Objects already covered by a matching or broader ``only_types``
+            record (or a prior unrestricted Gate E) are skipped unless
+            ``force`` is set.
     """
     from .specs import iter_all_specs as _iter_all_specs
     from .status import update_step as _update_step, STATUS_OK as _STATUS_OK, step_done as _step_done
     from .qc_io import is_edit_qc_failed as _is_edit_qc_failed
-    # Partial-completion aware skip:
-    #   * Restricted run (only_edit_types set) ALWAYS walks so newly-allowed
-    #     types get judged.
-    #   * Unrestricted run skips only if a previous unrestricted run finished
-    #     (recorded as status=ok WITHOUT an "only_types" field).
+    # Partial-completion aware skip (unless --force):
+    #   * Unrestricted run skips if a previous unrestricted Gate E finished
+    #     (status=ok WITHOUT "only_types").
+    #   * Restricted run skips if status=ok and either (a) prior run was
+    #     unrestricted (no only_types), or (b) sq3_qc_E.only_types already
+    #     contains every type in only_edit_types — avoids re-judging the same
+    #     QC_ONLY_TYPES pass.  If the filter adds new types, only_types is not
+    #     a superset and we re-enter to judge the new types only.
     if not force:
         from .status import load_status as _load_status
         rec = (_load_status(ctx).get("steps") or {}).get("sq3_qc_E") or {}
-        if only_edit_types is None and rec.get("status") == "ok" and not rec.get("only_types"):
-            return {"obj_id": ctx.obj_id, "skipped": True}
+        if rec.get("status") == "ok":
+            if only_edit_types is None:
+                if not rec.get("only_types"):
+                    return {"obj_id": ctx.obj_id, "skipped": True}
+            else:
+                needed = {str(x).strip().lower() for x in only_edit_types}
+                if not needed:
+                    pass
+                elif not rec.get("only_types"):
+                    # Prior full Gate E — nothing to add for this filter.
+                    return {"obj_id": ctx.obj_id, "skipped": True}
+                else:
+                    prev_types = {str(x).strip().lower() for x in (rec.get("only_types") or [])}
+                    if needed.issubset(prev_types):
+                        return {"obj_id": ctx.obj_id, "skipped": True}
 
     n_pass = n_fail = n_skip = 0
     before_imgs = _load_before_view_images(ctx)
