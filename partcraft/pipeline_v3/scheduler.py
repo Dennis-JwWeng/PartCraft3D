@@ -351,6 +351,28 @@ def dump_stage_chains(
         for chain in batch:
             chain.sort(key=lambda n: by_name[n].chain_order)
 
+    # Post-stage hooks (spec 2026-04-21): append each hook to the chain
+    # ending with its after_stage. Hooks whose after_stage is not the
+    # tail of any chain in the selected run are silently dropped — this
+    # inherits upstream stage selection (§4.2 of the spec).
+    hooks = hooks_for(cfg)
+    if hooks:
+        by_after: dict[str, list[Hook]] = {}
+        for h in hooks:
+            by_after.setdefault(h.after_stage, []).append(h)
+        for batch in batches:
+            for chain in batch:
+                last = chain[-1] if chain else None
+                if last in by_after:
+                    if len(by_after[last]) > 1:
+                        log.warning(
+                            "[scheduler] %d hooks share after_stage=%s; they "
+                            "will run sequentially in declaration order.",
+                            len(by_after[last]), last,
+                        )
+                    for h in by_after[last]:
+                        chain.append(f"{h.name}@hook")
+
     return batches
 
 
