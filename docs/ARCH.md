@@ -37,6 +37,32 @@
 
 ---
 
+## Post-stage hooks（spec 2026-04-21）
+
+在 `pipeline.hooks` 中声明的 **post-stage hook** 会被调度器接在其 `after_stage` 所在链的末尾，以 `<name>@hook` 形式出现在 chain dump 里。语义：
+
+| YAML 键 | 作用 |
+|---------|------|
+| `name` | 唯一标识（不得与任何 `pipeline.stages[*].name` 冲突）。 |
+| `after_stage` | hook 要追加到哪个 stage 末尾；若该 stage 不在本次 `STAGES=` 选择内则整条 hook 静默丢弃（§4.2）。 |
+| `uses` | v1 只支持 `cpu` / `none`；`gpu` 保留给后续 spec。CPU-only hook 会自然和同 `parallel_group` 的 GPU 链并行执行。 |
+| `command` | 进程 argv 列表，支持 `{placeholder}` 替换。 |
+| `env_passthrough` | shell driver 额外透传到 hook 进程的环境变量名列表。 |
+
+**支持的 placeholder**（闭集合，`partcraft.pipeline_v3.scheduler.resolve_hook_command` 里登记）：`{py_pipe}`、`{cfg}`、`{shard}`、`{blender}`、`{h3d_dataset_root}`、`{h3d_encode_work_dir}`。未知 placeholder 在解析时直接 `ValueError`。Dataset / encode 路径默认来自环境变量 `H3D_DATASET_ROOT` / `H3D_ENCODE_WORK_DIR`，未设时分别回退到 `data/H3D_v1` / `outputs/h3d_v1_encode/<SHARD>`。
+
+**skip / log 约定**：
+
+- 设置环境变量 **`SKIP_HOOKS=1`** 可全局跳过所有 hook 执行（chain dump 中仍列出 `<name>@hook`，但驱动会直接 `return 0`）。  
+- hook 日志落在 `logs/v3_<tag>/hook_<name>.log`；若 Python resolver 失败，traceback 落在 `logs/v3_<tag>/hook_<name>.resolve.err`。  
+- hook 失败等同 stage 失败：驱动会调用 `show_stage_errors` 并中止后续 batch。
+
+**v1 限制**：不含 retry / timeout / artifact 声明；hook 一律串联在链尾（chain tail），不支持在链中间插入；同一 `after_stage` 若声明多 hook，按声明顺序串联（并发出 WARNING）。
+
+示例见 `configs/pipeline_v3_shard06.yaml` 的 `pipeline.hooks.pull_deletion_render`（CPU-only，自动和 `flux_2d > trellis_preview` 并行跑）。
+
+---
+
 ## 权重路径（`load_config`）
 
 `partcraft.utils.config.load_config` 中 **`PARTCRAFT_CKPT_ROOT`** 优先于 YAML 的 `ckpt_root`。  

@@ -45,6 +45,16 @@ dominates, that just means a lot of edits failed gate_e — expected.
 
 ## 2. Wet promote — one shard, one machine
 
+> **Automation note (spec 2026-04-21, from shard06 onward):**  
+> Shards whose YAML declares a `pull_deletion_render` hook under
+> `pipeline.hooks` will have the Blender `--phase render` step kicked
+> off automatically by `run_pipeline_v3_shard.sh` as soon as `del_mesh`
+> finishes — it runs in parallel with `flux_2d > trellis_preview`. If
+> that's already done for your shard, you can skip the `--phase render`
+> command below and go straight to the `--phase encode` (GPU) step
+> (see §2.1 for the two-phase split).
+> To opt out, export `SKIP_HOOKS=1` before running the shard script.
+
 ```bash
 SHARD=08
 CFG=configs/pipeline_v3_shard${SHARD}.yaml
