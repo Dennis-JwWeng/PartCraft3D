@@ -13,8 +13,8 @@ Human-written docs live under **`docs/`** at the repository root (not under `.cu
 
 | Path | Role |
 |---|---|
-| `docs/ARCH.md` | **Primary architecture & data contracts** — pipeline steps, configs, I/O layout. Prefer this over guessing. |
-| `docs/AI_LOG.md` | Chronological decisions and migrations; cross-check with **current code** if something looks stale. |
+| `docs/ARCH.md` | **Pipeline v3** 架构与运行约定（`partcraft.pipeline_v3`）；v2 / 预处理 / 训练等见代码与 git 历史。 |
+| `docs/AI_LOG.md` | **Pipeline v3** 相关编年决策；其他主题见 git 历史。 |
 | `docs/Explore.md` | Exploration / notes as applicable. |
 
 **How to "see" docs:** open these paths in the workspace (same as any file), or ask to read `docs/ARCH.md` (or a section) before large edits. Do not assume behavior that is only documented in chat — **verify in `docs/` + code.**
