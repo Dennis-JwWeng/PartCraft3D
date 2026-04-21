@@ -38,6 +38,101 @@ class Phase:
     chain_order: int = 0
 
 
+_ALLOWED_HOOK_USES = frozenset({"cpu", "none"})
+_ALLOWED_HOOK_FIELDS = frozenset({
+    "name", "after_stage", "uses", "command", "env_passthrough",
+})
+
+
+@dataclass
+class Hook:
+    """One post-stage hook row from ``pipeline.hooks`` (spec 2026-04-21)."""
+
+    name: str
+    after_stage: str
+    uses: str  # "cpu" | "none" in v1
+    command: list[str] = field(default_factory=list)
+    env_passthrough: list[str] = field(default_factory=list)
+
+
+def hooks_for(cfg: dict) -> list[Hook]:
+    """Parse ``pipeline.hooks`` into a list of :class:`Hook`.
+
+    Returns ``[]`` when the block is absent. Validates:
+      * every required field is present;
+      * ``after_stage`` names an existing stage in ``pipeline.stages``;
+      * ``uses`` is one of ``cpu`` / ``none`` (v1; ``gpu`` is reserved);
+      * no unknown keys (guard against typos like ``timeout``);
+      * hook names do not collide with stage names.
+    """
+    p = _pipeline(cfg)
+    raw = p.get("hooks")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("[CONFIG] pipeline.hooks: must be a list")
+
+    stage_names = {ph.name for ph in stages_for(cfg)}
+    out: list[Hook] = []
+    seen_names: set[str] = set()
+
+    for idx, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ValueError(f"[CONFIG] pipeline.hooks[{idx}] not a mapping: {entry!r}")
+
+        unknown = set(entry) - _ALLOWED_HOOK_FIELDS
+        if unknown:
+            raise ValueError(
+                f"[CONFIG] pipeline.hooks[{idx}] unknown fields: {sorted(unknown)}; "
+                f"allowed: {sorted(_ALLOWED_HOOK_FIELDS)}"
+            )
+        for req in ("name", "after_stage", "uses", "command"):
+            if req not in entry:
+                raise ValueError(
+                    f"[CONFIG] pipeline.hooks[{idx}] missing required field {req!r}"
+                )
+
+        name = str(entry["name"])
+        after_stage = str(entry["after_stage"])
+        uses = str(entry["uses"])
+        command = list(entry["command"])
+        env_passthrough = list(entry.get("env_passthrough") or [])
+
+        if not command or not all(isinstance(c, str) for c in command):
+            raise ValueError(
+                f"[CONFIG] pipeline.hooks[{idx}] command must be a non-empty list of strings"
+            )
+        if uses not in _ALLOWED_HOOK_USES:
+            raise ValueError(
+                f"[CONFIG] pipeline.hooks[{idx}] uses={uses!r}; allowed v1: "
+                f"{sorted(_ALLOWED_HOOK_USES)} (gpu reserved for follow-up spec)"
+            )
+        if after_stage not in stage_names:
+            raise ValueError(
+                f"[CONFIG] pipeline.hooks[{idx}] after_stage={after_stage!r} is not a "
+                f"declared stage; known stages: {sorted(stage_names)}"
+            )
+        if name in stage_names:
+            raise ValueError(
+                f"[CONFIG] pipeline.hooks[{idx}] name={name!r} collides with an "
+                "existing stage name"
+            )
+        if name in seen_names:
+            raise ValueError(
+                f"[CONFIG] pipeline.hooks[{idx}] duplicate hook name {name!r}"
+            )
+        seen_names.add(name)
+
+        out.append(Hook(
+            name=name,
+            after_stage=after_stage,
+            uses=uses,
+            command=command,
+            env_passthrough=env_passthrough,
+        ))
+    return out
+
+
 def _pipeline(cfg: dict) -> dict:
     p = cfg.get("pipeline") or {}
     if not isinstance(p, dict):
