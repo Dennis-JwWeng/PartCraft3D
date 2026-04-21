@@ -531,9 +531,11 @@ __all__ = [
     "vlm_urls_for", "flux_urls_for",
     "stages_for", "select_stages", "get_stage",
     "phases_for", "select_phases", "get_phase",
-    "resolve_hook_command",
     "dump_shell_env",
     "dump_stage_batches",
     "dump_stage_chains",
     "format_stage_chains_text",
+    "Hook",
+    "hooks_for",
+    "resolve_hook_command",
 ]
