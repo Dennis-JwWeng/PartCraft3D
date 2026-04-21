@@ -4,6 +4,20 @@
 
 ---
 
+## 2026-04-21 — pipeline_v3：ckpt 根目录与 Trellis worker 配置对齐
+
+**背景**：`load_config()` 只认环境变量 **`PARTCRAFT_CKPT_ROOT`** 作为权重根覆盖；machine env 长期只写 **`TRELLIS_CKPT_ROOT`**，二者未同步时易出现 Trellis 权重路径不符合预期。另 aibox 上 `trellis_workers_per_gpu: 2` 会每 GPU fork 两个 worker，NFS 冷读权重时压力大。
+
+**变更**：
+
+- **`configs/machine/aibox-rd3996bf91f9-68f4cd496c-nsm56.env`**：`export PARTCRAFT_CKPT_ROOT="${PARTCRAFT_CKPT_ROOT:-${TRELLIS_CKPT_ROOT}}"`。
+- **`configs/machine/aibox-re289eb56bb7-6b4f8cd8fb-xgpnz.env`**：同上（dev_hs 挂载 sister 机）。
+- **`configs/pipeline_v3_shard09.yaml`**：`services.image_edit.trellis_text_ckpt` 改为相对名 `TRELLIS-text-xlarge`（在 `ckpt_root` / `PARTCRAFT_CKPT_ROOT` 下解析）；`trellis_workers_per_gpu: 1`；`ckpt_root` 注释说明可被 `PARTCRAFT_CKPT_ROOT` 覆盖。
+
+**文档**：`docs/ARCH.md`「权重下载与目录规范」补充 `PARTCRAFT_CKPT_ROOT` 与 `TRELLIS_CKPT_ROOT` 关系及相对 `trellis_text_ckpt` 的推荐写法。
+
+---
+
 ## 2026-04-20 — pipeline_v3 color 编辑 3D 生效（双 bug 修复）
 
 **背景**：shard08 `mode_e_text_align` 的 color 编辑 gate_e 通过率只有 **14.4%**（同配置下 `material` 60.8%、`global` 85.2%）。FLUX 已经把 2D 颜色改对了（`edits_2d/clr_*_edited.png` 显示目标色），但 TRELLIS 输出的 5 视图预览和 BEFORE 几乎像素级相同。定位到两个独立的退化路径同时存在。

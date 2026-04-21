@@ -9,6 +9,7 @@
 #   CONDA_ENV_PIPELINE = vinedresser3d   (pipeline_v3 driver)
 
 blender: /usr/local/bin/blender
+# Overridden by PARTCRAFT_CKPT_ROOT when set (machine env exports it from TRELLIS_CKPT_ROOT).
 ckpt_root: /mnt/cfs/vffey4/omni3d/ckpt
 
 data:
@@ -91,9 +92,11 @@ services:
 
   image_edit:
     enabled: true
-    trellis_text_ckpt: /mnt/cfs/vffey4/omni3d/ckpt/TRELLIS-text-xlarge
+    # Resolved under ckpt_root (PARTCRAFT_CKPT_ROOT / TRELLIS_CKPT_ROOT on aibox).
+    trellis_text_ckpt: TRELLIS-text-xlarge
     image_edit_backend: local_diffusers
     workers_per_server: 2
+    trellis_workers_per_gpu: 1
     export_ply: false
     export_ply_for_deletion: true
     large_part_threshold: 0.35

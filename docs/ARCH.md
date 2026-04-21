@@ -225,7 +225,12 @@ DATA_DIR, OUTPUT_ROOT
 
 ### 权重下载与目录规范（本机）
 
-- 权重根目录由 machine env 的 `PARTCRAFT_CKPT_ROOT` 或 `VLM_CKPT` / `EDIT_CKPT` / `TRELLIS_CKPT_ROOT` 指定。
+- **`load_config()`（`partcraft/utils/config.py::_apply_ckpt_root`）的优先级**：若设置了环境变量 **`PARTCRAFT_CKPT_ROOT`**，则它**覆盖** YAML 顶层的 `ckpt_root`，并在此根下解析相对路径的 `services.image_edit.trellis_text_ckpt` / `trellis_image_ckpt`。若未设置，才使用 YAML 中的 `ckpt_root`。
+- Machine env 里通常已有 **`TRELLIS_CKPT_ROOT`**（人类可读、与 onboarding 文档一致），但 **`PARTCRAFT_CKPT_ROOT` 不会自动等于它**。请在各 `configs/machine/*.env` 中增加一行：  
+  `export PARTCRAFT_CKPT_ROOT="${PARTCRAFT_CKPT_ROOT:-${TRELLIS_CKPT_ROOT}}"`  
+  这样 `scripts/tools/run_pipeline_v3_shard.sh` `source` 机器配置后，Trellis 与 `load_config` 使用同一物理目录，避免「找不到 ckpt」类路径漂移。
+- **pipeline_v3 shard YAML 建议**：`trellis_text_ckpt` 写成相对名（例如 `TRELLIS-text-xlarge`），由 `ckpt_root` / `PARTCRAFT_CKPT_ROOT` 拼接为绝对路径；换挂载点时只改 machine env，不必改多处绝对路径。
+- **`trellis_workers_per_gpu`**（`services.image_edit`）：每张 GPU 上 Trellis worker 进程数；`preview_flux` / `render_3d` 仍为每 GPU 单进程。IO/NFS 压力大时可设为 `1` 降低并行读权重（见上文「Trellis 单卡多 worker」）。
 - 缺失本地推理权重时，使用：
   - `bash scripts/tools/download_local_missing_weights.sh`
 - 可通过 `VLM_REPO_ID` / `EDIT_REPO_ID` / `PARTCRAFT_CKPT_ROOT` 覆盖默认仓库与目录，无需修改代码。
