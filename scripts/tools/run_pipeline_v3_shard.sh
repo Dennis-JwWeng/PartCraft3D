@@ -369,6 +369,98 @@ run_stage() {
     fi
 }
 
+# ─── hook invocation (post-stage external command) ───────────────────
+
+_run_hook() {
+    # _run_hook <hook_name>
+    # Looks up pipeline.hooks.<name>, resolves placeholders via the
+    # scheduler helper, and exec's the command with env_passthrough.
+    local name="$1"
+    local log="$LOG_DIR/hook_${name}.log"
+
+    if [ "${SKIP_HOOKS:-0}" = "1" ]; then
+        printf "${_YEL}> Hook %-22s SKIPPED (SKIP_HOOKS=1)${_RST}\n" "$name"
+        return 0
+    fi
+
+    # Resolve hook metadata + argv in one Python invocation. Output
+    # layout: line 1 = 'ENV:<space-separated names>', then 'ARGV:',
+    # followed by one argv element per line.
+    local resolved rc
+    resolved=$(
+        H3D_DATASET_ROOT_DEFAULT="${H3D_DATASET_ROOT:-data/H3D_v1}" \
+        H3D_ENCODE_WORK_DIR_DEFAULT="${H3D_ENCODE_WORK_DIR:-outputs/h3d_v1_encode/${SHARD}}" \
+        PY_PIPE_FOR_HOOK="$PY_PIPE" \
+        BLENDER_FOR_HOOK="${BLENDER_PATH:-}" \
+        "$PY_PIPE" -c "
+import os, yaml
+from pathlib import Path
+from partcraft.pipeline_v3.scheduler import get_hook, resolve_hook_command
+cfg = yaml.safe_load(open('$CFG'))
+h = get_hook(cfg, '$name')
+blender = cfg.get('blender') or os.environ.get('BLENDER_FOR_HOOK') or ''
+if not blender:
+    raise SystemExit('[hook:$name] no blender path (YAML blender: or \$BLENDER_PATH)')
+argv = resolve_hook_command(
+    h,
+    py_pipe=os.environ['PY_PIPE_FOR_HOOK'],
+    cfg_path=Path('$CFG'),
+    shard='$SHARD',
+    blender=blender,
+    h3d_dataset_root=Path(os.environ['H3D_DATASET_ROOT_DEFAULT']),
+    h3d_encode_work_dir=Path(os.environ['H3D_ENCODE_WORK_DIR_DEFAULT']),
+)
+print('ENV:' + ' '.join(h.env_passthrough))
+print('ARGV:')
+for a in argv:
+    print(a)
+"
+    )
+    rc=$?
+    if [ "$rc" != "0" ]; then
+        echo "[scheduler] hook $name resolve failed: $resolved"
+        return "$rc"
+    fi
+
+    local env_line
+    env_line=$(printf '%s\n' "$resolved" | sed -n '1s/^ENV://p')
+    local -a HOOK_ARGV=()
+    local in_argv=0
+    while IFS= read -r line; do
+        if [ "$in_argv" = "1" ]; then
+            HOOK_ARGV+=("$line")
+        elif [ "$line" = "ARGV:" ]; then
+            in_argv=1
+        fi
+    done <<< "$resolved"
+
+    if [ "${#HOOK_ARGV[@]}" = "0" ]; then
+        echo "[scheduler] hook $name produced empty argv"
+        return 1
+    fi
+
+    local -a env_assigns=()
+    if [ -n "$env_line" ]; then
+        for v in $env_line; do
+            if [ -z "${!v:-}" ]; then
+                echo "[scheduler] hook $name env_passthrough missing: $v"
+                return 1
+            fi
+            env_assigns+=("$v=${!v}")
+        done
+    fi
+
+    printf "\n${_BOLD}> Hook  %-24s${_RST}  (after-stage tail, uses=cpu|none)\n" "$name"
+    printf "  argv: %s\n" "${HOOK_ARGV[*]}"
+    env "${env_assigns[@]}" "${HOOK_ARGV[@]}" > "$log" 2>&1
+    rc=$?
+    if [ "$rc" != "0" ]; then
+        show_stage_errors "$log" "HOOK FAILED: $name"
+        echo "[scheduler] hook $name exit=$rc — aborting"
+    fi
+    return "$rc"
+}
+
 # ─── single-stage invocation (background-friendly: no tee) ──────────
 
 _run_stage_bg() {
@@ -378,6 +470,11 @@ _run_stage_bg() {
     #   flux_2d > trellis_preview
     # frees the FLUX server before Trellis starts using the same GPUs.
     local stage="$1"
+    if [[ "$stage" == *@hook ]]; then
+        local hook_name="${stage%@hook}"
+        _run_hook "$hook_name"
+        return $?
+    fi
     _load_stage_meta "$stage"
 
     printf "\n${_BOLD}> Stage %-24s — %s${_RST}  (steps=[%s] servers=%s gpu=%s)\n" \
