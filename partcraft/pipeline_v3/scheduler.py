@@ -5,6 +5,7 @@ Pure functions that read the ``pipeline:`` block and ``services`` of a config.
 * :func:`stages_for(cfg)` — list[Phase] ordered stage definitions (``pipeline.stages``)
 * :func:`select_stages(cfg, names, with_optional)` — stage subset
 * :func:`gpus_for` / :func:`vlm_urls_for` / :func:`flux_urls_for` — hardware + URL lists
+* :func:`hooks_for(cfg)` — list[:class:`Hook`] post-stage hooks (``pipeline.hooks``)
 
 Imported by :mod:`run` (``dump_shell_env``).
 """
@@ -95,13 +96,26 @@ def hooks_for(cfg: dict) -> list[Hook]:
         name = str(entry["name"])
         after_stage = str(entry["after_stage"])
         uses = str(entry["uses"])
-        command = list(entry["command"])
-        env_passthrough = list(entry.get("env_passthrough") or [])
-
-        if not command or not all(isinstance(c, str) for c in command):
+        cmd_raw = entry["command"]
+        if (
+            not isinstance(cmd_raw, list)
+            or not cmd_raw
+            or not all(isinstance(c, str) for c in cmd_raw)
+        ):
             raise ValueError(
                 f"[CONFIG] pipeline.hooks[{idx}] command must be a non-empty list of strings"
             )
+        command = list(cmd_raw)
+
+        env_raw = entry.get("env_passthrough")
+        if env_raw is None:
+            env_passthrough: list[str] = []
+        elif not isinstance(env_raw, list) or not all(isinstance(v, str) for v in env_raw):
+            raise ValueError(
+                f"[CONFIG] pipeline.hooks[{idx}] env_passthrough must be a list of strings"
+            )
+        else:
+            env_passthrough = list(env_raw)
         if uses not in _ALLOWED_HOOK_USES:
             raise ValueError(
                 f"[CONFIG] pipeline.hooks[{idx}] uses={uses!r}; allowed v1: "

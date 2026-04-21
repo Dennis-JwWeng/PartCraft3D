@@ -100,6 +100,54 @@ class TestHooksParsing(unittest.TestCase):
         with self.assertRaises(ValueError):
             hooks_for(cfg)
 
+    def test_hooks_non_list_scalar_raises(self):
+        cfg = _cfg_with_stages(hooks="bad")
+        with self.assertRaises(ValueError) as ctx:
+            hooks_for(cfg)
+        self.assertIn("must be a list", str(ctx.exception))
+
+    def test_hook_entry_not_mapping_raises(self):
+        cfg = _cfg_with_stages(hooks=["not-a-mapping"])
+        with self.assertRaises(ValueError) as ctx:
+            hooks_for(cfg)
+        self.assertIn("not a mapping", str(ctx.exception))
+
+    def test_duplicate_hook_names_raise(self):
+        cfg = _cfg_with_stages(hooks=[
+            {"name": "h", "after_stage": "del_mesh", "uses": "cpu", "command": ["a"]},
+            {"name": "h", "after_stage": "del_mesh", "uses": "cpu", "command": ["b"]},
+        ])
+        with self.assertRaises(ValueError) as ctx:
+            hooks_for(cfg)
+        self.assertIn("duplicate", str(ctx.exception).lower())
+
+    def test_scalar_command_string_rejected(self):
+        cfg = _cfg_with_stages(hooks=[{
+            "name": "h", "after_stage": "del_mesh",
+            "uses": "cpu", "command": "echo hi",
+        }])
+        with self.assertRaises(ValueError) as ctx:
+            hooks_for(cfg)
+        self.assertIn("non-empty list of strings", str(ctx.exception))
+
+    def test_non_list_command_raises_value_error_not_typeerror(self):
+        cfg = _cfg_with_stages(hooks=[{
+            "name": "h", "after_stage": "del_mesh",
+            "uses": "cpu", "command": 42,
+        }])
+        with self.assertRaises(ValueError):
+            hooks_for(cfg)
+
+    def test_env_passthrough_non_list_raises(self):
+        cfg = _cfg_with_stages(hooks=[{
+            "name": "h", "after_stage": "del_mesh",
+            "uses": "cpu", "command": ["x"],
+            "env_passthrough": "PARTCRAFT_CKPT_ROOT",
+        }])
+        with self.assertRaises(ValueError) as ctx:
+            hooks_for(cfg)
+        self.assertIn("env_passthrough", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
