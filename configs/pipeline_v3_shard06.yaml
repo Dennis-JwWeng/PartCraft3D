@@ -96,6 +96,36 @@ pipeline:
     steps:
     - gate_quality
 
+  # ─── Post-stage hooks (spec 2026-04-21) ──────────────────────────────
+  # pull_deletion_render runs in Blender (CPU-only) and produces the
+  # deletion staged renders under
+  #   outputs/h3d_v1_encode/<shard>/staged_renders/<edit>/
+  # It chains onto del_mesh's tail so it executes in parallel with
+  # flux_2d > trellis_preview (same parallel_group).
+  # Set SKIP_HOOKS=1 in the environment to globally disable hook execution.
+  hooks:
+    - name: pull_deletion_render
+      after_stage: del_mesh
+      uses: cpu
+      command:
+        - "{py_pipe}"
+        - "-m"
+        - "scripts.cleaning.h3d_v1.pull_deletion"
+        - "--pipeline-cfg"
+        - "{cfg}"
+        - "--shard"
+        - "{shard}"
+        - "--dataset-root"
+        - "{h3d_dataset_root}"
+        - "--phase"
+        - "render"
+        - "--encode-work-dir"
+        - "{h3d_encode_work_dir}"
+        - "--blender"
+        - "{blender}"
+      env_passthrough:
+        - PARTCRAFT_CKPT_ROOT
+
 services:
   vlm:
     model: /mnt/zsn/ckpts/Qwen3.5-27B
