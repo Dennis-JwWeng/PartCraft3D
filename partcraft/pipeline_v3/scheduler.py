@@ -6,13 +6,16 @@ Pure functions that read the ``pipeline:`` block and ``services`` of a config.
 * :func:`select_stages(cfg, names, with_optional)` — stage subset
 * :func:`gpus_for` / :func:`vlm_urls_for` / :func:`flux_urls_for` — hardware + URL lists
 * :func:`hooks_for(cfg)` — list[:class:`Hook`] post-stage hooks (``pipeline.hooks``)
+* :func:`resolve_hook_command(hook, **ctx)` — expand ``{placeholder}`` tokens in ``hook.command``
 
 Imported by :mod:`run` (``dump_shell_env``).
 """
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from . import services_cfg as sc
@@ -145,6 +148,49 @@ def hooks_for(cfg: dict) -> list[Hook]:
             env_passthrough=env_passthrough,
         ))
     return out
+
+
+_HOOK_PLACEHOLDER_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+
+
+def resolve_hook_command(
+    hook: Hook,
+    *,
+    py_pipe: str,
+    cfg_path: Path,
+    shard: str,
+    blender: str,
+    h3d_dataset_root: Path,
+    h3d_encode_work_dir: Path,
+) -> list[str]:
+    """Expand ``{placeholder}`` tokens in ``hook.command``.
+
+    Known placeholders (spec 2026-04-21 §3.3):
+      py_pipe, cfg, shard, blender, h3d_dataset_root, h3d_encode_work_dir
+
+    Unknown placeholders raise :class:`ValueError` — v1 keeps the surface
+    closed; add new sources explicitly here. Literal ``{`` / ``}`` outside
+    a valid ``{identifier}`` match are preserved verbatim.
+    """
+    table = {
+        "py_pipe": str(py_pipe),
+        "cfg": str(cfg_path),
+        "shard": str(shard),
+        "blender": str(blender),
+        "h3d_dataset_root": str(h3d_dataset_root),
+        "h3d_encode_work_dir": str(h3d_encode_work_dir),
+    }
+
+    def _sub(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key not in table:
+            raise ValueError(
+                f"[hook:{hook.name}] unknown placeholder {{{key}}}; "
+                f"known: {sorted(table)}"
+            )
+        return table[key]
+
+    return [_HOOK_PLACEHOLDER_RE.sub(_sub, arg) for arg in hook.command]
 
 
 def _pipeline(cfg: dict) -> dict:
@@ -485,6 +531,7 @@ __all__ = [
     "vlm_urls_for", "flux_urls_for",
     "stages_for", "select_stages", "get_stage",
     "phases_for", "select_phases", "get_phase",
+    "resolve_hook_command",
     "dump_shell_env",
     "dump_stage_batches",
     "dump_stage_chains",

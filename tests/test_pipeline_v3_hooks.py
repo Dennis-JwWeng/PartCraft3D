@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 from partcraft.pipeline_v3.scheduler import (
     Hook,
     dump_stage_chains,
     format_stage_chains_text,
     hooks_for,
+    resolve_hook_command,
 )
 
 
@@ -252,6 +254,64 @@ class TestHookChainSplice(unittest.TestCase):
         batches = dump_stage_chains(cfg, stages)
         flat = [s for b in batches for c in b for s in c]
         self.assertNotIn("mid_hook@hook", flat)
+
+
+class TestResolveHookCommand(unittest.TestCase):
+    def _hook(self, command):
+        return Hook(
+            name="h", after_stage="del_mesh", uses="cpu",
+            command=command, env_passthrough=[],
+        )
+
+    def _ctx(self, **over):
+        base = dict(
+            py_pipe="/usr/bin/python3",
+            cfg_path=Path("configs/pipeline_v3_shard06.yaml"),
+            shard="06",
+            blender="/opt/blender/blender",
+            h3d_dataset_root=Path("data/H3D_v1"),
+            h3d_encode_work_dir=Path("outputs/h3d_v1_encode/06"),
+        )
+        base.update(over)
+        return base
+
+    def test_resolves_all_known_placeholders(self):
+        h = self._hook([
+            "{py_pipe}", "-m", "mod", "--cfg", "{cfg}", "--shard", "{shard}",
+            "--dataset-root", "{h3d_dataset_root}",
+            "--encode-work-dir", "{h3d_encode_work_dir}",
+            "--blender", "{blender}",
+        ])
+        argv = resolve_hook_command(h, **self._ctx())
+        self.assertEqual(argv, [
+            "/usr/bin/python3", "-m", "mod",
+            "--cfg", "configs/pipeline_v3_shard06.yaml",
+            "--shard", "06",
+            "--dataset-root", "data/H3D_v1",
+            "--encode-work-dir", "outputs/h3d_v1_encode/06",
+            "--blender", "/opt/blender/blender",
+        ])
+
+    def test_literal_argv_unchanged(self):
+        h = self._hook(["echo", "no-placeholders-here"])
+        argv = resolve_hook_command(h, **self._ctx())
+        self.assertEqual(argv, ["echo", "no-placeholders-here"])
+
+    def test_unknown_placeholder_raises(self):
+        h = self._hook(["{unknown_key}"])
+        with self.assertRaises(ValueError) as ctx:
+            resolve_hook_command(h, **self._ctx())
+        self.assertIn("unknown_key", str(ctx.exception))
+
+    def test_partial_placeholder_like_string_is_literal(self):
+        h = self._hook(["{", "}", "{not a placeholder}"])
+        argv = resolve_hook_command(h, **self._ctx())
+        self.assertEqual(argv, ["{", "}", "{not a placeholder}"])
+
+    def test_multiple_placeholders_in_one_arg(self):
+        h = self._hook(["{h3d_dataset_root}/shard-{shard}.tar"])
+        argv = resolve_hook_command(h, **self._ctx())
+        self.assertEqual(argv, ["data/H3D_v1/shard-06.tar"])
 
 
 if __name__ == "__main__":
