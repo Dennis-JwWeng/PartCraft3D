@@ -244,6 +244,14 @@ def check_sq3(ctx: ObjectContext) -> StepCheck:
     are expected to have a Gate E verdict.  Other types' missing gate_E
     entries are not validation failures — they will be filled in by a later
     invocation of ``gate_quality`` covering those types.
+
+    Alignment with the runner's skip logic
+    (``vlm_core._run_quality_gate_for_object``): edits whose upstream QC has
+    already failed (``final_pass == False``; typically Gate A fail) are
+    never judged by Gate E, so they must not count toward coverage — else
+    the runner would keep flipping the step status to ``fail`` and the
+    orchestrator would re-queue the object on every run without producing
+    any new gate_E records.
     """
     from .status import load_status as _load_status
     qc = load_qc(ctx)
@@ -252,11 +260,16 @@ def check_sq3(ctx: ObjectContext) -> StepCheck:
         return StepCheck(step="sq3_qc_E", ok=True, expected=0, found=0, skip=True)
     rec = (_load_status(ctx).get("steps") or {}).get("sq3_qc_E") or {}
     only_types = set(rec.get("only_types") or [])
-    if only_types:
-        target_ids = [eid for eid, e in edits.items()
-                      if (e.get("edit_type") or "").lower() in only_types]
-    else:
-        target_ids = list(edits.keys())
+
+    def _is_judgable(e: dict) -> bool:
+        if only_types and (e.get("edit_type") or "").lower() not in only_types:
+            return False
+        # Skip edits the runner would skip (final_pass=False ⇒ gate_A/C fail).
+        if e.get("final_pass", True) is False:
+            return False
+        return True
+
+    target_ids = [eid for eid, e in edits.items() if _is_judgable(e)]
     if not target_ids:
         return StepCheck(step="sq3_qc_E", ok=True, expected=0, found=0, skip=True)
     found = sum(1 for eid in target_ids
@@ -303,6 +316,7 @@ def apply_check(ctx: ObjectContext, step_short: str) -> StepCheck:
         s = load_status(ctx)
         steps = s.setdefault("steps", {})
         entry = steps.get(rep.step) or {"status": "?"}
+        prev_validation_ok = (entry.get("validation") or {}).get("ok", None)
         entry["validation"] = rep.to_dict()
         if rep.skip:
             # Only mark skip if not already completed — don't overwrite an "ok" status
@@ -312,6 +326,13 @@ def apply_check(ctx: ObjectContext, step_short: str) -> StepCheck:
         elif not rep.ok:
             entry["status"] = STATUS_FAIL
         elif entry.get("status") not in (STATUS_OK, STATUS_FAIL):
+            entry["status"] = STATUS_OK
+        elif entry.get("status") == STATUS_FAIL and prev_validation_ok is False:
+            # The prior fail came from the validator itself (coverage check)
+            # and this run's validator now reports ok — lift the stale fail.
+            # Runner-set fails (prior validation.ok not False, e.g. missing
+            # or ok==True) are preserved so genuine step failures aren't
+            # masked.
             entry["status"] = STATUS_OK
         steps[rep.step] = entry
         save_status(ctx, s)
