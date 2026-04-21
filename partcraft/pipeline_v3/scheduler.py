@@ -209,12 +209,16 @@ def get_hook(cfg: dict, name: str) -> Hook:
 
 
 def dump_hook_meta(cfg: dict, name: str) -> dict:
-    """Return a JSON-serialisable snapshot of one hook for shell drivers.
+    """Return a JSON-serialisable snapshot of one hook.
 
-    Used by ``run_pipeline_v3_shard.sh`` to resolve and exec the hook
-    command once its chain position has been reached. The returned dict
-    intentionally mirrors :class:`Hook`'s field names so the shell side
-    can index by keyword.
+    Intended for shell drivers or tooling that want to introspect a
+    hook's declared fields without importing :class:`Hook`. The
+    returned dict mirrors :class:`Hook` field names. ``command`` and
+    ``env_passthrough`` are shallow-copied so downstream mutation does
+    not alias back into the parsed hook. (The shipped shell driver in
+    ``run_pipeline_v3_shard.sh`` uses :func:`get_hook` +
+    :func:`resolve_hook_command` directly; ``dump_hook_meta`` stays
+    available for JSON-oriented callers.)
     """
     h = get_hook(cfg, name)
     return {
