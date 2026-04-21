@@ -64,7 +64,8 @@ import yaml
 from .paths import (DatasetRoots, PipelineRoot, ObjectContext, normalize_shard,
                       resolve_blender_executable)
 from .status import rebuild_manifest, manifest_summary, step_done, load_status
-from .edit_status_io import build_prereq_map
+from .edit_status_io import build_prereq_map, edit_needs_step
+from .specs import iter_flux_specs
 from .validators import apply_check
 from . import scheduler as sched
 from . import services_cfg as psvc
@@ -156,6 +157,93 @@ def resolve_ctxs(
 
 def slice_for_gpu(ctxs: list[ObjectContext], i: int, n: int) -> list[ObjectContext]:
     return [c for k, c in enumerate(ctxs) if k % n == i]
+
+
+def pending_s5_edits_count(
+    ctx: ObjectContext,
+    prereq_map: dict[str, str | None],
+) -> int:
+    """Count flux edits on *ctx* that still need Trellis (stage ``s5``).
+
+    Used to balance GPU shards by **remaining work** instead of raw object
+    index (round-robin).  Same rules as :func:`edit_needs_step` / ``s5``."""
+    n = 0
+    for spec in iter_flux_specs(ctx):
+        if edit_needs_step(ctx, spec.edit_id, "s5", prereq_map, force=False):
+            n += 1
+    return n
+
+
+def slice_for_gpu_lpt(
+    ctxs: list[ObjectContext],
+    i: int,
+    n: int,
+    weights: list[int],
+) -> list[ObjectContext]:
+    """Greedy LPT bin packing: assign heaviest objects to the least-loaded shard.
+
+    Deterministic: all GPU children run the same partition on the same
+    ``ctxs`` list, so shard *i* is identical everywhere."""
+    if n <= 0:
+        return list(ctxs)
+    if len(ctxs) != len(weights):
+        raise ValueError("weights length must match ctxs")
+    if n == 1:
+        return list(ctxs)
+    order = sorted(
+        range(len(ctxs)),
+        key=lambda k: (-weights[k], ctxs[k].obj_id),
+    )
+    loads = [0] * n
+    buckets: list[list[ObjectContext]] = [[] for _ in range(n)]
+    for k in order:
+        j = min(range(n), key=lambda j: (loads[j], j))
+        buckets[j].append(ctxs[k])
+        loads[j] += max(0, weights[k])
+    LOG.info(
+        "gpu LPT shard loads (pending s5 edits): %s total=%d",
+        loads,
+        sum(loads),
+    )
+    return buckets[i]
+
+
+def _gpu_shard_ctxs(
+    ctxs: list[ObjectContext],
+    cfg: dict,
+    *,
+    shard_i: int,
+    shard_n: int,
+    slice_steps: list[str] | None,
+) -> list[ObjectContext]:
+    """Apply ``--gpu-shard``: round-robin, or LPT when running ``trellis_3d``.
+
+    Env ``TRELLIS_SHARD_MODE=roundrobin`` restores legacy index-based slicing.
+
+    Objects with **zero** pending ``s5`` edits are excluded from LPT (they would
+    otherwise all tie-break onto the same shard and waste wall time scanning).
+    """
+    if shard_n <= 0:
+        return ctxs
+    mode = os.environ.get("TRELLIS_SHARD_MODE", "lpt").strip().lower()
+    use_lpt = (
+        slice_steps
+        and "trellis_3d" in slice_steps
+        and mode not in ("roundrobin", "rr", "0")
+    )
+    if use_lpt:
+        pm = build_prereq_map(cfg)
+        weights = [pending_s5_edits_count(c, pm) for c in ctxs]
+        active = [(c, w) for c, w in zip(ctxs, weights) if w > 0]
+        zeros = [c for c, w in zip(ctxs, weights) if w == 0]
+        out: list[ObjectContext] = []
+        if active:
+            act_ctxs = [t[0] for t in active]
+            act_w = [t[1] for t in active]
+            out.extend(slice_for_gpu_lpt(act_ctxs, shard_i, shard_n, act_w))
+        out.extend([c for k, c in enumerate(zeros) if k % shard_n == shard_i])
+        return out
+    return slice_for_gpu(ctxs, shard_i, shard_n)
 
 
 def _apply_obj_limit(ctxs: list[ObjectContext]) -> list[ObjectContext]:
@@ -549,7 +637,11 @@ def run_single_gpu(
                         obj_ids=_obj_ids, all_objs=args.all)
     if args.gpu_shard:
         i, n = (int(x) for x in args.gpu_shard.split("/"))
-        ctxs = slice_for_gpu(ctxs, i, n)
+        ctxs = _gpu_shard_ctxs(
+            ctxs, cfg,
+            shard_i=i, shard_n=n,
+            slice_steps=[step] if step else None,
+        )
         LOG.info("[%s] gpu shard %d/%d -> %d objects", step, i, n, len(ctxs))
     ctxs = _apply_obj_limit(ctxs)
     run_step(step, ctxs, cfg, args)
@@ -609,9 +701,16 @@ def main():
         LOG.info("--obj-ids-file: loaded %d obj_ids from %s", len(_obj_ids), args.obj_ids_file)
     ctxs = resolve_ctxs(root, cfg, shard=args.shard,
                         obj_ids=_obj_ids, all_objs=args.all)
+    _slice_steps_early: list[str] | None = None
+    if args.steps:
+        _slice_steps_early = [s.strip() for s in args.steps.split(",") if s.strip()]
     if args.gpu_shard:
         _i, _n = (int(x) for x in args.gpu_shard.split("/"))
-        ctxs = slice_for_gpu(ctxs, _i, _n)
+        ctxs = _gpu_shard_ctxs(
+            ctxs, cfg,
+            shard_i=_i, shard_n=_n,
+            slice_steps=_slice_steps_early,
+        )
         LOG.info("gpu-shard %d/%d → %d objects", _i, _n, len(ctxs))
     ctxs = _apply_obj_limit(ctxs)
     LOG.info("root=%s shard=%s objects=%d", root.root, args.shard, len(ctxs))

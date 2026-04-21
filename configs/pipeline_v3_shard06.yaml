@@ -134,7 +134,9 @@ services:
     enabled: true
     trellis_text_ckpt: /mnt/zsn/zsn_workspace/PartCraft3D/checkpoints/TRELLIS-text-xlarge
     image_edit_backend: local_diffusers
+    # FLUX: in-flight edits per FLUX server (not GPU count).
     workers_per_server: 2
+    # Trellis: subprocesses per GPU for trellis_3d (keep 1 unless VRAM allows more).
     trellis_workers_per_gpu: 1
     export_ply: false
     export_ply_for_deletion: false
