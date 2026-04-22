@@ -201,6 +201,72 @@ python -m scripts.cleaning.h3d_v1.pull_addition   --pipeline-cfg $CFG --shard $S
 exists (idempotent); it will simply hardlink the freshly rendered
 `preview_{k}.png` as `after.png` and update the promote log.
 
+### 2b.1 End-to-end mechanism (why preview backfill works on its own)
+
+What H3D_v1 actually reads for `after.png` vs `after.npz`:
+
+| Dataset file | Produced by | Source |
+|---|---|---|
+| `deletion/<shard>/<obj>/<eid>/after.png` | `promoter.promote_deletion` (pure IO) | `os.link(<edit_dir>/preview_{k}.png → .../after.png)`; `k = gates.A.vlm.best_view` |
+| `deletion/<shard>/<obj>/<eid>/after.npz` | `pull_deletion` s6b encode pool | Blender 40-view render → DINOv2 → SLAT encoder → NPZ |
+
+The two paths are **completely independent**.  The 40-view Blender
+render you see in `pull_deletion` logs (``[gpu3 R 12/437] … render ok``)
+is feeding the SLAT encoder, not drawing `after.png`.  `promoter` never
+renders anything; it only hardlinks `preview_{k}.png`.  If
+`preview_{k}.png` is missing, the promoter raises
+`FileNotFoundError: link source missing: …/preview_{k}.png` at promote
+time — not earlier.
+
+This is why the backfill can run **concurrently** with an already-in-flight
+`pull_deletion`:
+
+1. `pull_deletion --phase both` is strictly ordered
+   `render_pool → encode_pool → promote_pool`.  Only the last step reads
+   `preview_{k}.png`.  For a shard of ~4k deletions the first two pools
+   take multiple hours.
+2. `preview_del --best-view-only` writes `preview_{k}.png` under
+   `<obj>/edits_3d/<edit>/` and updates `edit_status.json.steps.s6p_del`
+   only.  It does **not** touch `after.npz`, `render.done`, or any
+   `H3D_v1/` path.
+3. Write safety:
+   * `preview_{k}.png` has exactly one writer (`preview_del`) and one
+     reader (`promoter`, hours later).
+   * `edit_status.json` has exactly one writer (`preview_del`, via
+     :func:`partcraft.pipeline_v3.status.update_step`) which takes
+     `fcntl.lockf(LOCK_EX)` on `edit_status.json.lock` and writes
+     atomically via tempfile + `os.replace`.  `pull_deletion` / the
+     promoter only **read** this file.
+4. GPU contention is the only cost: both pools fire Blender jobs.
+   `preview_del` renders 1 view per edit (≈ 2.5–5 s); `pull_deletion`
+   renders 40 (≈ 80–110 s).  Empirically `preview_del` wall-time
+   roughly doubles vs. solo run; `pull_deletion` throughput drops a
+   similar amount.  Net: both finish, correctness is unaffected.
+
+Concrete recipe to backfill a shard whose `pull_deletion` is already
+running in another tmux (shard06 at the time of writing):
+
+```bash
+# Do NOT kill the existing pull_deletion.  Open a new tmux / shell:
+SHARD=06
+CFG=configs/pipeline_v3_shard${SHARD}.yaml
+tmux new -d -s h3d_s${SHARD}_preview_del "
+  source /root/miniconda3/etc/profile.d/conda.sh
+  conda activate vinedresser3d
+  cd /mnt/zsn/zsn_workspace/PartCraft3D
+  LOG=logs/s${SHARD}_preview_backfill_\$(date +%Y%m%d_%H%M%S).log
+  python -m partcraft.pipeline_v3.run \
+    --config $CFG --shard $SHARD --all \
+    --steps preview_del --best-view-only --skip-input-check \
+    --gpus 0,1,2,3,4,5,6,7 --force 2>&1 | tee "\$LOG"
+"
+```
+
+The `pull_deletion` process does not need to be restarted.  When it
+reaches its promote stage (hours later) the `preview_{k}.png` files
+are already in place; `_hardlink_or_copy` picks them up and
+`after.png` is populated.
+
 Notes:
 
 - `--best-view-only` is **additive / non-destructive**: already-rendered
