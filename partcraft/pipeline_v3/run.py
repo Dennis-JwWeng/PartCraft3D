@@ -438,7 +438,9 @@ def run_step(
         s6p_del_run(ctxs, blender=blender, n_workers=_n_workers,
                     gpus=_gpus if _gpus else None,
                     prereq_map=prereq_map,
-                    force=args.force, logger=log)
+                    force=args.force,
+                    best_view_only=getattr(args, "best_view_only", False),
+                    logger=log)
 
     # ── gate_quality ──────────────────────────────────────────────────
     # Gate E: the VLM receives a 2-row × 5-col collage (top = before from
@@ -602,6 +604,10 @@ def dispatch_gpus(
                 cmd += ["--all"]
             if args.force:
                 cmd += ["--force"]
+            if getattr(args, "best_view_only", False):
+                cmd += ["--best-view-only"]
+            if getattr(args, "skip_input_check", False):
+                cmd += ["--skip-input-check"]
             LOG.info(
                 "  GPU %s worker %d/%d (shard %d/%d): %s",
                 gpu, w + 1, k, shard_id, total, " ".join(cmd[-6:]),
@@ -674,6 +680,13 @@ def main():
     ap.add_argument("--flux-url", dest="flux_url", default=None,
                     help="Override FLUX URL(s), comma-separated (reserved, not active).")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--best-view-only", dest="best_view_only", action="store_true",
+                    help="preview_del: render/copy only the gate_a best_view slot "
+                         "per edit (fast backfill for H3D_v1 after.png)")
+    ap.add_argument("--skip-input-check", dest="skip_input_check", action="store_true",
+                    help="bypass the global mesh/image/slat pre-flight. Use when "
+                         "running a single step that does not consume one of those "
+                         "inputs (e.g. preview_del does not read slat).")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--count-pending", action="store_true",
                     help="Print count of objects with pending work for the "
@@ -716,8 +729,9 @@ def main():
     LOG.info("root=%s shard=%s objects=%d", root.root, args.shard, len(ctxs))
 
     # Run input pre-flight check unless we are a GPU child worker
-    # (children share the same inputs already validated by the parent).
-    if not args.single_gpu:
+    # (children share the same inputs already validated by the parent),
+    # or the caller explicitly opted out via --skip-input-check.
+    if not args.single_gpu and not getattr(args, "skip_input_check", False):
         roots_for_check = DatasetRoots.from_pipeline_cfg(cfg)
         check_inputs(ctxs, roots_for_check, args.shard)
 

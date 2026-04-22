@@ -1,16 +1,29 @@
-"""Step s6p — 5-view preview renders for all edit types (pre-VLM-gate).
+"""Step s6p — canonical-view preview renders for all edit types (pre-VLM-gate).
 
 Renders preview_{0..4}.png for every non-identity edit using the same
 VIEW_INDICES cameras as the phase1 VLM overview.  These previews are
-consumed by sq3 (VLM quality gate) without needing a full 40-view render.
+consumed by sq3 (VLM quality gate) without needing a full 40-view render,
+and later by H3D_v1 ``pull_deletion``/``pull_addition`` as the source for
+``after.png``.
 
 Route by type:
-  deletion   → Blender renders after.ply (after state = object minus parts)
-  addition   → Blender renders source_del's before.ply (after state = original)
+  deletion   → Blender renders after_new.glb (after state = object minus parts)
+  addition   → copies source_del's already-rendered preview_{k}.png (addition
+               before-state = del after-state)
   mod/scl/mat/glb → TRELLIS decode+render from after.npz
 
-Output per edit: edits_3d/<edit_id>/preview_{0..4}.png
-Step key: s6p_preview
+Output per edit: ``edits_3d/<edit_id>/preview_{k}.png`` for k in target slots.
+Step key: s6p_preview (split entrypoints: ``s6p_del`` / ``s6p_flux``).
+
+Fast-path (``best_view_only=True`` in ``render_del_previews_{for_object,batch}``
+or CLI flag ``--best-view-only``): renders/copies only the single canonical
+slot picked by ``edit_status.json → gates.A.vlm.best_view`` per edit (fallback
+:data:`DEFAULT_FRONT_VIEW_INDEX`, slot 4).  Used to backfill ``after.png`` on
+shards where the pipeline's ``preview_del`` stage was skipped — the resulting
+``preview_{k}.png`` matches exactly the slot that H3D_v1 promoter hardlinks as
+``after.png`` (see ``partcraft.cleaning.h3d_v1.promoter._views_block``), so
+``pull_deletion`` → ``pull_addition`` then proceeds without any upstream
+pipeline rerun.  Runbook: ``docs/runbooks/h3d-v1-promote.md`` §2b.
 """
 from __future__ import annotations
 
@@ -74,6 +87,49 @@ def _all_previews_exist(edit_dir: Path, n: int = 5) -> bool:
     return all((edit_dir / f"preview_{i}.png").is_file() for i in range(n))
 
 
+DEFAULT_FRONT_VIEW_INDEX: int = 4  # fallback slot when gate_a.vlm.best_view unavailable
+
+
+def _best_view_slot_for_edit(
+    ctx: ObjectContext,
+    edit_id: str,
+    *,
+    default: int = DEFAULT_FRONT_VIEW_INDEX,
+) -> int:
+    """Return the canonical preview slot (0..N_VIEWS-1) for ``edit_id``.
+
+    Source of truth: ``edit_status.json -> edits[edit_id].gates.A.vlm.best_view``
+    (pipeline_v3 text_gen_gate_a).  For addition edits, Gate A is synthesised
+    from the paired deletion, so we fall back to the paired ``del_*``'s
+    best_view.  Final fallback is ``default`` (front view = 4).
+
+    Keeps the same resolution order used by
+    ``partcraft.cleaning.h3d_v1.promoter._views_block`` so single-view
+    previews land at the exact slot H3D_v1 later hardlinks as ``after.png``.
+    """
+    from .edit_status_io import load_edit_status
+
+    def _pick(eid: str) -> int | None:
+        es = load_edit_status(ctx)
+        e = (es.get("edits") or {}).get(eid) or {}
+        ga = (e.get("gates") or {}).get("A")
+        vlm = ga.get("vlm") if isinstance(ga, dict) else None
+        bv = vlm.get("best_view") if isinstance(vlm, dict) else None
+        if isinstance(bv, int) and 0 <= bv < len(VIEW_INDICES):
+            return int(bv)
+        return None
+
+    k = _pick(edit_id)
+    if k is None and edit_id.startswith("add_"):
+        k = _pick("del_" + edit_id[4:])
+    return k if k is not None else int(default)
+
+
+def _slot_previews_exist(edit_dir: Path, slots: list[int]) -> bool:
+    """Return True iff every ``preview_{k}.png`` for k in ``slots`` exists."""
+    return bool(slots) and all((edit_dir / f"preview_{k}.png").is_file() for k in slots)
+
+
 def _write_preview_images(edit_dir: Path, imgs: list[np.ndarray]) -> None:
     """Save list of BGR images as preview_{0..}.png.
 
@@ -84,6 +140,13 @@ def _write_preview_images(edit_dir: Path, imgs: list[np.ndarray]) -> None:
     import cv2 as _cv2
     for i, img in enumerate(imgs):
         _cv2.imwrite(str(edit_dir / f"preview_{i}.png"), img)
+
+
+def _write_preview_images_by_slot(edit_dir: Path, imgs_by_slot: dict[int, np.ndarray]) -> None:
+    """Save BGR images keyed by canonical slot as preview_{slot}.png."""
+    import cv2 as _cv2
+    for slot, img in imgs_by_slot.items():
+        _cv2.imwrite(str(edit_dir / f"preview_{int(slot)}.png"), img)
 
 
 def _render_ply_views(
@@ -118,18 +181,30 @@ def _render_ply_views(
     return imgs
 
 
-def _read_camera_views_from_npz(image_npz: Path) -> list[dict]:
-    """Extract yaw/pitch/radius/fov camera params for VIEW_INDICES from image NPZ.
+def _read_camera_views_from_npz(
+    image_npz: Path,
+    *,
+    slots: list[int] | None = None,
+) -> list[dict]:
+    """Extract yaw/pitch/radius/fov camera params from image NPZ.
 
-    The NPZ contains 'transforms.json' with camera frames. We extract the
-    matching VIEW_INDICES frames and convert transform_matrix to yaw/pitch/radius/fov
-    for use with encode_asset/blender_script/render.py.
+    By default returns one entry per ``VIEW_INDICES`` slot (canonical 5 views).
+    If ``slots`` is given, only those 0..N_VIEWS-1 indices are returned, in
+    the caller-supplied order.  Used by the best-view-only preview path where
+    we only need a single canonical camera per edit.
     """
     import math
     npz = np.load(str(image_npz), allow_pickle=True)
     frames = json.loads(bytes(npz["transforms.json"]))["frames"]
+    if slots is None:
+        src_slots = list(range(len(VIEW_INDICES)))
+    else:
+        src_slots = [int(s) for s in slots]
     views = []
-    for vi in VIEW_INDICES:
+    for s in src_slots:
+        if not (0 <= s < len(VIEW_INDICES)):
+            continue
+        vi = VIEW_INDICES[s]
         if vi >= len(frames):
             continue
         frame = frames[vi]
@@ -168,30 +243,41 @@ def _read_scene_normalization(image_npz: Path) -> tuple[float, list[float]] | tu
     return None, None
 
 
-def _render_glb_five_views(
+def _render_glb_views(
     glb_path: Path,
     image_npz: Path,
     encode_script: str,
     blender: str,
     resolution: int,
     *,
+    view_slots: list[int] | None = None,
     force_cpu: bool = False,
     cuda_device: str | None = None,
-) -> list[np.ndarray]:
-    """Render GLB at VIEW_INDICES cameras using encode_asset Cycles renderer.
+) -> dict[int, np.ndarray]:
+    """Render GLB at a subset of VIEW_INDICES cameras.
+
+    ``view_slots`` is a list of canonical slot indices (0..N_VIEWS-1).  None
+    means "all N_VIEWS canonical slots" (legacy behaviour).  Returns a mapping
+    ``{slot: BGR_image}`` so callers can write directly to ``preview_{slot}.png``.
 
     Uses the *same* normalization (scale + offset) that was applied when the
     original object was pre-rendered, so deleted-part renders appear at the
     correct apparent size instead of being zoomed-in to the remaining bbox.
-    Returns list of BGR numpy arrays (cv2 convention) composited onto white.
     """
     import subprocess
     import cv2 as _cv2
 
-    views = _read_camera_views_from_npz(image_npz)
-    if len(views) != len(VIEW_INDICES):
+    if view_slots is None:
+        slots = list(range(len(VIEW_INDICES)))
+    else:
+        slots = [int(s) for s in view_slots if 0 <= int(s) < len(VIEW_INDICES)]
+        if not slots:
+            raise RuntimeError(f"no valid view_slots in {view_slots!r}")
+
+    views = _read_camera_views_from_npz(image_npz, slots=slots)
+    if len(views) != len(slots):
         raise RuntimeError(
-            f"Expected {len(VIEW_INDICES)} camera views, got {len(views)}"
+            f"Expected {len(slots)} camera views, got {len(views)}"
         )
 
     norm_scale, norm_offset = _read_scene_normalization(image_npz)
@@ -223,8 +309,8 @@ def _render_glb_five_views(
                 f"encode_asset Blender failed:\n{result.stderr[-400:]}"
             )
 
-        imgs = []
-        for i in range(len(VIEW_INDICES)):
+        out: dict[int, np.ndarray] = {}
+        for i, slot in enumerate(slots):
             png = tmp_path / f"{i:03d}.png"
             if not png.is_file():
                 raise RuntimeError(f"Missing render output: {png}")
@@ -235,8 +321,27 @@ def _render_glb_five_views(
                 (g_ch * a + (1 - a)) * 255,
                 (b_ch * a + (1 - a)) * 255,
             ], axis=-1).clip(0, 255).astype(np.uint8)
-            imgs.append(_cv2.cvtColor(rgb, _cv2.COLOR_RGB2BGR))
-        return imgs
+            out[slot] = _cv2.cvtColor(rgb, _cv2.COLOR_RGB2BGR)
+        return out
+
+
+def _render_glb_five_views(
+    glb_path: Path,
+    image_npz: Path,
+    encode_script: str,
+    blender: str,
+    resolution: int,
+    *,
+    force_cpu: bool = False,
+    cuda_device: str | None = None,
+) -> list[np.ndarray]:
+    """Legacy 5-view wrapper returning a list aligned with VIEW_INDICES."""
+    out = _render_glb_views(
+        glb_path, image_npz, encode_script, blender, resolution,
+        view_slots=list(range(len(VIEW_INDICES))),
+        force_cpu=force_cpu, cuda_device=cuda_device,
+    )
+    return [out[k] for k in range(len(VIEW_INDICES))]
 
 
 def _render_trellis_five_views(
@@ -498,13 +603,19 @@ def render_del_previews_for_object(
     force: bool = False,
     cuda_device: str | None = None,
     progress_bar=None,
+    best_view_only: bool = False,
     logger: logging.Logger | None = None,
 ) -> PreviewResult:
-    """Render preview_{0..4}.png for deletion and addition edits only.
+    """Render preview_{k}.png for deletion and addition edits only.
 
     Step key: s6p_del.  CPU/Blender only — no TRELLIS pipeline needed.
     Deletion: renders after_new.glb (or after.ply fallback) via Blender.
     Addition: copies source deletion's preview_*.png (no Blender call).
+
+    ``best_view_only=True`` renders / copies only the single canonical slot
+    picked by gate_a.vlm.best_view (fallback DEFAULT_FRONT_VIEW_INDEX) per
+    edit.  This cuts Blender cost ~5x and is enough for H3D_v1 promotion,
+    which only hardlinks ``preview_{best_view_index}.png``.
     """
     log = logger or logging.getLogger("pipeline_v3.s6p_del")
     res = PreviewResult(obj_id=ctx.obj_id)
@@ -556,16 +667,39 @@ def render_del_previews_for_object(
             log.warning("[s6p_del] del %s: both after.ply and after_new.glb missing", spec.edit_id)
             res.n_fail += 1
             continue
+        # Resolve target slots: single best-view in fast mode, else all 5.
+        if best_view_only:
+            k = _best_view_slot_for_edit(ctx, spec.edit_id)
+            target_slots = [k]
+        else:
+            target_slots = list(range(len(VIEW_INDICES)))
+        # Re-check skip with slot-precise existence for fast mode.
+        if (
+            best_view_only
+            and prereq_map is None
+            and not force
+            and _slot_previews_exist(edit_dir, target_slots)
+        ):
+            res.n_skip += 1
+            if progress_bar is not None:
+                progress_bar.update(1)
+            continue
         try:
             if after_glb.is_file():
-                imgs = _render_glb_five_views(
+                imgs_by_slot = _render_glb_views(
                     after_glb, ctx.image_npz, _encode_asset_script(),
                     blender, resolution,
+                    view_slots=target_slots,
                     cuda_device=cuda_device,
                 )
+                _write_preview_images_by_slot(edit_dir, imgs_by_slot)
             else:
-                imgs = _render_ply_views(a_ply, frames, blender, resolution, samples=32)
-            _write_preview_images(edit_dir, imgs)
+                # PLY fallback renders the exact camera frames we ask for.
+                sub_frames = [frames[k] for k in target_slots]
+                imgs = _render_ply_views(a_ply, sub_frames, blender, resolution, samples=32)
+                _write_preview_images_by_slot(
+                    edit_dir, {k: img for k, img in zip(target_slots, imgs)}
+                )
             res.n_ok += 1
             update_edit_stage(ctx, spec.edit_id, spec.edit_type, "s6p", status="done")
         except Exception as e:
@@ -598,11 +732,23 @@ def render_del_previews_for_object(
             res.n_fail += 1
             continue
         del_dir = ctx.edit_3d_dir(source_del_id)
-        del_previews = sorted(del_dir.glob("preview_*.png"))
-        if not del_previews:
-            log.warning("[s6p_del] add %s: del %s has no preview_*.png yet", add_id, source_del_id)
-            res.n_fail += 1
-            continue
+        if best_view_only:
+            k_add = _best_view_slot_for_edit(ctx, add_id)
+            src_png = del_dir / f"preview_{k_add}.png"
+            if not src_png.is_file():
+                log.warning(
+                    "[s6p_del] add %s: del %s missing preview_%d.png (best-view-only)",
+                    add_id, source_del_id, k_add,
+                )
+                res.n_fail += 1
+                continue
+            del_previews = [src_png]
+        else:
+            del_previews = sorted(del_dir.glob("preview_*.png"))
+            if not del_previews:
+                log.warning("[s6p_del] add %s: del %s has no preview_*.png yet", add_id, source_del_id)
+                res.n_fail += 1
+                continue
         try:
             for src in del_previews:
                 shutil.copy2(src, add_dir / src.name)
@@ -720,9 +866,15 @@ def render_del_previews_batch(
     force: bool = False,
     n_workers: int = 8,
     gpus: list[int] | None = None,
+    best_view_only: bool = False,
     logger: logging.Logger | None = None,
 ) -> list[PreviewResult]:
     """Batch entry for s6p_del (deletion + addition preview, GPU/Blender).
+
+    ``best_view_only=True`` renders only one canonical view per edit (gate_a
+    ``best_view``, fallback front = slot 4).  This is the fast path used to
+    backfill ``after.png`` on shards where the pipeline preview stage was
+    skipped.
 
     GPU binding strategy (when ``gpus`` is provided):
     - n_workers is overridden to len(gpus): one worker thread per GPU.
@@ -751,7 +903,8 @@ def render_del_previews_batch(
         effective_workers = n_workers
         pool_kwargs = {"max_workers": effective_workers}
 
-    log.info("[s6p_del] n_workers=%d  gpus=%s", effective_workers, gpus)
+    log.info("[s6p_del] n_workers=%d  gpus=%s  best_view_only=%s",
+             effective_workers, gpus, best_view_only)
 
     ctx_list = list(ctxs)
     from .specs import iter_deletion_specs as _iter_del_specs_outer
@@ -772,15 +925,25 @@ def render_del_previews_batch(
             if is_gate_a_failed(ctx, spec.edit_id):
                 continue
             edit_dir = ctx.edit_3d_dir(spec.edit_id)
-            if _all_previews_exist(edit_dir) and not force:
-                continue
+            if not force:
+                if best_view_only:
+                    k = _best_view_slot_for_edit(ctx, spec.edit_id)
+                    if _slot_previews_exist(edit_dir, [k]):
+                        continue
+                elif _all_previews_exist(edit_dir):
+                    continue
             count += 1
         for add_id, _ in _iter_addition_edits(ctx):
             if is_gate_a_failed(ctx, add_id):
                 continue
             add_dir = ctx.edit_3d_dir(add_id)
-            if _all_previews_exist(add_dir) and not force:
-                continue
+            if not force:
+                if best_view_only:
+                    k = _best_view_slot_for_edit(ctx, add_id)
+                    if _slot_previews_exist(add_dir, [k]):
+                        continue
+                elif _all_previews_exist(add_dir):
+                    continue
             count += 1
         return count
 
@@ -805,7 +968,9 @@ def render_del_previews_batch(
             cuda_device=getattr(_thread_local, "cuda_device", None),
             progress_bar=_bar,
             prereq_map=prereq_map,
-            force=force, logger=log,
+            force=force,
+            best_view_only=best_view_only,
+            logger=log,
         )
         with _bar_lock:
             _n_ok   += res.n_ok

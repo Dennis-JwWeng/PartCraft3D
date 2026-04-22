@@ -6,6 +6,29 @@
 
 ---
 
+## 2026-04-22 — pipeline_v3 `preview_del`：新增 `--best-view-only` 单视角回补
+
+**背景**：shard05 跑完整条 v3 pipeline 后发现 `edits_3d/del_*/` 里只有 `after.npz` / `after_new.glb`，没有 `preview_*.png`（上游 `preview_del` 阶段被漏掉）。`pull_deletion` 仍能入库 NPZ，但 H3D_v1 `deletion/.../after.png` 因缺少 pipeline `preview_{k}.png` 源一直为空，后续 `pull_addition` 全部 `skip=pair_after_image_missing`，`promoted=0`。
+
+**决策**：不回跑上游整条 pipeline，也不做 `pull_deletion` 40 视角渲染结果的角度匹配 fallback；直接给 `preview_del` 加一个**单视角快速回补路径**。H3D_v1 promoter 本来就只 hardlink 一张 `preview_{best_view_index}.png`（见 `partcraft.cleaning.h3d_v1.promoter._views_block`），渲 5 张是纯浪费。
+
+**变更**：
+
+- **`partcraft/pipeline_v3/preview_render.py`**
+  - 新增 `DEFAULT_FRONT_VIEW_INDEX = 4` 与 `_best_view_slot_for_edit(ctx, edit_id)`：按 del → paired del（针对 addition）→ 默认槽 4 的顺序解析 `edit_status.json → gates.A.vlm.best_view`，与 promoter 侧逻辑完全一致。
+  - `_read_camera_views_from_npz(…, slots=…)` 支持子集槽位读取；新增 `_render_glb_views(…, view_slots=…)` 返回 `{slot: BGR_img}`；旧 `_render_glb_five_views` 改为薄 wrapper 保持向后兼容。
+  - `_write_preview_images_by_slot(edit_dir, imgs_by_slot)` 按槽位写 `preview_{slot}.png`；`_slot_previews_exist(edit_dir, slots)` 做 slot-precise skip。
+  - `render_del_previews_for_object(…, best_view_only=False)` 与 `render_del_previews_batch(…, best_view_only=False)`：True 时 deletion 只渲 1 张 best view，addition 只复制 paired del 的这 1 张；False 时行为与旧实现字节等价。`_count_pending_edits` 也按 slot-precise 计数。
+- **`partcraft/pipeline_v3/run.py`**：新增 CLI `--best-view-only`，在 `preview_del` 分支透传；多 GPU 子进程 `spawn` 同步带上该 flag。
+- **`tests/test_preview_best_view_only.py`**：新增 6 条 unit test 覆盖 best_view 解析（正常 / 缺失 / 越界 / addition 镜像 / addition 无 paired）与 slot 存在性，全部通过，`tests.test_pipeline_v3_hooks` 27/27 无回归。
+- **文档**：`docs/runbooks/h3d-v1-promote.md` 新增 §2b「Backfill `preview_{k}.png` on shards that skipped `preview_del`」，含命令、耗时估算、两条 troubleshooting 行；`preview_render.py` 模块 docstring 说明 fast-path 语义。
+
+**验证**：shard05 单 obj `5dd321dc17774aeb830876bbb588d188`（2 deletion + 2 addition）上跑：`del_000 best_view=3` → `preview_3.png`，`del_001 best_view=0` → `preview_0.png`，对应 addition 镜像拷贝。侧视对比 `image_npz` 同一槽位的原物体渲染，相机角度 + `normalize_scene(scale, offset)` 一致，保留部分尺寸/位置不会被 re-normalize 拉近。单 GPU 约 2.5–5 s/edit，8 GPU 全 shard05（~3223 条 del）≈ 17 min。
+
+**默认行为**：未传 `--best-view-only` 时 `preview_del` 路径与旧实现完全一致（5 张）。已跑完 5 视角的 shard（06/07/08）不受影响。
+
+---
+
 ## 2026-04-21 — pipeline_v3：ckpt 根目录与 Trellis worker 配置对齐
 
 **背景**：`load_config()` 只认环境变量 **`PARTCRAFT_CKPT_ROOT`** 作为权重根覆盖；machine env 长期只写 **`TRELLIS_CKPT_ROOT`**，二者未同步时易出现 Trellis 权重路径不符合预期。另 aibox 上 `trellis_workers_per_gpu: 2` 会每 GPU fork 两个 worker，NFS 冷读权重时压力大。

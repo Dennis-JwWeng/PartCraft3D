@@ -155,6 +155,64 @@ Workers write `<edit_dir>/after.npz` directly; the parent re-enumerates
 ready edits after the encode pool finishes, so a partial encode failure
 in one worker does not block promotion of the rest of the shard.
 
+## 2b. Backfill `preview_{k}.png` on shards that skipped `preview_del`
+
+> Applies to shards whose pipeline run never executed the `preview_del`
+> stage (discovered on shard05: every `edits_3d/del_*/` had `after.npz`
+> and `after_new.glb` but **no** `preview_*.png`).  `pull_deletion` will
+> still promote the SLAT NPZ, but H3D_v1 `deletion/<shard>/<obj>/<eid>/
+> after.png` stays missing because the promoter hardlinks from the
+> pipeline's `preview_{k}.png`.  That in turn makes every paired
+> addition `skip=pair_after_image_missing`, so `pull_addition` finishes
+> with `promoted=0`.
+
+**Fast fix — render only the single best_view per edit.**  H3D_v1 only
+ever reads one preview (`preview_{best_view_index}.png`), so rendering
+all five canonical slots is wasted work.  The pipeline_v3 `preview_del`
+stage accepts `--best-view-only`, which picks the slot per edit from
+`edit_status.json → gates.A.vlm.best_view` (fallback slot 4,
+``DEFAULT_FRONT_VIEW_INDEX``) and produces exactly one file per edit.
+
+```bash
+SHARD=05
+CFG=configs/pipeline_v3_shard${SHARD}.yaml
+
+# vinedresser3d env — the Blender path is resolved from the shard yaml.
+python -m partcraft.pipeline_v3.run   --config $CFG --shard $SHARD --all   --steps preview_del --best-view-only   --gpus 0,1,2,3,4,5,6,7 --force
+```
+
+Throughput on an 8×L20X box: ≈ 2.5–5 s/edit per GPU →  ~17 min for a
+3000-edit shard.  Addition entries are handled in the same run —
+`preview_del` copies the paired deletion's single `preview_{k}.png`
+into each `add_*/` dir (both sides of an add/del pair always share
+best_view via `_views_block`).
+
+After this completes, rerun the normal §2 sequence:
+
+```bash
+PARTCRAFT_CKPT_ROOT=$PWD/checkpoints python -m scripts.cleaning.h3d_v1.pull_deletion   --pipeline-cfg $CFG --shard $SHARD --dataset-root data/H3D_v1   --gpu-ids 0,1,2,3,4,5,6,7 --workers 8
+
+python -m scripts.cleaning.h3d_v1.pull_flux   --pipeline-cfg $CFG --shard $SHARD --dataset-root data/H3D_v1 --workers 8
+
+python -m scripts.cleaning.h3d_v1.pull_addition   --pipeline-cfg $CFG --shard $SHARD --dataset-root data/H3D_v1 --workers 8
+```
+
+`pull_deletion` is a no-op for NPZ re-encode if `after.npz` already
+exists (idempotent); it will simply hardlink the freshly rendered
+`preview_{k}.png` as `after.png` and update the promote log.
+
+Notes:
+
+- `--best-view-only` is **additive / non-destructive**: already-rendered
+  5-view previews are left alone on other shards.  The skip check uses
+  per-slot existence, so a future full `preview_del` run on a
+  best-view-only shard will top up the missing 4 slots without
+  re-rendering the best slot.
+- `preview_del` step status in `edit_status.json` is marked `done` on
+  success; drop `--force` if you later only want to pick up new edits.
+- Implementation: `partcraft/pipeline_v3/preview_render.py`
+  (`render_del_previews_batch(..., best_view_only=True)`).
+
 ## 3. Wet promote — multi-machine, multi-GPU
 
 Each shard is independent; assign each shard to one machine. Within a
@@ -255,3 +313,5 @@ manifest JSONLs back in sync with the per-edit ``meta.json`` files.
 | `--skip-encode and --phase are mutually exclusive` | Both flags passed together | Use `--phase both --skip-encode` (equivalent to old `--skip-encode` alone) or drop one |
 | `missing_staged_render` skip reason in summary | `--phase encode` ran but render artifacts absent | Run `--phase render` first with the same `--encode-work-dir`, then re-run `--phase encode` |
 | `render.done missing` in encode worker log | Individual edit's render failed or staging deleted | Rerun `--phase render` (idempotent; already-staged edits are skipped) |
+| `pull_addition --dry-run` reports `skip=pair_after_image_missing` for most adds | Shard's pipeline run skipped the `preview_del` stage, so `deletion/<shard>/<obj>/<eid>/after.png` never populated | Run `preview_del --best-view-only` for that shard (see §2b), then rerun `pull_deletion` + `pull_addition` |
+| `gate_a.vlm.best_view` absent and `--best-view-only` falls back everywhere | VLM gate_a never wrote `best_view` (rare) | Single-view render uses :data:`partcraft.pipeline_v3.preview_render.DEFAULT_FRONT_VIEW_INDEX` (slot 4); check pipeline_v3 VLM log if this is widespread |
