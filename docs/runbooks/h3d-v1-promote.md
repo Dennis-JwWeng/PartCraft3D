@@ -243,6 +243,41 @@ This is why the backfill can run **concurrently** with an already-in-flight
    roughly doubles vs. solo run; `pull_deletion` throughput drops a
    similar amount.  Net: both finish, correctness is unaffected.
 
+### 2b.2 Why best-view-only is not 5× faster than full 5-view
+
+`_render_glb_views` spawns a **fresh Blender subprocess per edit**
+(`subprocess.run([blender, "-b", "-P", encode_script, ...])`).  Cold
+start dominates per-edit wall time; the actual Cycles render of 1 vs 5
+views is a small fraction:
+
+| Stage                                    | ~time  | % of 3.5 s |
+|------------------------------------------|--------|-----------:|
+| Blender interpreter boot + addon / scene init | 1.8 s  | ~52% |
+| CUDA / Cycles device init                | 0.5 s  | ~14% |
+| GLB import + normalization               | 0.3 s  |  ~9% |
+| 1 view Cycles render                     | 0.4 s  | ~11% |
+| PNG encode + subprocess teardown + Python IO | 0.5 s | ~14% |
+
+So `--best-view-only` saves ≈ 2 s per edit vs a 5-view run (not ≈ 8 s),
+i.e. **roughly 1.5× speedup**, not 5×.  Observed throughput on 6–8 L20X
+workers: 1.7 edit/s, independent of whether 6 or 8 workers are used
+when the extra GPUs are already saturated by a co-tenant.
+
+Plausible next-step optimisations (not implemented):
+
+- **Batch mode**: pass N edits to a single Blender invocation via
+  `--jobs jobs.json`; amortises cold start to ≈ 0.06 s/edit.  ~3× win
+  with moderate `render.py` refactor.
+- **Blender daemon**: long-lived Blender process listening on a socket;
+  ≤ 1 s/edit, but larger refactor (stdin/socket protocol, error
+  recovery).
+- **EEVEE instead of Cycles**: shaves ~0.2 s off the render itself but
+  does not touch cold start — minor win.
+
+None of these change the mechanism in §2b.1; they only lower the
+per-edit constant factor.  Wait-times quoted elsewhere in §2b assume
+the current one-subprocess-per-edit path.
+
 Concrete recipe to backfill a shard whose `pull_deletion` is already
 running in another tmux (shard06 at the time of writing):
 
