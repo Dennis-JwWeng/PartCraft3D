@@ -111,8 +111,9 @@ after numpy is stable, avoiding the race entirely.
    Logs: `[gpu3 R 12/437] del_xxx_003 render ok (7.2s)`.
 
 2. **Encode pool** — load `ss_encoder` once per worker, then
-   DINOv2 → SLAT → SS for all staged renders.  Staging is removed on
-   success unless `--keep-staging` is set.
+   DINOv2 → SLAT → SS for all staged renders.  Staging under
+   `<encode-work-dir>/<name>/` is always kept after a successful encode
+   (remove manually if you need disk).
    Logs: `[gpu3 E 12/437] del_xxx_003 encode ok (0.9s)`.
 
 **`--phase` flag** lets you run the two pools independently:
@@ -145,9 +146,8 @@ Practical knobs:
   the legacy flag still works but prints a deprecation warning).
 - `--encode-work-dir <path>` — staging root; render artifacts land in
   `<path>/<shard>_<obj>_<edit>/`. Put this on the same FS as the pipeline
-  output to keep IO local.
-- `--keep-staging` — keep render artifacts after successful encode (default:
-  removed to reclaim disk; ~40 MB per edit × 1108 = ~43 GiB for shard08).
+  output to keep IO local. These directories are not auto-deleted after
+  encode (~40 MB per edit × N adds up; prune old shards by hand when safe).
 - `--skip-encode` — skip s6b entirely (dry-run / CPU-only accounting).
   Mutually exclusive with `--phase`.
 

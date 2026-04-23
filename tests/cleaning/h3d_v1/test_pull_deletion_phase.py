@@ -120,7 +120,7 @@ def test_render_worker_skips_already_staged(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# _encode_worker: skips edits without render.done, calls encode, deletes staging
+# _encode_worker: skips edits without render.done; keeps staging after encode
 # ---------------------------------------------------------------------------
 
 def test_encode_worker_skips_missing_done_marker(tmp_path):
@@ -130,14 +130,14 @@ def test_encode_worker_skips_missing_done_marker(tmp_path):
     with patch(
         "scripts.cleaning.h3d_v1.pull_deletion._maybe_load_encoder", return_value=MagicMock()
     ), patch("scripts.tools.migrate_slat_to_npz._encode_from_render_dir"):
-        ok, fail = _encode_worker(0, [edit], tmp_path / "ckpt", work_root, 4, False)
+        ok, fail = _encode_worker(0, [edit], tmp_path / "ckpt", work_root, 4)
 
     assert ok == 0
     assert fail == 1
     assert not (edit.edit_dir / "after.npz").is_file()
 
 
-def test_encode_worker_writes_npz_and_removes_staging(tmp_path):
+def test_encode_worker_writes_npz_and_preserves_staging(tmp_path):
     import numpy as np
 
     edit = _fake_edit(tmp_path, "08", "obj5", "del_obj5_000")
@@ -157,38 +157,12 @@ def test_encode_worker_writes_npz_and_removes_staging(tmp_path):
         "scripts.cleaning.h3d_v1.pull_deletion._maybe_load_encoder",
         return_value=MagicMock(),
     ), patch.object(msnpz_mod, "_encode_from_render_dir", return_value=fake_payload):
-        ok, fail = _encode_worker(0, [edit], tmp_path / "ckpt", work_root, 4, keep_staging=False)
+        ok, fail = _encode_worker(0, [edit], tmp_path / "ckpt", work_root, 4)
 
     assert ok == 1
     assert fail == 0
     assert (edit.edit_dir / "after.npz").is_file()
-    assert not stage_dir.exists(), "staging dir should be removed after successful encode"
-
-
-def test_encode_worker_keeps_staging_when_flag_set(tmp_path):
-    import numpy as np
-
-    edit = _fake_edit(tmp_path, "08", "obj6", "del_obj6_000")
-    work_root = tmp_path / "staging"
-    stage_dir = work_root / _edit_name(edit)
-    stage_dir.mkdir(parents=True)
-    (stage_dir / "render.done").touch()
-
-    fake_payload = {
-        "slat_feats": np.zeros((2, 4), dtype=np.float32),
-        "slat_coords": np.zeros((2, 4), dtype=np.int32),
-        "ss": np.zeros((4, 8, 8, 8), dtype=np.float32),
-    }
-
-    import scripts.tools.migrate_slat_to_npz as msnpz_mod
-    with patch(
-        "scripts.cleaning.h3d_v1.pull_deletion._maybe_load_encoder",
-        return_value=MagicMock(),
-    ), patch.object(msnpz_mod, "_encode_from_render_dir", return_value=fake_payload):
-        ok, fail = _encode_worker(0, [edit], tmp_path / "ckpt", work_root, 4, keep_staging=True)
-
-    assert ok == 1
-    assert stage_dir.exists(), "staging dir must be preserved when --keep-staging"
+    assert stage_dir.exists(), "staging dir must be preserved after successful encode"
 
 
 # ---------------------------------------------------------------------------
@@ -248,26 +222,6 @@ def test_phase_render_default_args():
     ):
         args = _parse_args()
         assert args.phase == "render"
-        assert args.keep_staging is False
-
-
-def test_phase_encode_keep_staging():
-    from scripts.cleaning.h3d_v1.pull_deletion import _parse_args
-
-    with patch(
-        "sys.argv",
-        [
-            "pull_deletion",
-            "--pipeline-cfg", "cfg.yaml",
-            "--shard", "08",
-            "--dataset-root", "data/H3D_v1",
-            "--phase", "encode",
-            "--keep-staging",
-        ],
-    ):
-        args = _parse_args()
-        assert args.phase == "encode"
-        assert args.keep_staging is True
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +265,7 @@ def test_run_encode_pool_uses_fork(tmp_path):
         mock_mp.get_context.return_value = mock_ctx
 
         _run_encode_pool(
-            [edit], [0], tmp_path / "ckpt", tmp_path / "staging", 4, False, stats
+            [edit], [0], tmp_path / "ckpt", tmp_path / "staging", 4, stats
         )
 
         mock_mp.get_context.assert_called_once_with("fork")

@@ -28,6 +28,9 @@ End-to-end per shard:
    b. **encode pool** (``--phase encode`` or ``both``): load
       ``ss_encoder`` once per GPU, then DINOv2 → SLAT → SS for every
       staged edit, writing ``after.npz`` to the pipeline edit dir.
+      Render artifacts under ``<encode-work-dir>/<name>/`` are always
+      left in place after a successful encode (delete manually if you
+      need disk).
 
    Both pools use ``fork`` (CUDA-safe because the parent never inits
    CUDA), which avoids the numpy-in-spawn race seen on earlier runs.
@@ -55,7 +58,6 @@ import argparse
 import logging
 import multiprocessing as mp
 import os
-import shutil
 import sys
 import time
 from pathlib import Path
@@ -116,9 +118,6 @@ def _add_encode_args(ap: argparse.ArgumentParser) -> None:
                         "'encode': SLAT/SS encode from already-staged renders, then promote. "
                         "'both' (default): render → encode → promote."
                     ))
-    ap.add_argument("--keep-staging", action="store_true",
-                    help="Keep encode-work-dir/<name>/ render artifacts after successful "
-                         "encode (default: delete to reclaim disk).")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -277,13 +276,12 @@ def _encode_worker(
     ckpt_root: Path,
     work_root: Path,
     num_views: int,
-    keep_staging: bool,
 ) -> tuple[int, int]:
     """Fork child: DINO/SLAT/SS encode from pre-staged render artifacts.
 
     Expects ``<work_root>/<name>/render.done`` for each edit.
     Loads ``ss_encoder`` once, streams the bucket, writes ``after.npz``.
-    Removes staging dir on success unless ``keep_staging`` is True.
+    Staging dirs under ``work_root`` are left intact after success.
 
     Returns (encode_ok, encode_fail).
     """
@@ -326,8 +324,6 @@ def _encode_worker(
             ok_c += 1
             log.info("[gpu%s E %d/%d] %s encode ok (%.1fs)",
                      gpu_id, j, len(edits), edit.edit_id, time.time() - t0)
-            if not keep_staging and work_dir.is_dir():
-                shutil.rmtree(work_dir, ignore_errors=True)
         except Exception as exc:  # noqa: BLE001
             fail_c += 1
             log.warning("[gpu%s E %d/%d] %s encode FAILED: %s",
@@ -372,7 +368,6 @@ def _run_encode_pool(
     ckpt_root: Path,
     work_dir: Path,
     num_views: int,
-    keep_staging: bool,
     stats,
 ) -> None:
     """Launch fork pool for encode phase. Updates stats in place."""
@@ -382,7 +377,7 @@ def _run_encode_pool(
     LOG.info("encode: %d edits across %d workers (GPU ids %s, %d non-empty partitions)",
              len(staged), n_workers, gpu_ids, len(pairs))
     t0 = time.time()
-    tasks = [(gid, bucket, ckpt_root, work_dir, num_views, keep_staging)
+    tasks = [(gid, bucket, ckpt_root, work_dir, num_views)
              for gid, bucket in pairs]
     mp_ctx = mp.get_context("fork")
     with mp_ctx.Pool(processes=len(pairs)) as pool:
@@ -476,7 +471,7 @@ def main() -> int:
         if staged:
             _run_encode_pool(
                 staged, gpu_ids, args.ckpt_root, args.encode_work_dir,
-                args.num_views, args.keep_staging, stats,
+                args.num_views, stats,
             )
 
         ready = [e for e in edits if (e.edit_dir / "after.npz").is_file()]
