@@ -71,7 +71,7 @@ def available_pipeline_shards(out_root: Path) -> set[str]:
     }
 
 
-def iter_default_val_test_candidates(repo: Path) -> tuple[list[dict], Counter[str], MissingRequirements]:
+def iter_default_val_test_candidates(repo: Path, include_shards: set[str] | None = None) -> tuple[list[dict], Counter[str], MissingRequirements]:
     out_root = repo / "outputs/partverse"
     h3d_root = repo / "data/H3D_v1"
     manifest = h3d_root / "manifests/all.jsonl"
@@ -98,6 +98,9 @@ def iter_default_val_test_candidates(repo: Path) -> tuple[list[dict], Counter[st
                 continue
             if edit_type not in EDIT_TYPES or not obj_id or not edit_id:
                 reject["bad_record"] += 1
+                continue
+            if include_shards is not None and shard not in include_shards:
+                reject["not_requested_shard"] += 1
                 continue
             if shard not in shard_set:
                 reject["no_pipeline_shard_dir"] += 1
@@ -239,12 +242,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=DEFAULT_REPO)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
+    parser.add_argument(
+        "--shards",
+        nargs="*",
+        default=None,
+        help="Optional shard ids to include, e.g. --shards 00 or --shards 00 01 03.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    records, reject, missing = iter_default_val_test_candidates(args.repo)
+    include_shards = set(args.shards) if args.shards is not None else None
+    records, reject, missing = iter_default_val_test_candidates(args.repo, include_shards=include_shards)
     outputs = write_outputs(args.out_dir, records, reject, missing)
     print(f"wrote {outputs.manifest_path}")
     print(f"wrote {outputs.edit_ids_path}")

@@ -93,3 +93,27 @@ def test_write_outputs_records_summary_and_missing_lists(tmp_path):
     assert outputs.edit_ids_path.read_text(encoding="utf-8") == "del_obj_val_000\n"
     assert "default val+test" in outputs.summary_path.read_text(encoding="utf-8")
     assert (tmp_path / "missing/shard03_missing_obj_ids.txt").read_text(encoding="utf-8") == "obj_missing\n"
+
+
+def test_default_val_test_manifest_can_filter_to_requested_shards(tmp_path):
+    repo = tmp_path
+    split_dir = repo / "H3D_v1_hf/data/splits"
+    split_dir.mkdir(parents=True)
+    (split_dir / "train.obj_ids.txt").write_text("", encoding="utf-8")
+    (split_dir / "val.obj_ids.txt").write_text("obj_02\nobj_03\n", encoding="utf-8")
+    (split_dir / "test.obj_ids.txt").write_text("", encoding="utf-8")
+
+    rows = [
+        {"edit_id": "add_obj_02_000", "edit_type": "addition", "obj_id": "obj_02", "shard": "02"},
+        {"edit_id": "add_obj_03_000", "edit_type": "addition", "obj_id": "obj_03", "shard": "03"},
+    ]
+    _write_jsonl(repo / "data/H3D_v1/manifests/all.jsonl", rows)
+    for row in rows:
+        _touch_assets(repo, row["edit_type"], row["shard"], row["obj_id"], row["edit_id"])
+        _touch_pipeline(repo, row["shard"], row["obj_id"], row["edit_id"])
+
+    records, reject, missing = builder.iter_default_val_test_candidates(repo, include_shards={"03"})
+
+    assert [record["edit_id"] for record in records] == ["add_obj_03_000"]
+    assert reject["not_requested_shard"] == 1
+    assert missing.by_shard_edit_count == {}

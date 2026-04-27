@@ -117,3 +117,138 @@ PYIDS
 ```
 
 Keep the exported `review_results_*.json` files next to the final id list so rejected and uncertain cases remain auditable.
+
+
+## Remote Shard Packaging And Upload
+
+Use this section on machines that have the missing pipeline shard outputs. Package each missing shard separately so uploads do not overwrite the already uploaded `assets/h3d_test_review_000_assets.zip` through `assets/h3d_test_review_038_assets.zip`.
+
+Current missing default `val ∪ test` worklist:
+
+| shard | objects | edits | object id list | edit id list |
+|---|---:|---:|---|---|
+| 00 | 57 | 485 | `bench_review/default_val_test_available/missing/shard00_missing_obj_ids.txt` | `bench_review/default_val_test_available/missing/shard00_missing_edit_ids.txt` |
+| 01 | 53 | 544 | `bench_review/default_val_test_available/missing/shard01_missing_obj_ids.txt` | `bench_review/default_val_test_available/missing/shard01_missing_edit_ids.txt` |
+| 03 | 63 | 473 | `bench_review/default_val_test_available/missing/shard03_missing_obj_ids.txt` | `bench_review/default_val_test_available/missing/shard03_missing_edit_ids.txt` |
+
+### Required Data On The Remote Machine
+
+The remote machine must have the same logical workspace layout, or equivalent symlinks, for:
+
+- `data/H3D_v1/manifests/all.jsonl`
+- `data/H3D_v1/<edit_type>/<shard>/<obj_id>/<edit_id>/{before.png,after.png,before.npz,after.npz,meta.json}`
+- `H3D_v1_hf/data/splits/{train,val,test}.obj_ids.txt`
+- `outputs/partverse/shardXX/mode_e_text_align/objects/XX/<obj_id>/edits_3d/<edit_id>/`
+- For flux edit types (`modification`, `scale`, `material`, `color`, `global`): `outputs/partverse/shardXX/mode_e_text_align/objects/XX/<obj_id>/edits_2d/<edit_id>_input.png` and `<edit_id>_edited.png`
+
+`addition` and `deletion` do not need `edits_2d` images. If the machine only has one target shard, that is fine; use `--shards` to force the manifest builder to include only that shard.
+
+### Build One Shard Package
+
+Set the shard id and build the review manifest:
+
+```bash
+cd /mnt/zsn/zsn_workspace/PartCraft3D
+export SHARD=00  # use 00, 01, or 03
+
+python bench_review/build_default_val_test_review_manifest.py \
+  --repo /mnt/zsn/zsn_workspace/PartCraft3D \
+  --out-dir /mnt/zsn/zsn_workspace/PartCraft3D/bench_review/default_val_test_available_shard${SHARD} \
+  --shards ${SHARD}
+```
+
+Check `summary.md` in the output directory. The `Total available records` should match the shard's expected edit count when all required pipeline outputs are present:
+
+- `SHARD=00`: 485 edits
+- `SHARD=01`: 544 edits
+- `SHARD=03`: 473 edits
+
+Then build chunked review ZIPs:
+
+```bash
+python bench_review/build_zip_review.py \
+  --manifest /mnt/zsn/zsn_workspace/PartCraft3D/bench_review/default_val_test_available_shard${SHARD}/h3d_default_val_test_available_manifest.jsonl \
+  --out-dir /mnt/zsn/zsn_workspace/PartCraft3D/bench_review/default_val_test_available_shard${SHARD}_zip_review \
+  --chunk-size 100 \
+  --all
+```
+
+Expected chunk counts:
+
+- `SHARD=00`: 5 chunks (`000`-`004`; last chunk 85 edits)
+- `SHARD=01`: 6 chunks (`000`-`005`; last chunk 44 edits)
+- `SHARD=03`: 5 chunks (`000`-`004`; last chunk 73 edits)
+
+### Upload One Shard To Hugging Face
+
+Do not put tokens in files. Export a token only in the shell session:
+
+```bash
+export HF_TOKEN='<your-write-token>'
+export SHARD=00  # use 00, 01, or 03
+export HF_REPO='Dennis0626/h3d-default-val-test-available-zip-review'
+```
+
+Upload metadata, the HTML tool, then asset chunks in filename order:
+
+```bash
+python - <<'PYUPLOAD'
+from pathlib import Path
+import os
+from huggingface_hub import HfApi
+
+repo_id = os.environ['HF_REPO']
+token = os.environ['HF_TOKEN']
+shard = os.environ['SHARD']
+base = Path('/mnt/zsn/zsn_workspace/PartCraft3D/bench_review')
+meta_dir = base / f'default_val_test_available_shard{shard}'
+review_dir = base / f'default_val_test_available_shard{shard}_zip_review'
+api = HfApi(token=token)
+
+for local, remote in [
+    (meta_dir / 'h3d_default_val_test_available_manifest.jsonl', f'missing_shards/shard{shard}/metadata/h3d_default_val_test_available_manifest.jsonl'),
+    (meta_dir / 'h3d_default_val_test_available_edit_ids.txt', f'missing_shards/shard{shard}/metadata/h3d_default_val_test_available_edit_ids.txt'),
+    (meta_dir / 'summary.md', f'missing_shards/shard{shard}/metadata/summary.md'),
+    (review_dir / 'h3d_review_tool.html', f'missing_shards/shard{shard}/h3d_review_tool.html'),
+]:
+    api.upload_file(
+        repo_id=repo_id,
+        repo_type='dataset',
+        path_or_fileobj=str(local),
+        path_in_repo=remote,
+        commit_message=f'Add shard{shard} {remote}',
+    )
+    print(f'uploaded {remote}')
+
+chunks = sorted(review_dir.glob('h3d_test_review_*_assets.zip'))
+for idx, path in enumerate(chunks):
+    remote = f'missing_shards/shard{shard}/assets/{path.name}'
+    api.upload_file(
+        repo_id=repo_id,
+        repo_type='dataset',
+        path_or_fileobj=str(path),
+        path_in_repo=remote,
+        commit_message=f'Add shard{shard} review assets chunk {idx:03d}',
+    )
+    print(f'uploaded {idx + 1}/{len(chunks)} {remote}')
+PYUPLOAD
+```
+
+After upload, verify the file count for that shard:
+
+```bash
+python - <<'PYCHECK'
+import os
+from huggingface_hub import HfApi
+repo_id = os.environ['HF_REPO']
+shard = os.environ['SHARD']
+files = HfApi(token=os.environ['HF_TOKEN']).list_repo_files(repo_id, repo_type='dataset')
+prefix = f'missing_shards/shard{shard}/assets/h3d_test_review_'
+chunks = sorted(f for f in files if f.startswith(prefix) and f.endswith('_assets.zip'))
+print(f'shard{shard} chunks: {len(chunks)}')
+for f in chunks:
+    print(f)
+PYCHECK
+```
+
+Reviewers can use each shard-specific `missing_shards/shardXX/h3d_review_tool.html` with its own `missing_shards/shardXX/assets/*.zip`. Exported `selected_edit_ids_*.txt` files should later be concatenated with the main 3,855-edit review exports.
