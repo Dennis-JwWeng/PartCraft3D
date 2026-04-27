@@ -191,7 +191,7 @@ With this convention, the full review sequence is globally unique: main package 
 
 ### Upload One Shard To Hugging Face
 
-Do not put tokens in files. Export a token only in the shell session:
+Do not put tokens in files. Export a token only in the shell session. Upload missing shard asset ZIPs into the same top-level `assets/` directory as the existing `000`-`038` chunks; global numbering prevents collisions.
 
 ```bash
 export HF_TOKEN='<your-write-token>'
@@ -199,7 +199,7 @@ export SHARD=00  # use 00, 01, or 03
 export HF_REPO='Dennis0626/h3d-default-val-test-available-zip-review'
 ```
 
-Upload metadata, the HTML tool, then asset chunks in filename order:
+Upload shard metadata, then asset chunks in filename order. Reuse the already uploaded top-level `h3d_review_tool.html`:
 
 ```bash
 python - <<'PYUPLOAD'
@@ -216,10 +216,9 @@ review_dir = base / f'default_val_test_available_shard{shard}_zip_review'
 api = HfApi(token=token)
 
 for local, remote in [
-    (meta_dir / 'h3d_default_val_test_available_manifest.jsonl', f'missing_shards/shard{shard}/metadata/h3d_default_val_test_available_manifest.jsonl'),
-    (meta_dir / 'h3d_default_val_test_available_edit_ids.txt', f'missing_shards/shard{shard}/metadata/h3d_default_val_test_available_edit_ids.txt'),
-    (meta_dir / 'summary.md', f'missing_shards/shard{shard}/metadata/summary.md'),
-    (review_dir / 'h3d_review_tool.html', f'missing_shards/shard{shard}/h3d_review_tool.html'),
+    (meta_dir / 'h3d_default_val_test_available_manifest.jsonl', f'metadata/missing_shards/shard{shard}/h3d_default_val_test_available_manifest.jsonl'),
+    (meta_dir / 'h3d_default_val_test_available_edit_ids.txt', f'metadata/missing_shards/shard{shard}/h3d_default_val_test_available_edit_ids.txt'),
+    (meta_dir / 'summary.md', f'metadata/missing_shards/shard{shard}/summary.md'),
 ]:
     api.upload_file(
         repo_id=repo_id,
@@ -232,7 +231,7 @@ for local, remote in [
 
 chunks = sorted(review_dir.glob('h3d_test_review_*_assets.zip'))
 for idx, path in enumerate(chunks):
-    remote = f'missing_shards/shard{shard}/assets/{path.name}'
+    remote = f'assets/{path.name}'
     api.upload_file(
         repo_id=repo_id,
         repo_type='dataset',
@@ -253,12 +252,19 @@ from huggingface_hub import HfApi
 repo_id = os.environ['HF_REPO']
 shard = os.environ['SHARD']
 files = HfApi(token=os.environ['HF_TOKEN']).list_repo_files(repo_id, repo_type='dataset')
-prefix = f'missing_shards/shard{shard}/assets/h3d_test_review_'
-chunks = sorted(f for f in files if f.startswith(prefix) and f.endswith('_assets.zip'))
-print(f'shard{shard} chunks: {len(chunks)}')
-for f in chunks:
-    print(f)
+prefix = 'assets/h3d_test_review_'
+expected = {
+    '00': range(39, 44),
+    '01': range(44, 50),
+    '03': range(50, 55),
+}[shard]
+expected_names = [f'assets/h3d_test_review_{i:03d}_assets.zip' for i in expected]
+missing = [name for name in expected_names if name not in files]
+print(f'shard{shard} expected chunks: {len(expected_names)}')
+print(f'shard{shard} missing chunks: {len(missing)}')
+for name in expected_names:
+    print(name, 'OK' if name in files else 'MISSING')
 PYCHECK
 ```
 
-Reviewers can use each shard-specific `missing_shards/shardXX/h3d_review_tool.html` with its own `missing_shards/shardXX/assets/*.zip`. The HTML tool names exports from the ZIP stem, so reviewing `h3d_test_review_044_assets.zip` exports `selected_edit_ids_h3d_test_review_044_assets.txt` and `review_results_h3d_test_review_044_assets.json`. That makes every exported decision file traceable back to exactly one asset ZIP. Exported `selected_edit_ids_*.txt` files should later be concatenated with the main 3,855-edit review exports.
+Reviewers use the same top-level `h3d_review_tool.html` and the same top-level `assets/*.zip` sequence. The HTML tool names exports from the ZIP stem, so reviewing `h3d_test_review_044_assets.zip` exports `selected_edit_ids_h3d_test_review_044_assets.txt` and `review_results_h3d_test_review_044_assets.json`. That makes every exported decision file traceable back to exactly one asset ZIP. Exported `selected_edit_ids_*.txt` files should later be concatenated across the full `000`-`054` sequence.
