@@ -163,21 +163,31 @@ Check `summary.md` in the output directory. The `Total available records` should
 - `SHARD=01`: 544 edits
 - `SHARD=03`: 473 edits
 
-Then build chunked review ZIPs:
+Then build chunked review ZIPs with global numbering. The already uploaded main package uses `000`-`038`, so missing shards continue from `039`:
 
 ```bash
+case "$SHARD" in
+  00) CHUNK_OFFSET=39 ;;
+  01) CHUNK_OFFSET=44 ;;
+  03) CHUNK_OFFSET=50 ;;
+  *) echo "unknown SHARD=$SHARD" >&2; exit 2 ;;
+esac
+
 python bench_review/build_zip_review.py \
   --manifest /mnt/zsn/zsn_workspace/PartCraft3D/bench_review/default_val_test_available_shard${SHARD}/h3d_default_val_test_available_manifest.jsonl \
   --out-dir /mnt/zsn/zsn_workspace/PartCraft3D/bench_review/default_val_test_available_shard${SHARD}_zip_review \
   --chunk-size 100 \
+  --chunk-offset ${CHUNK_OFFSET} \
   --all
 ```
 
-Expected chunk counts:
+Expected global chunk names:
 
-- `SHARD=00`: 5 chunks (`000`-`004`; last chunk 85 edits)
-- `SHARD=01`: 6 chunks (`000`-`005`; last chunk 44 edits)
-- `SHARD=03`: 5 chunks (`000`-`004`; last chunk 73 edits)
+- `SHARD=00`: 5 chunks, `h3d_test_review_039_assets.zip`-`h3d_test_review_043_assets.zip`; last chunk 85 edits
+- `SHARD=01`: 6 chunks, `h3d_test_review_044_assets.zip`-`h3d_test_review_049_assets.zip`; last chunk 44 edits
+- `SHARD=03`: 5 chunks, `h3d_test_review_050_assets.zip`-`h3d_test_review_054_assets.zip`; last chunk 73 edits
+
+With this convention, the full review sequence is globally unique: main package `000`-`038`, missing shards `039`-`054`.
 
 ### Upload One Shard To Hugging Face
 
@@ -251,4 +261,4 @@ for f in chunks:
 PYCHECK
 ```
 
-Reviewers can use each shard-specific `missing_shards/shardXX/h3d_review_tool.html` with its own `missing_shards/shardXX/assets/*.zip`. Exported `selected_edit_ids_*.txt` files should later be concatenated with the main 3,855-edit review exports.
+Reviewers can use each shard-specific `missing_shards/shardXX/h3d_review_tool.html` with its own `missing_shards/shardXX/assets/*.zip`. The HTML tool names exports from the ZIP stem, so reviewing `h3d_test_review_044_assets.zip` exports `selected_edit_ids_h3d_test_review_044_assets.txt` and `review_results_h3d_test_review_044_assets.json`. That makes every exported decision file traceable back to exactly one asset ZIP. Exported `selected_edit_ids_*.txt` files should later be concatenated with the main 3,855-edit review exports.

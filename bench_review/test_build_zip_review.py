@@ -53,3 +53,37 @@ def test_load_translations_by_edit_id(tmp_path):
         encoding="utf-8",
     )
     assert builder.load_translations(path) == {"e1": "中文一。", "e2": "中文二。"}
+
+
+def test_chunk_filename_can_start_from_offset(tmp_path):
+    img = tmp_path / "img.png"
+    img.write_bytes(b"png")
+    meta = tmp_path / "meta.json"
+    meta.write_text('{"instruction":{"prompt":"remove wheel"}}', encoding="utf-8")
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        json.dumps({
+            "edit_id": "del_obj_000",
+            "edit_type": "deletion",
+            "obj_id": "obj",
+            "shard": "00",
+            "h3d_before_png": str(img),
+            "h3d_after_png": str(img),
+            "h3d_meta_json": str(meta),
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    out = builder.build_chunk(manifest, tmp_path, chunk_index=0, chunk_size=100, chunk_offset=39)
+
+    assert out.name == "h3d_test_review_039_assets.zip"
+
+
+def test_html_exports_use_loaded_zip_stem(tmp_path):
+    out = tmp_path / "h3d_review_tool.html"
+    builder.write_tool_html(out)
+    html = out.read_text(encoding="utf-8")
+
+    assert "currentZipStem = file.name.replace" in html
+    assert "review_results_${currentZipStem}.json" in html
+    assert "selected_edit_ids_${currentZipStem}.txt" in html

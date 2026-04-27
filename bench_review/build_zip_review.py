@@ -215,11 +215,11 @@ document.getElementById('downloadKeep').addEventListener('click', () => {{ const
     output_path.write_text(html, encoding="utf-8")
 
 
-def build_chunk(manifest_path: Path, out_dir: Path, *, chunk_index: int, chunk_size: int, translations: dict[str, str] | None = None) -> Path:
+def build_chunk(manifest_path: Path, out_dir: Path, *, chunk_index: int, chunk_size: int, chunk_offset: int = 0, translations: dict[str, str] | None = None) -> Path:
     records = load_manifest_records(manifest_path, start=chunk_index * chunk_size, limit=chunk_size, translations=translations)
     if not records:
         raise ValueError(f"chunk {chunk_index} has no records")
-    zip_path = out_dir / f"h3d_test_review_{chunk_index:03d}_assets.zip"
+    zip_path = out_dir / f"h3d_test_review_{chunk_index + chunk_offset:03d}_assets.zip"
     write_assets_zip(records, zip_path)
     return zip_path
 
@@ -230,6 +230,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     ap.add_argument("--chunk-size", type=int, default=100)
     ap.add_argument("--chunk-index", type=int, default=0)
+    ap.add_argument("--chunk-offset", type=int, default=0, help="Add this offset to output chunk filenames; record slicing still uses --chunk-index.")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--translations", type=Path, default=DEFAULT_TRANSLATIONS)
     return ap.parse_args()
@@ -242,7 +243,7 @@ def main() -> None:
     chunk_indices = range(total_chunks) if args.all else [args.chunk_index]
     translations = load_translations(args.translations)
     for chunk_index in chunk_indices:
-        zip_path = build_chunk(args.manifest, args.out_dir, chunk_index=chunk_index, chunk_size=args.chunk_size, translations=translations)
+        zip_path = build_chunk(args.manifest, args.out_dir, chunk_index=chunk_index, chunk_size=args.chunk_size, chunk_offset=args.chunk_offset, translations=translations)
         print(f"wrote {zip_path}")
     tool_path = args.out_dir / "h3d_review_tool.html"
     write_tool_html(tool_path)
